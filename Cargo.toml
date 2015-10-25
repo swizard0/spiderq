@@ -2,3 +2,6 @@
 name = "spiderq"
 version = "0.0.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
+
+[dependencies]
+getopts = "*"
