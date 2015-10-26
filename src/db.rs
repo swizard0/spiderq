@@ -65,17 +65,17 @@ impl Loader for Vec<u8> {
 }
 
 impl Database {
-    pub fn new(database_dir: String) -> Result<Database, Error> {
-        match fs::metadata(&database_dir) {
+    pub fn new(database_dir: &str) -> Result<Database, Error> {
+        match fs::metadata(database_dir) {
             Ok(ref metadata) if metadata.is_dir() => (),
-            Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir)),
+            Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
             Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-                try!(fs::create_dir(&database_dir).map_err(|e| Error::DatabaseMkdir(e))),
+                try!(fs::create_dir(database_dir).map_err(|e| Error::DatabaseMkdir(e))),
             Err(e) => return Err(Error::DatabaseStat(e)),
         }
 
-        let (filename_idx, fd_idx) = try!(open_rw(&database_dir, "spiderq.idx"));
-        let (filename_db, fd_db) = try!(open_rw(&database_dir, "spiderq.db"));
+        let (filename_idx, fd_idx) = try!(open_rw(database_dir, "spiderq.idx"));
+        let (filename_db, fd_db) = try!(open_rw(database_dir, "spiderq.db"));
         Ok(Database {
             filename_idx: filename_idx,
             filename_db: filename_db,
@@ -101,7 +101,7 @@ impl Database {
         Ok(try!(self.count()) - 1)
     }
 
-    pub fn load<L>(&mut self, index: usize, loader: &mut L) -> Result<(), Error> where L: Loader {
+    pub fn load<'a, 'b, L>(&'a mut self, index: usize, loader: &'b mut L) -> Result<&'b L, Error> where L: Loader {
         let total = try!(self.count());
         if index >= total {
             return Err(Error::IndexIsTooBig { given: index, total: total, })
@@ -117,18 +117,20 @@ impl Database {
                             .map_err(|e| Error::Read(filename_as_string(&self.filename_db), From::from(e)))) as usize;
         loader.set_len(data_len);
 
-        let mut target = loader.contents();
-        while !target.is_empty() {
-            match self.fd_db.read(target) {
-                Ok(0) if target.is_empty() => break,
-                Ok(0) => return Err(Error::EofReadingData { index: index, len: data_len, read: data_len - target.len(), }),
-                Ok(n) => { let tmp = target; target = &mut tmp[n ..]; },
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => { },
-                Err(e) => return Err(Error::Read(filename_as_string(&self.filename_db), e)),
+        {
+            let mut target = loader.contents();
+            while !target.is_empty() {
+                match self.fd_db.read(target) {
+                    Ok(0) if target.is_empty() => break,
+                    Ok(0) => return Err(Error::EofReadingData { index: index, len: data_len, read: data_len - target.len(), }),
+                    Ok(n) => { let tmp = target; target = &mut tmp[n ..]; },
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => { },
+                    Err(e) => return Err(Error::Read(filename_as_string(&self.filename_db), e)),
+                }
             }
         }
 
-        Ok(())
+        Ok(loader)
     }
 }
 
