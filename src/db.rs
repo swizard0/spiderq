@@ -14,8 +14,8 @@ pub enum Error {
     Seek(String, io::Error),
     Read(String, io::Error),
     Write(String, io::Error),
-    IndexIsTooBig { given: usize, total: usize, },
-    EofReadingData { index: usize, len: usize, read: usize },
+    IndexIsTooBig { given: u32, total: u32, },
+    EofReadingData { index: u32, len: usize, read: usize },
 }
 
 pub struct Database {
@@ -88,7 +88,7 @@ impl Database {
         Ok(try!(file_size(&self.fd_idx, &self.filename_idx)) as usize / mem::size_of::<u64>())
     }
 
-    pub fn add(&mut self, data: &[u8]) -> Result<usize, Error> {
+    pub fn add(&mut self, data: &[u8]) -> Result<u32, Error> {
         let last_offset = try!(file_size(&self.fd_db, &self.filename_db));
         try!(self.fd_idx.seek(SeekFrom::End(0)).map_err(|e| Error::Seek(filename_as_string(&self.filename_idx), e)));
         try!(self.fd_idx.write_u64::<NativeEndian>(last_offset)
@@ -98,16 +98,16 @@ impl Database {
         try!(self.fd_db.write_u32::<NativeEndian>(data.len() as u32)
              .map_err(|e| Error::Write(filename_as_string(&self.filename_db), From::from(e))));
         try!(self.fd_db.write(data).map_err(|e| Error::Write(filename_as_string(&self.filename_db), e)));
-        Ok(try!(self.count()) - 1)
+        Ok(try!(self.count()) as u32 - 1)
     }
 
-    pub fn load<'a, 'b, L>(&'a mut self, index: usize, loader: &'b mut L) -> Result<&'b L, Error> where L: Loader {
-        let total = try!(self.count());
+    pub fn load<'a, 'b, L>(&'a mut self, index: u32, loader: &'b mut L) -> Result<&'b L, Error> where L: Loader {
+        let total = try!(self.count()) as u32;
         if index >= total {
             return Err(Error::IndexIsTooBig { given: index, total: total, })
         }
 
-        try!(self.fd_idx.seek(SeekFrom::Start((index * mem::size_of::<u64>()) as u64))
+        try!(self.fd_idx.seek(SeekFrom::Start((index as usize * mem::size_of::<u64>()) as u64))
              .map_err(|e| Error::Seek(filename_as_string(&self.filename_idx), e)));
         let offset = try!(self.fd_idx.read_u64::<NativeEndian>()
                           .map_err(|e| Error::Read(filename_as_string(&self.filename_idx), From::from(e))));

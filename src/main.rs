@@ -8,6 +8,7 @@ use std::io::Write;
 use getopts::Options;
 
 pub mod db;
+pub mod pq;
 
 #[derive(Debug)]
 enum Error {
