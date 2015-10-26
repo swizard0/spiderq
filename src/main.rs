@@ -1,4 +1,7 @@
+#![feature(vec_resize)]
+
 extern crate getopts;
+extern crate byteorder;
 
 use std::{io, env, process};
 use std::io::Write;

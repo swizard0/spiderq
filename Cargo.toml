@@ -1,7 +1,8 @@
 [package]
 name = "spiderq"
-version = "0.0.1"
+version = "0.0.3"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
 getopts = "*"
+byteorder = "*"
