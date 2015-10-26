@@ -4,13 +4,14 @@ use std::collections::{BinaryHeap, HashMap};
 
 #[derive(PartialEq, Eq)]
 struct PQueueEntry {
-    priority: u32,
+    priority: u64,
     index: u32,
+    boost: u32,
 }
 
 impl Ord for PQueueEntry {
     fn cmp(&self, other: &PQueueEntry) -> Ordering {
-        self.priority.cmp(&other.priority)
+        other.priority.cmp(&self.priority)
     }
 }
 
@@ -28,7 +29,7 @@ struct LentEntry {
 
 impl Ord for LentEntry {
     fn cmp(&self, other: &LentEntry) -> Ordering {
-        self.trigger_at.cmp(&other.trigger_at)
+        other.trigger_at.cmp(&self.trigger_at)
     }
 }
 
@@ -39,15 +40,23 @@ impl PartialOrd for LentEntry {
 }
 
 pub struct PQueue {
+    serial: u64,
     queue: BinaryHeap<PQueueEntry>,
     lentm: HashMap<u32, PQueueEntry>,
     lentq: BinaryHeap<LentEntry>,
 }
 
+pub enum RepayStatus {
+    Penalty,
+    Reward,
+    Requeue,
+}
+
 impl PQueue {
     pub fn new(count: usize) -> PQueue {
         PQueue {
-            queue: (0 .. count).map(|i| PQueueEntry { priority: 0, index: i as u32, }).collect(),
+            serial: count as u64,
+            queue: (0 .. count).map(|i| PQueueEntry { priority: i as u64, index: i as u32, boost: 0, }).collect(),
             lentm: HashMap::new(),
             lentq: BinaryHeap::new(),
         }
@@ -80,12 +89,27 @@ impl PQueue {
     
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { index: qi, .. }) = self.lentq.pop() {
-            self.repay(qi)
+            self.repay(qi, RepayStatus::Requeue)
         }
     }
 
-    pub fn repay(&mut self, index: u32) {
-        if let Some(entry) = self.lentm.remove(&index) {
+    pub fn repay(&mut self, index: u32, status: RepayStatus) {
+        if let Some(mut entry) = self.lentm.remove(&index) {
+            self.serial += 1;
+            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
+            let total = self.queue.len() as u64;
+            let region = total - min_priority;
+            let current_boost = match status {
+                RepayStatus::Penalty if entry.boost == 0 => 0,
+                RepayStatus::Penalty => { entry.boost -= 1; entry.boost },
+                RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
+                RepayStatus::Reward => { entry.boost += 1; entry.boost },
+                RepayStatus::Requeue => 0,
+            };
+            entry.priority = match status {
+                RepayStatus::Requeue => 0,
+                _ => self.serial - (region - (region >> current_boost)),
+            };
             self.queue.push(entry)
         }
     }
