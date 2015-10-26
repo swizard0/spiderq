@@ -80,9 +80,13 @@ impl PQueue {
     
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { index: qi, .. }) = self.lentq.pop() {
-            if let Some(entry) = self.lentm.remove(&qi) {
-                self.queue.push(entry)
-            }
+            self.repay(qi)
+        }
+    }
+
+    pub fn repay(&mut self, index: u32) {
+        if let Some(entry) = self.lentm.remove(&index) {
+            self.queue.push(entry)
         }
     }
 }
