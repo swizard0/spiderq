@@ -4,13 +4,19 @@ use std::{io, env, process};
 use std::io::Write;
 use getopts::Options;
 
+pub mod db;
+
 #[derive(Debug)]
 enum Error {
     Getopts(getopts::Fail),
+    Db(db::Error),
 }
 
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
+    let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
+
+    let _db = try!(db::Database::new(database_dir).map_err(|e| Error::Db(e)));
 
     Ok(())
 }
