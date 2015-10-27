@@ -24,6 +24,7 @@ impl PartialOrd for PQueueEntry {
 #[derive(PartialEq, Eq)]
 struct LentEntry {
     trigger_at: Duration,
+    snapshot: u64,
     index: u32,
 }
 
@@ -42,7 +43,7 @@ impl PartialOrd for LentEntry {
 pub struct PQueue {
     serial: u64,
     queue: BinaryHeap<PQueueEntry>,
-    lentm: HashMap<u32, PQueueEntry>,
+    lentm: HashMap<u32, (u64, PQueueEntry)>,
     lentq: BinaryHeap<LentEntry>,
 }
 
@@ -69,8 +70,8 @@ impl PQueue {
     pub fn lend(&mut self, trigger_at: Duration) -> Option<u32> {
         if let Some(entry) = self.queue.pop() {
             let index = entry.index;
-            self.lentm.insert(index, entry);
-            self.lentq.push(LentEntry { trigger_at: trigger_at, index: index, });
+            self.lentm.insert(index, (self.serial, entry));
+            self.lentq.push(LentEntry { trigger_at: trigger_at, snapshot: self.serial, index: index, });
             Some(index)
         } else {
             None
@@ -78,11 +79,13 @@ impl PQueue {
     }
 
     pub fn next_timeout(&mut self) -> Option<Duration> {
-        while let Some(&LentEntry { trigger_at: trigger, index: i, .. }) = self.lentq.peek() {
-            if self.lentm.contains_key(&i) {
-                return Some(trigger)
-            }
-            self.lentq.pop();
+        while let Some(&LentEntry { trigger_at: trigger, snapshot: qshot, index: i, .. }) = self.lentq.peek() {
+            match self.lentm.get(&i) {
+                Some(&(mshot, _)) if mshot == qshot => 
+                    return Some(trigger),
+                _ => 
+                    self.lentq.pop(),
+            };
         }
         None
     }
@@ -94,7 +97,7 @@ impl PQueue {
     }
 
     pub fn repay(&mut self, index: u32, status: RepayStatus) {
-        if let Some(mut entry) = self.lentm.remove(&index) {
+        if let Some((_, mut entry)) = self.lentm.remove(&index) {
             self.serial += 1;
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let total = self.queue.len() as u64;

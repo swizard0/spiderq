@@ -134,5 +134,17 @@ mod test {
         assert_eq!(pq.lend(Duration::new(13, 0)), Some(1));
         assert_eq!(pq.lend(Duration::new(14, 0)), Some(9));
     }
+
+    #[test]
+    fn pqueue_double_lend() {
+        let mut pq = pq::PQueue::new(2);
+        assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
+        assert_eq!(pq.lend(Duration::new(15, 0)), Some(1));
+        pq.repay(1, pq::RepayStatus::Penalty);
+        assert_eq!(pq.lend(Duration::new(20, 0)), Some(1));
+        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
+        pq.repay_timed_out();
+        assert_eq!(pq.next_timeout(), Some(Duration::new(20, 0)));
+    }
 }
 
