@@ -22,7 +22,7 @@ pub enum Req<'a> {
     Local(LocalReq),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum GlobalRep<'a> {
     Count(usize),
     Added(u32),
@@ -30,19 +30,19 @@ pub enum GlobalRep<'a> {
     Repaid,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LocalRep {
     Lend(u32),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Rep<'a> {
     GlobalOk(GlobalRep<'a>),
     GlobalErr(ProtoError),
     Local(LocalRep),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ProtoError {
     NotEnoughDataForReqTag { required: usize, given: usize, },
     InvalidReqTag(u8),
