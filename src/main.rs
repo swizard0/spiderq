@@ -51,6 +51,7 @@ mod test {
     use std::fs;
     use std::time::Duration;
     use super::{db, pq};
+    use super::proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
     fn mkdb(path: &str) -> db::Database {
         let _ = fs::remove_dir_all(path);
@@ -147,6 +148,27 @@ mod test {
         assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
         pq.repay_timed_out();
         assert_eq!(pq.next_timeout(), Some(Duration::new(20, 0)));
+    }
+
+    fn assert_encode_decode(req: Req) {
+        let bytes_required = req.encode_len();
+        let mut area: Vec<_> = (0 .. bytes_required).map(|_| 0).collect();
+        assert!(req.encode(&mut area).len() == 0);
+        let assert_req = Req::decode(&area).unwrap();
+        assert_eq!(req, assert_req);
+    }
+
+    #[test]
+    fn proto_encode_decode() {
+        let some_data = "hello world".as_bytes();
+        assert_encode_decode(Req::Global(GlobalReq::Count));
+        assert_encode_decode(Req::Global(GlobalReq::Add(None)));
+        assert_encode_decode(Req::Global(GlobalReq::Add(Some(some_data))));
+        assert_encode_decode(Req::Global(GlobalReq::Lend { timeout: 177, }));
+        assert_encode_decode(Req::Global(GlobalReq::Repay(17, pq::RepayStatus::Penalty)));
+        assert_encode_decode(Req::Global(GlobalReq::Repay(18, pq::RepayStatus::Reward)));
+        assert_encode_decode(Req::Global(GlobalReq::Repay(19, pq::RepayStatus::Requeue)));
+        assert_encode_decode(Req::Local(LocalReq::Load(217)));
     }
 }
 
