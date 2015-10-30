@@ -5,7 +5,7 @@ use super::pq::RepayStatus;
 #[derive(Debug)]
 pub enum GlobalReq<'a> {
     Count,
-    Add(&'a [u8]),
+    Add(Option<&'a [u8]>),
     Lend { timeout: u64 },
     Repay(u32, RepayStatus),
 }
@@ -25,7 +25,7 @@ pub enum Req<'a> {
 pub enum GlobalRep<'a> {
     Count(usize),
     Added(u32),
-    Lend(u32, &'a [u8]),
+    Lend(u32, Option<&'a [u8]>),
     Repaid,
 }
 
@@ -98,13 +98,23 @@ impl<'a> Req<'a> {
             (tag, _) => return Err(ProtoError::InvalidReqTag(tag)),
         }
     }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &Req::Global(ref req) => req.encode_len(),
+            &Req::Local(ref req) => req.encode_len(),
+        }
+    }
 }
 
 impl<'a> GlobalReq<'a> {
     pub fn decode(data: &'a [u8]) -> Result<GlobalReq<'a>, ProtoError> {
         match try_get!(data, u8, read_u8, NotEnoughDataForGlobalReqTag) {
             (1, _) => Ok(GlobalReq::Count),
-            (2, data_to_add) => Ok(GlobalReq::Add(data_to_add)),
+            (2, data_to_add) if data_to_add.len() == 0 => 
+                Ok(GlobalReq::Add(None)),
+            (2, data_to_add) => 
+                Ok(GlobalReq::Add(Some(data_to_add))),
             (3, timeout_buf) => { 
                 let (timeout, _) = try_get!(timeout_buf, u64, read_u64, NotEnoughDataForGlobalReqLendTimeout);
                 Ok(GlobalReq::Lend { timeout: timeout, })
@@ -122,6 +132,16 @@ impl<'a> GlobalReq<'a> {
             (tag, _) => return Err(ProtoError::InvalidGlobalReqTag(tag)),
         }
     }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &GlobalReq::Count => 0,
+            &GlobalReq::Add(None) => 0,
+            &GlobalReq::Add(Some(data)) => data.len(),
+            &GlobalReq::Lend { .. } => size_of::<u64>(),
+            &GlobalReq::Repay(..) => size_of::<u32>() + size_of::<u8>(),
+        }
+    }
 }
 
 impl LocalReq {
@@ -134,6 +154,12 @@ impl LocalReq {
             (tag, _) => return Err(ProtoError::InvalidLocalReqTag(tag)),
         }
     }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &LocalReq::Load(..) => size_of::<u32>(),
+        }
+    }
 }
 
 impl<'a> Rep<'a> {
@@ -143,6 +169,14 @@ impl<'a> Rep<'a> {
             (2, packet) => Ok(Rep::GlobalErr(try!(ProtoError::decode(packet)))),
             (3, packet) => Ok(Rep::Local(try!(LocalRep::decode(packet)))),
             (tag, _) => return Err(ProtoError::InvalidRepTag(tag)),
+        }
+    }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &Rep::GlobalOk(ref rep) => rep.encode_len(),
+            &Rep::GlobalErr(ref err) => err.encode_len(),
+            &Rep::Local(ref rep) => rep.encode_len(),
         }
     }
 }
@@ -160,10 +194,20 @@ impl<'a> GlobalRep<'a> {
             },
             (3, rest_buf) => {
                 let (id, lent_data) = try_get!(rest_buf, u32, read_u32, NotEnoughDataForGlobalRepLendId);
-                Ok(GlobalRep::Lend(id, lent_data))
+                Ok(GlobalRep::Lend(id, if lent_data.len() == 0 { None } else { Some(lent_data) }))
             },
             (4, _) => Ok(GlobalRep::Repaid),
             (tag, _) => return Err(ProtoError::InvalidGlobalRepTag(tag)),
+        }
+    }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &GlobalRep::Count(..) => size_of::<u32>(),
+            &GlobalRep::Added(..) => size_of::<u32>(),
+            &GlobalRep::Lend(_, None) => size_of::<u32>(),
+            &GlobalRep::Lend(_, Some(data)) => size_of::<u32>() + data.len(),
+            &GlobalRep::Repaid => 0,
         }
     }
 }
@@ -215,6 +259,39 @@ impl ProtoError {
             (tag, _) => return Err(ProtoError::InvalidProtoErrorTag(tag)),
         }
     }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &ProtoError::NotEnoughDataForReqTag { .. } |
+            &ProtoError::NotEnoughDataForGlobalReqTag { .. } |
+            &ProtoError::NotEnoughDataForGlobalReqLendTimeout { .. } |
+            &ProtoError::NotEnoughDataForGlobalReqRepayId { .. } |
+            &ProtoError::NotEnoughDataForGlobalReqRepayStatus { .. } |
+            &ProtoError::NotEnoughDataForLocalReqTag { .. } |
+            &ProtoError::NotEnoughDataForLocalReqLoadId { .. } |
+            &ProtoError::NotEnoughDataForRepTag { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepTag { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepCountCount { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepAddedId { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepLendId { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorTag { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorRequired { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorGiven { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { .. } |
+            &ProtoError::NotEnoughDataForLocalRepTag { .. } |
+            &ProtoError::NotEnoughDataForLocalRepLendId { .. } =>
+                size_of::<u32>() + size_of::<u32>(),
+            &ProtoError::InvalidReqTag(..) |
+            &ProtoError::InvalidGlobalReqTag(..) |
+            &ProtoError::InvalidGlobalReqRepayStatusTag(..) |
+            &ProtoError::InvalidLocalReqTag(..) |
+            &ProtoError::InvalidRepTag(..) |
+            &ProtoError::InvalidGlobalRepTag(..) |
+            &ProtoError::InvalidProtoErrorTag(..) |
+            &ProtoError::InvalidLocalRepTag(..) =>
+                size_of::<u8>(),
+        }
+    }
 }
 
 impl LocalRep {
@@ -225,6 +302,12 @@ impl LocalRep {
                 Ok(LocalRep::Lend(id))
             },
             (tag, _) => return Err(ProtoError::InvalidLocalRepTag(tag)),
+        }
+    }
+
+    pub fn encode_len(&self) -> usize {
+        size_of::<u8>() + match self {
+            &LocalRep::Lend(..) => size_of::<u32>(),
         }
     }
 }
