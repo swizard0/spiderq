@@ -150,25 +150,63 @@ mod test {
         assert_eq!(pq.next_timeout(), Some(Duration::new(20, 0)));
     }
 
-    fn assert_encode_decode(req: Req) {
-        let bytes_required = req.encode_len();
-        let mut area: Vec<_> = (0 .. bytes_required).map(|_| 0).collect();
-        assert!(req.encode(&mut area).len() == 0);
-        let assert_req = Req::decode(&area).unwrap();
-        assert_eq!(req, assert_req);
+    macro_rules! defassert_encode_decode {
+        ($name:ident, $ty:ty, $class:ident) => (fn $name(r: $ty) {
+            let bytes_required = r.encode_len();
+            let mut area: Vec<_> = (0 .. bytes_required).map(|_| 0).collect();
+            assert!(r.encode(&mut area).len() == 0);
+            let assert_r = $class::decode(&area).unwrap();
+            assert_eq!(r, assert_r);
+        })
     }
+
+    defassert_encode_decode!(assert_encode_decode_req, Req, Req);
+    defassert_encode_decode!(assert_encode_decode_rep, Rep, Rep);
 
     #[test]
     fn proto_encode_decode() {
         let some_data = "hello world".as_bytes();
-        assert_encode_decode(Req::Global(GlobalReq::Count));
-        assert_encode_decode(Req::Global(GlobalReq::Add(None)));
-        assert_encode_decode(Req::Global(GlobalReq::Add(Some(some_data))));
-        assert_encode_decode(Req::Global(GlobalReq::Lend { timeout: 177, }));
-        assert_encode_decode(Req::Global(GlobalReq::Repay(17, pq::RepayStatus::Penalty)));
-        assert_encode_decode(Req::Global(GlobalReq::Repay(18, pq::RepayStatus::Reward)));
-        assert_encode_decode(Req::Global(GlobalReq::Repay(19, pq::RepayStatus::Requeue)));
-        assert_encode_decode(Req::Local(LocalReq::Load(217)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Count));
+        assert_encode_decode_req(Req::Global(GlobalReq::Add(None)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Add(Some(some_data))));
+        assert_encode_decode_req(Req::Global(GlobalReq::Lend { timeout: 177, }));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(17, pq::RepayStatus::Penalty)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(18, pq::RepayStatus::Reward)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, pq::RepayStatus::Requeue)));
+        assert_encode_decode_req(Req::Local(LocalReq::Load(217)));
+        
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Count(97)));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Added(167)));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lend(317, None)));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lend(316, Some(some_data))));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Repaid));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForReqTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidReqTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalReqTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqLendTimeout { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqRepayId { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqRepayStatus { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalReqRepayStatusTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidLocalReqTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqLoadId { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForRepTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidRepTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalRepTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepCountCount { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepAddedId { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepLendId { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidProtoErrorTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorRequired { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorGiven { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepTag { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidLocalRepTag(157)));
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepLendId { required: 177, given: 167, }));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Lend(147)));
     }
 }
 
