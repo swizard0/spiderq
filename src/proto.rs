@@ -14,6 +14,7 @@ pub enum GlobalReq<'a> {
 #[derive(Debug, PartialEq)]
 pub enum LocalReq {
     Load(u32),
+    Stop,
 }
 
 #[derive(Debug, PartialEq)]
@@ -33,6 +34,7 @@ pub enum GlobalRep<'a> {
 #[derive(Debug, PartialEq)]
 pub enum LocalRep {
     Lend(u32),
+    StopAck,
 }
 
 #[derive(Debug, PartialEq)]
@@ -150,7 +152,8 @@ impl<'a> GlobalReq<'a> {
                 };
                 Ok(GlobalReq::Repay(id, status))
             },
-            (tag, _) => return Err(ProtoError::InvalidGlobalReqTag(tag)),
+            (tag, _) => 
+                return Err(ProtoError::InvalidGlobalReqTag(tag)),
         }
     }
 
@@ -199,13 +202,17 @@ impl LocalReq {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalReqLoadId);
                 Ok(LocalReq::Load(id))
             },
-            (tag, _) => return Err(ProtoError::InvalidLocalReqTag(tag)),
+            (2, _) => 
+                Ok(LocalReq::Stop),
+            (tag, _) => 
+                return Err(ProtoError::InvalidLocalReqTag(tag)),
         }
     }
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
             &LocalReq::Load(..) => size_of::<u32>(),
+            &LocalReq::Stop => 0,
         }
     }
 
@@ -215,6 +222,8 @@ impl LocalReq {
                 let area = put_adv!(area, u8, write_u8, 1);
                 put_adv!(area, u32, write_u32, id)
             },
+            &LocalReq::Stop =>
+                put_adv!(area, u8, write_u8, 2),
         }
     }
 }
@@ -436,13 +445,17 @@ impl LocalRep {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalRepLendId);
                 Ok(LocalRep::Lend(id))
             },
-            (tag, _) => return Err(ProtoError::InvalidLocalRepTag(tag)),
+            (2, _) => 
+                Ok(LocalRep::StopAck),
+            (tag, _) => 
+                return Err(ProtoError::InvalidLocalRepTag(tag)),
         }
     }
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
             &LocalRep::Lend(..) => size_of::<u32>(),
+            &LocalRep::StopAck => 0,
         }
     }
 
@@ -451,7 +464,9 @@ impl LocalRep {
             &LocalRep::Lend(id) => {
                 let area = put_adv!(area, u8, write_u8, 1);
                 put_adv!(area, u32, write_u32, id)
-            }
+            },
+            &LocalRep::StopAck =>
+                put_adv!(area, u8, write_u8, 2),
         }
     }
 }
