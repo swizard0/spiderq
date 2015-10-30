@@ -47,6 +47,7 @@ pub struct PQueue {
     lentq: BinaryHeap<LentEntry>,
 }
 
+#[derive(Debug)]
 pub enum RepayStatus {
     Penalty,
     Reward,
