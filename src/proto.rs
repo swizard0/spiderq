@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::slice::bytes;
 use byteorder::{ByteOrder, BigEndian};
 use super::pq::RepayStatus;
 
@@ -80,13 +81,26 @@ macro_rules! try_get {
         })
 }
 
+macro_rules! put_adv {
+    ($area:expr, $ty:ty, $writer:ident, $value:expr) => ({
+        let area = $area;
+        BigEndian::$writer(area, $value);
+        &mut area[size_of::<$ty>() ..]
+    })
+}
+
 trait U8Support {
     fn read_u8(buf: &[u8]) -> u8;
+    fn write_u8(buf: &mut [u8], n: u8);
 }
 
 impl U8Support for BigEndian {
     fn read_u8(buf: &[u8]) -> u8 { 
         buf[0] 
+    }
+
+    fn write_u8(buf: &mut [u8], n: u8) {
+        buf[0] = n;
     }
 }
 
@@ -103,6 +117,13 @@ impl<'a> Req<'a> {
         size_of::<u8>() + match self {
             &Req::Global(ref req) => req.encode_len(),
             &Req::Local(ref req) => req.encode_len(),
+        }
+    }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &Req::Global(ref req) => req.encode(put_adv!(area, u8, write_u8, 1)),
+            &Req::Local(ref req) => req.encode(put_adv!(area, u8, write_u8, 2)),
         }
     }
 }
@@ -142,6 +163,33 @@ impl<'a> GlobalReq<'a> {
             &GlobalReq::Repay(..) => size_of::<u32>() + size_of::<u8>(),
         }
     }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &GlobalReq::Count =>
+                put_adv!(area, u8, write_u8, 1),
+            &GlobalReq::Add(None) =>
+                put_adv!(area, u8, write_u8, 2),
+            &GlobalReq::Add(Some(data)) => {
+                let area = put_adv!(area, u8, write_u8, 2);
+                bytes::copy_memory(data, area);
+                &mut area[data.len() ..]
+            },
+            &GlobalReq::Lend { timeout: t } => {
+                let area = put_adv!(area, u8, write_u8, 3);
+                put_adv!(area, u64, write_u64, t)
+            },
+            &GlobalReq::Repay(id, ref status) => {
+                let area = put_adv!(area, u8, write_u8, 4);
+                let area = put_adv!(area, u32, write_u32, id);
+                put_adv!(area, u8, write_u8, match status {
+                    &RepayStatus::Penalty => 1,
+                    &RepayStatus::Reward => 2,
+                    &RepayStatus::Requeue => 3,
+                })
+            },
+        }
+    }
 }
 
 impl LocalReq {
@@ -158,6 +206,13 @@ impl LocalReq {
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
             &LocalReq::Load(..) => size_of::<u32>(),
+        }
+    }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &LocalReq::Load(id) =>
+                put_adv!(area, u32, write_u32, id),
         }
     }
 }
@@ -177,6 +232,14 @@ impl<'a> Rep<'a> {
             &Rep::GlobalOk(ref rep) => rep.encode_len(),
             &Rep::GlobalErr(ref err) => err.encode_len(),
             &Rep::Local(ref rep) => rep.encode_len(),
+        }
+    }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &Rep::GlobalOk(ref rep) => rep.encode(put_adv!(area, u8, write_u8, 1)),
+            &Rep::GlobalErr(ref err) => err.encode(put_adv!(area, u8, write_u8, 2)),
+            &Rep::Local(ref rep) => rep.encode(put_adv!(area, u8, write_u8, 3)),
         }
     }
 }
@@ -205,9 +268,33 @@ impl<'a> GlobalRep<'a> {
         size_of::<u8>() + match self {
             &GlobalRep::Count(..) => size_of::<u32>(),
             &GlobalRep::Added(..) => size_of::<u32>(),
-            &GlobalRep::Lend(_, None) => size_of::<u32>(),
-            &GlobalRep::Lend(_, Some(data)) => size_of::<u32>() + data.len(),
+            &GlobalRep::Lend(_, maybe_data) => size_of::<u32>() + maybe_data.map(|data| data.len()).unwrap_or(0),
             &GlobalRep::Repaid => 0,
+        }
+    }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &GlobalRep::Count(count) => {
+                let area = put_adv!(area, u8, write_u8, 1);
+                put_adv!(area, u32, write_u32, count as u32)
+            },
+            &GlobalRep::Added(id) => {
+                let area = put_adv!(area, u8, write_u8, 2);
+                put_adv!(area, u32, write_u32, id)
+            },
+            &GlobalRep::Lend(id, maybe_data) => {
+                let area = put_adv!(area, u8, write_u8, 3);
+                let area = put_adv!(area, u32, write_u32, id);
+                if let Some(data) = maybe_data {
+                    bytes::copy_memory(data, area);
+                    &mut area[data.len() ..]
+                } else {
+                    area
+                }
+            },
+            &GlobalRep::Repaid =>
+                put_adv!(area, u8, write_u8, 4),
         }
     }
 }
@@ -220,10 +307,25 @@ macro_rules! decode_not_enough {
     })
 }
 
+macro_rules! encode_not_enough {
+    ($area:ident, $tag:expr, $required:expr, $given: expr) => ({
+        let area = put_adv!($area, u8, write_u8, $tag);
+        let area = put_adv!(area, u32, write_u32, $required as u32);
+        put_adv!(area, u32, write_u32, $given as u32)
+    })
+}
+
 macro_rules! decode_tag {
     ($buf:ident, $pe_type:ident) => ({
         let (tag, _) = try_get!($buf, u8, read_u8, NotEnoughDataForProtoErrorInvalidTag);
         Ok(ProtoError::$pe_type(tag))
+    })
+}
+
+macro_rules! encode_tag {
+    ($area:ident, $tag:expr, $invalid_tag:expr) => ({
+        let area = put_adv!($area, u8, write_u8, $tag);
+        put_adv!(area, u8, write_u8, $invalid_tag)
     })
 }
 
@@ -292,6 +394,37 @@ impl ProtoError {
                 size_of::<u8>(),
         }
     }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &ProtoError::NotEnoughDataForReqTag { required: r, given: g, } => encode_not_enough!(area, 1, r, g),
+            &ProtoError::InvalidReqTag(tag) => encode_tag!(area, 2, tag),
+            &ProtoError::NotEnoughDataForGlobalReqTag { required: r, given: g, } => encode_not_enough!(area, 3, r, g),
+            &ProtoError::InvalidGlobalReqTag(tag) => encode_tag!(area, 4, tag),
+            &ProtoError::NotEnoughDataForGlobalReqLendTimeout { required: r, given: g, } => encode_not_enough!(area, 5, r, g),
+            &ProtoError::NotEnoughDataForGlobalReqRepayId { required: r, given: g, } => encode_not_enough!(area, 6, r, g),
+            &ProtoError::NotEnoughDataForGlobalReqRepayStatus { required: r, given: g, } => encode_not_enough!(area, 7, r, g),
+            &ProtoError::InvalidGlobalReqRepayStatusTag(tag) => encode_tag!(area, 8, tag),
+            &ProtoError::NotEnoughDataForLocalReqTag { required: r, given: g, } => encode_not_enough!(area, 9, r, g),
+            &ProtoError::InvalidLocalReqTag(tag) => encode_tag!(area, 10, tag),
+            &ProtoError::NotEnoughDataForLocalReqLoadId { required: r, given: g, } => encode_not_enough!(area, 11, r, g),
+            &ProtoError::NotEnoughDataForRepTag { required: r, given: g, } => encode_not_enough!(area, 12, r, g),
+            &ProtoError::InvalidRepTag(tag) => encode_tag!(area, 13, tag),
+            &ProtoError::NotEnoughDataForGlobalRepTag { required: r, given: g, } => encode_not_enough!(area, 14, r, g),
+            &ProtoError::InvalidGlobalRepTag(tag) => encode_tag!(area, 15, tag),
+            &ProtoError::NotEnoughDataForGlobalRepCountCount { required: r, given: g, } => encode_not_enough!(area, 16, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepAddedId { required: r, given: g, } => encode_not_enough!(area, 17, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepLendId { required: r, given: g, } => encode_not_enough!(area, 18, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorTag { required: r, given: g, } => encode_not_enough!(area, 19, r, g),
+            &ProtoError::InvalidProtoErrorTag(tag) => encode_tag!(area, 20, tag),
+            &ProtoError::NotEnoughDataForProtoErrorRequired { required: r, given: g, } => encode_not_enough!(area, 21, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorGiven { required: r, given: g, } => encode_not_enough!(area, 22, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: r, given: g, } => encode_not_enough!(area, 23, r, g),
+            &ProtoError::NotEnoughDataForLocalRepTag { required: r, given: g, } => encode_not_enough!(area, 24, r, g),
+            &ProtoError::InvalidLocalRepTag(tag) => encode_tag!(area, 25, tag),
+            &ProtoError::NotEnoughDataForLocalRepLendId { required: r, given: g, } => encode_not_enough!(area, 26, r, g),
+        }
+    }
 }
 
 impl LocalRep {
@@ -308,6 +441,15 @@ impl LocalRep {
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
             &LocalRep::Lend(..) => size_of::<u32>(),
+        }
+    }
+
+    pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
+        match self {
+            &LocalRep::Lend(id) => {
+                let area = put_adv!(area, u8, write_u8, 1);
+                put_adv!(area, u32, write_u32, id)
+            }
         }
     }
 }

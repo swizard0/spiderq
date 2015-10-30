@@ -1,4 +1,4 @@
-#![feature(vec_resize)]
+#![feature(vec_resize, slice_bytes)]
 
 extern crate zmq;
 extern crate getopts;
