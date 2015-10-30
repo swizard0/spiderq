@@ -63,6 +63,15 @@ impl PQueue {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn add(&mut self) {
+        let last_index = self.len() as u32;
+        self.queue.push(PQueueEntry { priority: 0, index: last_index, boost: 0, });
+    }
+
     pub fn top(&self) -> Option<u32> {
         self.queue.peek().map(|e| e.index)
     }
