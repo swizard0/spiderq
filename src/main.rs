@@ -6,6 +6,7 @@ extern crate byteorder;
 
 use std::{io, env, process};
 use std::io::Write;
+use std::convert::From;
 use getopts::Options;
 
 pub mod db;
@@ -16,14 +17,41 @@ pub mod proto;
 enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
+    Zmq(zmq::Error),
+}
+
+impl From<db::Error> for Error {
+    fn from(err: db::Error) -> Error {
+        Error::Db(err)
+    }
+}
+
+impl From<zmq::Error> for Error {
+    fn from(err: zmq::Error) -> Error {
+        Error::Zmq(err)
+    }
 }
 
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
+    let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
 
-    let _db = try!(db::Database::new(&database_dir).map_err(|e| Error::Db(e)));
+    let db = try!(db::Database::new(&database_dir).map_err(|e| Error::Db(e)));
+    let pq = pq::PQueue::new(try!(db.count()));
+    let mut ctx = zmq::Context::new();
+    let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER));
+    let mut sock_master_db = try!(ctx.socket(zmq::REQ));
+    let mut sock_master_pq = try!(ctx.socket(zmq::REQ));
+    let mut sock_db_master = try!(ctx.socket(zmq::REP));
+    let mut sock_pq_master = try!(ctx.socket(zmq::REP));
 
+    try!(sock_master_ext.bind(&zmq_addr));
+    try!(sock_master_db.bind("inproc://db"));
+    try!(sock_db_master.connect("inproc://db"));
+    try!(sock_master_pq.bind("inproc://pq"));
+    try!(sock_pq_master.connect("inproc://pq"));
+    
     Ok(())
 }
 
@@ -174,6 +202,7 @@ mod test {
         assert_encode_decode_req(Req::Global(GlobalReq::Repay(18, pq::RepayStatus::Reward)));
         assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, pq::RepayStatus::Requeue)));
         assert_encode_decode_req(Req::Local(LocalReq::Load(217)));
+        assert_encode_decode_req(Req::Local(LocalReq::Stop));
         
         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Count(97)));
         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Added(167)));
@@ -207,6 +236,7 @@ mod test {
         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidLocalRepTag(157)));
         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepLendId { required: 177, given: 167, }));
         assert_encode_decode_rep(Rep::Local(LocalRep::Lend(147)));
+        assert_encode_decode_rep(Rep::Local(LocalRep::StopAck));
     }
 }
 
