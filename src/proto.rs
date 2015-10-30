@@ -3,7 +3,7 @@ use std::slice::bytes;
 use byteorder::{ByteOrder, BigEndian};
 use super::pq::RepayStatus;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum GlobalReq<'a> {
     Count,
     Add(Option<&'a [u8]>),
@@ -11,12 +11,12 @@ pub enum GlobalReq<'a> {
     Repay(u32, RepayStatus),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LocalReq {
     Load(u32),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Req<'a> {
     Global(GlobalReq<'a>),
     Local(LocalReq),
@@ -211,8 +211,10 @@ impl LocalReq {
 
     pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
         match self {
-            &LocalReq::Load(id) =>
-                put_adv!(area, u32, write_u32, id),
+            &LocalReq::Load(id) => {
+                let area = put_adv!(area, u8, write_u8, 1);
+                put_adv!(area, u32, write_u32, id)
+            },
         }
     }
 }
