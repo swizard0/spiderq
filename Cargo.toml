@@ -6,3 +6,4 @@ authors = ["Alexey Voznyuk <me@swizard.info>"]
 [dependencies]
 getopts = "*"
 byteorder = "*"
+zmq = "*"

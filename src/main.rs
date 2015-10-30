@@ -1,5 +1,6 @@
 #![feature(vec_resize)]
 
+extern crate zmq;
 extern crate getopts;
 extern crate byteorder;
 
@@ -9,6 +10,7 @@ use getopts::Options;
 
 pub mod db;
 pub mod pq;
+pub mod proto;
 
 #[derive(Debug)]
 enum Error {
