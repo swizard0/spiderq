@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 use std::collections::{BinaryHeap, HashMap};
+use super::proto::RepayStatus;
 
 #[derive(PartialEq, Eq)]
 struct PQueueEntry {
@@ -45,13 +46,6 @@ pub struct PQueue {
     queue: BinaryHeap<PQueueEntry>,
     lentm: HashMap<u32, (u64, PQueueEntry)>,
     lentq: BinaryHeap<LentEntry>,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum RepayStatus {
-    Penalty,
-    Reward,
-    Requeue,
 }
 
 impl PQueue {

@@ -1,7 +1,13 @@
 use std::mem::size_of;
 use std::slice::bytes;
 use byteorder::{ByteOrder, BigEndian};
-use super::pq::RepayStatus;
+
+#[derive(Debug, PartialEq)]
+pub enum RepayStatus {
+    Penalty,
+    Reward,
+    Requeue,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum GlobalReq<'a> {

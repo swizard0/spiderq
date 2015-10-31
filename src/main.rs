@@ -7,11 +7,13 @@ extern crate byteorder;
 use std::{io, env, process};
 use std::io::Write;
 use std::convert::From;
+use std::thread::spawn;
 use getopts::Options;
 
 pub mod db;
 pub mod pq;
 pub mod proto;
+use proto::{RepayStatus, Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
 #[derive(Debug)]
 enum Error {
@@ -51,7 +53,43 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     try!(sock_db_master.connect("inproc://db"));
     try!(sock_master_pq.bind("inproc://pq"));
     try!(sock_pq_master.connect("inproc://pq"));
+
+    spawn(move || worker_db(sock_db_master, db).unwrap());
+    spawn(move || worker_pq(sock_pq_master, pq).unwrap());
+    try!(master(sock_master_ext, sock_master_db, sock_master_pq));
     
+    Ok(())
+}
+
+fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
+    let bytes_required = rep.encode_len();
+    let mut msg = try!(zmq::Message::with_capacity(bytes_required));
+    rep.encode(&mut msg);
+    try!(sock.send_msg(msg, 0));
+    Ok(())
+}
+
+fn worker_db(mut sock: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
+    loop {
+        // let req_msg = try!(sock.recv_msg(0));
+        // match Req::decode(&req_msg) {
+        //     Ok(Req::Local(LocalReq::Stop)) => {
+        //         try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
+        //         break;
+        //     },
+            
+        // }
+    }
+}
+
+fn worker_pq(sock: zmq::Socket, pq: pq::PQueue) -> Result<(), Error> {
+    loop {
+        
+    }
+}
+
+fn master(sock_ext: zmq::Socket, sock_db: zmq::Socket, sock_pq: zmq::Socket) -> Result<(), Error> {
+
     Ok(())
 }
 
@@ -79,7 +117,7 @@ mod test {
     use std::fs;
     use std::time::Duration;
     use super::{db, pq};
-    use super::proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
+    use super::proto::{RepayStatus, Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
     fn mkdb(path: &str) -> db::Database {
         let _ = fs::remove_dir_all(path);
@@ -149,7 +187,7 @@ mod test {
         assert_eq!(pq.lend(Duration::new(5, 0)), Some(1));
         assert_eq!(pq.top(), Some(2));
         assert_eq!(pq.next_timeout(), Some(Duration::new(5, 0)));
-        pq.repay(1, pq::RepayStatus::Reward);
+        pq.repay(1, RepayStatus::Reward);
         assert_eq!(pq.top(), Some(2));
         assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
         pq.repay_timed_out();
@@ -171,7 +209,7 @@ mod test {
         let mut pq = pq::PQueue::new(2);
         assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
         assert_eq!(pq.lend(Duration::new(15, 0)), Some(1));
-        pq.repay(1, pq::RepayStatus::Penalty);
+        pq.repay(1, RepayStatus::Penalty);
         assert_eq!(pq.lend(Duration::new(20, 0)), Some(1));
         assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
         pq.repay_timed_out();
@@ -198,9 +236,9 @@ mod test {
         assert_encode_decode_req(Req::Global(GlobalReq::Add(None)));
         assert_encode_decode_req(Req::Global(GlobalReq::Add(Some(some_data))));
         assert_encode_decode_req(Req::Global(GlobalReq::Lend { timeout: 177, }));
-        assert_encode_decode_req(Req::Global(GlobalReq::Repay(17, pq::RepayStatus::Penalty)));
-        assert_encode_decode_req(Req::Global(GlobalReq::Repay(18, pq::RepayStatus::Reward)));
-        assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, pq::RepayStatus::Requeue)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(17, RepayStatus::Penalty)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(18, RepayStatus::Reward)));
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, RepayStatus::Requeue)));
         assert_encode_decode_req(Req::Local(LocalReq::Load(217)));
         assert_encode_decode_req(Req::Local(LocalReq::Stop));
         
