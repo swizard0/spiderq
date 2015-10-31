@@ -115,9 +115,7 @@ fn main() {
 #[cfg(test)]
 mod test {
     use std::fs;
-    use std::time::Duration;
     use super::{db, pq};
-    use super::proto::RepayStatus;
 
     fn mkdb(path: &str) -> db::Database {
         let _ = fs::remove_dir_all(path);
@@ -175,45 +173,6 @@ mod test {
             Err(db::Error::IndexIsTooBig { given: 3, total: 3, }) => (),
             other => panic!("unexpected Database::load return value: {:?}", other),
         }
-    }
-
-    #[test]
-    fn pqueue_basic() {
-        let mut pq = pq::PQueue::new(10);
-        assert_eq!(pq.top(), Some(0));
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
-        assert_eq!(pq.top(), Some(1));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
-        assert_eq!(pq.lend(Duration::new(5, 0)), Some(1));
-        assert_eq!(pq.top(), Some(2));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(5, 0)));
-        pq.repay(1, RepayStatus::Reward);
-        assert_eq!(pq.top(), Some(2));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
-        pq.repay_timed_out();
-        assert_eq!(pq.next_timeout(), None);
-        assert_eq!(pq.lend(Duration::new(5, 0)), Some(0));
-        assert_eq!(pq.lend(Duration::new(6, 0)), Some(2));
-        assert_eq!(pq.lend(Duration::new(7, 0)), Some(3));
-        assert_eq!(pq.lend(Duration::new(8, 0)), Some(4));
-        assert_eq!(pq.lend(Duration::new(9, 0)), Some(5));
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(6));
-        assert_eq!(pq.lend(Duration::new(11, 0)), Some(7));
-        assert_eq!(pq.lend(Duration::new(12, 0)), Some(8));
-        assert_eq!(pq.lend(Duration::new(13, 0)), Some(1));
-        assert_eq!(pq.lend(Duration::new(14, 0)), Some(9));
-    }
-
-    #[test]
-    fn pqueue_double_lend() {
-        let mut pq = pq::PQueue::new(2);
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
-        assert_eq!(pq.lend(Duration::new(15, 0)), Some(1));
-        pq.repay(1, RepayStatus::Penalty);
-        assert_eq!(pq.lend(Duration::new(20, 0)), Some(1));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
-        pq.repay_timed_out();
-        assert_eq!(pq.next_timeout(), Some(Duration::new(20, 0)));
     }
 }
 
