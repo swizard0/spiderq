@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
-use std::time::Duration;
 use std::collections::{BinaryHeap, HashMap};
+use time::Duration;
 use super::proto::RepayStatus;
 
 #[derive(PartialEq, Eq)]
@@ -62,9 +62,10 @@ impl PQueue {
         self.queue.len()
     }
 
-    pub fn add(&mut self) {
+    pub fn add(&mut self) -> u32 {
         let last_index = self.len() as u32;
         self.queue.push(PQueueEntry { priority: 0, index: last_index, boost: 0, });
+        last_index
     }
 
     pub fn top(&self) -> Option<u32> {
@@ -124,7 +125,7 @@ impl PQueue {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use time::Duration;
     use super::PQueue;
     use super::super::proto::RepayStatus;
 
@@ -132,39 +133,49 @@ mod test {
     fn basic_api() {
         let mut pq = PQueue::new(10);
         assert_eq!(pq.top(), Some(0));
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
+        assert_eq!(pq.lend(Duration::seconds(10)), Some(0));
         assert_eq!(pq.top(), Some(1));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
-        assert_eq!(pq.lend(Duration::new(5, 0)), Some(1));
+        assert_eq!(pq.next_timeout(), Some(Duration::seconds(10)));
+        assert_eq!(pq.lend(Duration::seconds(5)), Some(1));
         assert_eq!(pq.top(), Some(2));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(5, 0)));
+        assert_eq!(pq.next_timeout(), Some(Duration::seconds(5)));
         pq.repay(1, RepayStatus::Reward);
         assert_eq!(pq.top(), Some(2));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
+        assert_eq!(pq.next_timeout(), Some(Duration::seconds(10)));
         pq.repay_timed_out();
         assert_eq!(pq.next_timeout(), None);
-        assert_eq!(pq.lend(Duration::new(5, 0)), Some(0));
-        assert_eq!(pq.lend(Duration::new(6, 0)), Some(2));
-        assert_eq!(pq.lend(Duration::new(7, 0)), Some(3));
-        assert_eq!(pq.lend(Duration::new(8, 0)), Some(4));
-        assert_eq!(pq.lend(Duration::new(9, 0)), Some(5));
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(6));
-        assert_eq!(pq.lend(Duration::new(11, 0)), Some(7));
-        assert_eq!(pq.lend(Duration::new(12, 0)), Some(8));
-        assert_eq!(pq.lend(Duration::new(13, 0)), Some(1));
-        assert_eq!(pq.lend(Duration::new(14, 0)), Some(9));
+        assert_eq!(pq.lend(Duration::seconds(5)), Some(0));
+        assert_eq!(pq.lend(Duration::seconds(6)), Some(2));
+        assert_eq!(pq.lend(Duration::seconds(7)), Some(3));
+        assert_eq!(pq.lend(Duration::seconds(8)), Some(4));
+        assert_eq!(pq.lend(Duration::seconds(9)), Some(5));
+        assert_eq!(pq.lend(Duration::seconds(10)), Some(6));
+        assert_eq!(pq.lend(Duration::seconds(11)), Some(7));
+        assert_eq!(pq.lend(Duration::seconds(12)), Some(8));
+        assert_eq!(pq.lend(Duration::seconds(13)), Some(1));
+        assert_eq!(pq.lend(Duration::seconds(14)), Some(9));
     }
 
     #[test]
     fn double_lend() {
         let mut pq = PQueue::new(2);
-        assert_eq!(pq.lend(Duration::new(10, 0)), Some(0));
-        assert_eq!(pq.lend(Duration::new(15, 0)), Some(1));
+        assert_eq!(pq.lend(Duration::seconds(10)), Some(0));
+        assert_eq!(pq.lend(Duration::seconds(15)), Some(1));
         pq.repay(1, RepayStatus::Penalty);
-        assert_eq!(pq.lend(Duration::new(20, 0)), Some(1));
-        assert_eq!(pq.next_timeout(), Some(Duration::new(10, 0)));
+        assert_eq!(pq.lend(Duration::seconds(20)), Some(1));
+        assert_eq!(pq.next_timeout(), Some(Duration::seconds(10)));
         pq.repay_timed_out();
-        assert_eq!(pq.next_timeout(), Some(Duration::new(20, 0)));
+        assert_eq!(pq.next_timeout(), Some(Duration::seconds(20)));
+    }
+
+    #[test]
+    fn add() {
+        let mut pq = PQueue::new(2);
+        assert_eq!(pq.len(), 2);
+        assert_eq!(pq.add(), 2);
+        assert_eq!(pq.len(), 3);
+        assert_eq!(pq.add(), 3);
+        assert_eq!(pq.len(), 4);
     }
 }
 
