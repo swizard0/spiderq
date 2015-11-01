@@ -1,6 +1,7 @@
 #![feature(vec_resize, slice_bytes)]
 
 extern crate zmq;
+extern crate time;
 extern crate getopts;
 extern crate byteorder;
 
@@ -71,20 +72,44 @@ fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
 
 fn worker_db(mut sock: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
-        // let req_msg = try!(sock.recv_msg(0));
-        // match Req::decode(&req_msg) {
-        //     Ok(Req::Local(LocalReq::Stop)) => {
-        //         try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
-        //         break;
-        //     },
-            
-        // }
+        let req_msg = try!(sock.recv_msg(0));
+        match Req::decode(&req_msg) {
+            Ok(Req::Local(LocalReq::Stop)) => {
+                try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
+                return Ok(())
+            },
+            Ok(..) =>
+                try!(proto_reply(&mut sock, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
+            Err(proto_err) =>
+                try!(proto_reply(&mut sock, Rep::GlobalErr(proto_err))),
+        }
     }
 }
 
-fn worker_pq(sock: zmq::Socket, pq: pq::PQueue) -> Result<(), Error> {
+fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
     loop {
-        
+        let req_msg = try!(sock.recv_msg(0));
+        match Req::decode(&req_msg) {
+            Ok(Req::Local(LocalReq::Stop)) => {
+                try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
+                return Ok(())
+            },
+            Ok(Req::Global(GlobalReq::Count)) => {
+                let count = pq.len();
+                try!(proto_reply(&mut sock, Rep::GlobalOk(GlobalRep::Count(count))))
+            },
+            Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
+                let new_id = pq.add();
+                try!(proto_reply(&mut sock, Rep::Local(LocalRep::Add(new_id))));
+            },
+            Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
+                
+            },
+            Ok(..) =>
+                try!(proto_reply(&mut sock, Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest))),
+            Err(proto_err) =>
+                try!(proto_reply(&mut sock, Rep::GlobalErr(proto_err))),
+        }
     }
 }
 
