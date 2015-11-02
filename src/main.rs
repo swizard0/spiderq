@@ -5,16 +5,18 @@ extern crate time;
 extern crate getopts;
 extern crate byteorder;
 
-use std::{io, env, process};
+use std::{io, env, mem, process};
 use std::io::Write;
 use std::convert::From;
 use std::thread::spawn;
+use std::collections::VecDeque;
 use getopts::Options;
+use time::{SteadyTime, Duration};
 
 pub mod db;
 pub mod pq;
 pub mod proto;
-use proto::{RepayStatus, Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
+use proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
 #[derive(Debug)]
 enum Error {
@@ -87,29 +89,80 @@ fn worker_db(mut sock: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
 }
 
 fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
+    let mut pending_queue = VecDeque::new();
     loop {
-        let req_msg = try!(sock.recv_msg(0));
-        match Req::decode(&req_msg) {
-            Ok(Req::Local(LocalReq::Stop)) => {
-                try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
-                return Ok(())
-            },
-            Ok(Req::Global(GlobalReq::Count)) => {
-                let count = pq.len();
-                try!(proto_reply(&mut sock, Rep::GlobalOk(GlobalRep::Count(count))))
-            },
-            Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
-                let new_id = pq.add();
-                try!(proto_reply(&mut sock, Rep::Local(LocalRep::Add(new_id))));
-            },
-            Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
-                
-            },
-            Ok(..) =>
-                try!(proto_reply(&mut sock, Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest))),
-            Err(proto_err) =>
-                try!(proto_reply(&mut sock, Rep::GlobalErr(proto_err))),
+        let timeout = if let Some(next_timeout) = pq.next_timeout() {
+            let interval = next_timeout - SteadyTime::now();
+            let timeout = interval.num_milliseconds();
+            if timeout < 0 {
+                pq.repay_timed_out();
+                continue;
+            }
+            timeout
+        } else {
+            -1
+        };
+
+        let mut pollitems = [sock.as_poll_item(zmq::POLLIN)];
+        let avail = try!(zmq::poll(&mut pollitems, timeout));
+        if (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN) {
+            let req_msg = try!(sock.recv_msg(0));
+            pending_queue.push_front(req_msg);
         }
+
+        let mut tmp_queue = VecDeque::new();
+        enum Action<'a> {
+            Reply(Rep<'a>),
+            DoNothing,
+            Reenqueue,
+        }
+
+        while let Some(msg) = pending_queue.pop_front() {
+            let action = match Req::decode(&msg) {
+                Ok(Req::Local(LocalReq::Stop)) => {
+                    try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
+                    return Ok(())
+                },
+                Ok(Req::Global(GlobalReq::Count)) => {
+                    let count = pq.len();
+                    Action::Reply(Rep::GlobalOk(GlobalRep::Count(count)))
+                },
+                Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
+                    let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
+                    if let Some(id) = pq.lend(trigger_at) {
+                        Action::Reply(Rep::Local(LocalRep::Lend(id)))
+                    } else {
+                        Action::Reenqueue
+                    }
+                },
+                Ok(Req::Global(GlobalReq::Repay(id, status))) => {
+                    pq.repay(id, status);
+                    Action::Reply(Rep::GlobalOk(GlobalRep::Repaid))
+                },
+                Ok(Req::Local(LocalReq::AddEnqueue(expected_id))) => {
+                    let new_id = pq.add();
+                    assert_eq!(expected_id, new_id);
+                    Action::DoNothing
+                },
+                Ok(..) =>
+                    Action::Reply(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest)),
+                Err(proto_err) =>
+                    Action::Reply(Rep::GlobalErr(proto_err)),
+            };
+
+            match action {
+                Action::Reply(reply) => {
+                    try!(proto_reply(&mut sock, reply));
+                },
+                Action::DoNothing =>
+                    (),
+                Action::Reenqueue => {
+                    tmp_queue.push_back(msg);
+                }
+            }
+        }
+
+        mem::replace(&mut pending_queue, tmp_queue);
     }
 }
 
