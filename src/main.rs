@@ -165,9 +165,11 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
                     Action::Reply(Rep::GlobalOk(GlobalRep::Count(count)))
                 },
                 Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
-                    let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
-                    if let Some(id) = pq.lend(trigger_at) {
-                        Action::Reply(Rep::Local(LocalRep::Lend(id)))
+                    if let Some(id) = pq.top() {
+                        try!(proto_reply(sock_tx, Rep::Local(LocalRep::Lend(id))));
+                        let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
+                        assert_eq!(pq.lend(trigger_at), Some(id));
+                        Action::DoNothing
                     } else {
                         Action::Reenqueue
                     }
