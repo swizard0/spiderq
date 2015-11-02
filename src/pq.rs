@@ -105,8 +105,7 @@ impl PQueue {
         if let Some((_, mut entry)) = self.lentm.remove(&index) {
             self.serial += 1;
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
-            let total = self.queue.len() as u64; // TODO: this is a bug (total = 1, min_priority = 2)
-            let region = total - min_priority;
+            let region = self.serial - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
                 RepayStatus::Penalty => { entry.boost -= 1; entry.boost },
@@ -151,9 +150,9 @@ mod test {
         assert_eq!(pq.lend(time + Duration::seconds(8)), Some(4));
         assert_eq!(pq.lend(time + Duration::seconds(9)), Some(5));
         assert_eq!(pq.lend(time + Duration::seconds(10)), Some(6));
-        assert_eq!(pq.lend(time + Duration::seconds(11)), Some(7));
-        assert_eq!(pq.lend(time + Duration::seconds(12)), Some(8));
-        assert_eq!(pq.lend(time + Duration::seconds(13)), Some(1));
+        assert_eq!(pq.lend(time + Duration::seconds(11)), Some(1));
+        assert_eq!(pq.lend(time + Duration::seconds(12)), Some(7));
+        assert_eq!(pq.lend(time + Duration::seconds(13)), Some(8));
         assert_eq!(pq.lend(time + Duration::seconds(14)), Some(9));
     }
 
