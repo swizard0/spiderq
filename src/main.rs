@@ -175,8 +175,9 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
                     }
                 },
                 Ok(Req::Global(GlobalReq::Repay(id, status))) => {
+                    try!(proto_reply(sock_tx, Rep::GlobalOk(GlobalRep::Repaid)));
                     pq.repay(id, status);
-                    Action::Reply(Rep::GlobalOk(GlobalRep::Repaid))
+                    Action::DoNothing
                 },
                 Ok(Req::Local(LocalReq::AddEnqueue(expected_id))) => {
                     let new_id = pq.add();
