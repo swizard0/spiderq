@@ -98,11 +98,14 @@ pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
     }
 }
 
-#[allow(unused_variables, unused_mut)]
 fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
         let req_msg = try!(sock_rx.recv_msg(0));
         match Req::decode(&req_msg) {
+            Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
+                let id = try!(db.add(maybe_data.unwrap_or(&[])));
+                try!(proto_reply(sock_tx, Rep::Local(LocalRep::Add(id))));
+            },
             Ok(Req::Local(LocalReq::Stop)) => {
                 try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
                 return Ok(())
@@ -255,65 +258,77 @@ mod test {
         assert_eq!(Rep::decode(&rep_msg), Ok(rep));
     }
 
+    fn with_worker<WF, MF>(base_addr: &str, worker_fn: WF, master_fn: MF)
+        where WF: FnOnce(zmq::Socket, zmq::Socket) + Send + 'static, MF: FnOnce(&mut zmq::Socket, &mut zmq::Socket) + Send + 'static
+    {
+        let mut ctx = zmq::Context::new();
+        let mut sock_master_slave_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_master_slave_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_slave_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_slave_master_rx = ctx.socket(zmq::PULL).unwrap();
+
+        let tx_addr = format!("inproc://{}_txrx", base_addr);
+        sock_master_slave_tx.bind(&tx_addr).unwrap();
+        sock_slave_master_rx.connect(&tx_addr).unwrap();
+        let rx_addr = format!("inproc://{}_rxtx", base_addr);
+        sock_master_slave_rx.bind(&rx_addr).unwrap();
+        sock_slave_master_tx.connect(&rx_addr).unwrap();
+
+        let worker = spawn(move || worker_fn(sock_slave_master_tx, sock_slave_master_rx));
+        master_fn(&mut sock_master_slave_tx, &mut sock_master_slave_rx);
+        proto_request(&mut sock_master_slave_tx, Req::Local(LocalReq::Stop)).unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn pq_worker() {
         let pq = pq::PQueue::new(3);
-        let mut ctx = zmq::Context::new();
-        let mut sock_master_pq_tx = ctx.socket(zmq::PUSH).unwrap();
-        let mut sock_master_pq_rx = ctx.socket(zmq::PULL).unwrap();
-        let mut sock_pq_master_tx = ctx.socket(zmq::PUSH).unwrap();
-        let mut sock_pq_master_rx = ctx.socket(zmq::PULL).unwrap();
-
-        sock_master_pq_tx.bind("inproc://pq_txrx").unwrap();
-        sock_pq_master_rx.connect("inproc://pq_txrx").unwrap();
-        sock_master_pq_rx.bind("inproc://pq_rxtx").unwrap();
-        sock_pq_master_tx.connect("inproc://pq_rxtx").unwrap();
-
-        let worker = spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(3)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                             Rep::Local(LocalRep::Lend(0)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(2)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                             Rep::Local(LocalRep::Lend(1)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(1)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Repay(1, RepayStatus::Front)),
-                             Rep::GlobalOk(GlobalRep::Repaid));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(2)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                             Rep::Local(LocalRep::Lend(1)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(1)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Lend { timeout: 1000, }),
-                             Rep::Local(LocalRep::Lend(2)));
-        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                             Req::Global(GlobalReq::Count),
-                             Rep::GlobalOk(GlobalRep::Count(0)));
-        {
-            let start = SteadyTime::now();
-            assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
-                                 Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                 Rep::Local(LocalRep::Lend(2)));
-            let interval = SteadyTime::now() - start;
-            assert_eq!(interval.num_seconds(), 1);
-        }
-
-        proto_request(&mut sock_master_pq_tx, Req::Local(LocalReq::Stop)).unwrap();
-        worker.join().unwrap();
+        with_worker(
+            "pq",
+            move |sock_pq_master_tx, sock_pq_master_rx| worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq),
+            move |sock_master_pq_tx, sock_master_pq_rx| {
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(3)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                     Rep::Local(LocalRep::Lend(0)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(2)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                     Rep::Local(LocalRep::Lend(1)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(1)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Repay(1, RepayStatus::Front)),
+                                     Rep::GlobalOk(GlobalRep::Repaid));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(2)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                     Rep::Local(LocalRep::Lend(1)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(1)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Lend { timeout: 1000, }),
+                                     Rep::Local(LocalRep::Lend(2)));
+                assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                     Req::Global(GlobalReq::Count),
+                                     Rep::GlobalOk(GlobalRep::Count(0)));
+                {
+                    let start = SteadyTime::now();
+                    assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
+                                         Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                         Rep::Local(LocalRep::Lend(2)));
+                    let interval = SteadyTime::now() - start;
+                    assert_eq!(interval.num_seconds(), 1);
+                }
+            });
     }
 
     #[test]
@@ -321,21 +336,14 @@ mod test {
         let path = "/tmp/spiderq_main";
         let _ = fs::remove_dir_all(path);
         let db = db::Database::new(path).unwrap();
-        let mut ctx = zmq::Context::new();
-        let mut sock_master_db_tx = ctx.socket(zmq::PUSH).unwrap();
-        let mut sock_master_db_rx = ctx.socket(zmq::PULL).unwrap();
-        let mut sock_db_master_tx = ctx.socket(zmq::PUSH).unwrap();
-        let mut sock_db_master_rx = ctx.socket(zmq::PULL).unwrap();
-
-        sock_master_db_tx.bind("inproc://db_txrx").unwrap();
-        sock_db_master_rx.connect("inproc://db_txrx").unwrap();
-        sock_master_db_rx.bind("inproc://db_rxtx").unwrap();
-        sock_db_master_tx.connect("inproc://db_rxtx").unwrap();
-
-        let worker = spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
-
-        proto_request(&mut sock_master_db_tx, Req::Local(LocalReq::Stop)).unwrap();
-        worker.join().unwrap();
+        with_worker(
+            "pq",
+            move |sock_db_master_tx, sock_db_master_rx| worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db),
+            move |sock_master_db_tx, sock_master_db_rx| {
+                assert_request_reply(sock_master_db_tx, sock_master_db_rx,
+                                     Req::Global(GlobalReq::Add(None)),
+                                     Rep::Local(LocalRep::Add(0)));
+            });
     }
 }
 
