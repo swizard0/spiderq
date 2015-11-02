@@ -46,20 +46,28 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let pq = pq::PQueue::new(try!(db.count()));
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER));
-    let mut sock_master_db = try!(ctx.socket(zmq::REQ));
-    let mut sock_master_pq = try!(ctx.socket(zmq::REQ));
-    let mut sock_db_master = try!(ctx.socket(zmq::REP));
-    let mut sock_pq_master = try!(ctx.socket(zmq::REP));
+    let mut sock_master_db_tx = try!(ctx.socket(zmq::PUSH));
+    let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL));
+    let mut sock_master_pq_tx = try!(ctx.socket(zmq::PUSH));
+    let mut sock_master_pq_rx = try!(ctx.socket(zmq::PULL));
+    let mut sock_db_master_tx = try!(ctx.socket(zmq::PUSH));
+    let mut sock_db_master_rx = try!(ctx.socket(zmq::PULL));
+    let mut sock_pq_master_tx = try!(ctx.socket(zmq::PUSH));
+    let mut sock_pq_master_rx = try!(ctx.socket(zmq::PULL));
 
     try!(sock_master_ext.bind(&zmq_addr));
-    try!(sock_master_db.bind("inproc://db"));
-    try!(sock_db_master.connect("inproc://db"));
-    try!(sock_master_pq.bind("inproc://pq"));
-    try!(sock_pq_master.connect("inproc://pq"));
+    try!(sock_master_db_tx.bind("inproc://db_txrx"));
+    try!(sock_db_master_rx.connect("inproc://db_txrx"));
+    try!(sock_master_db_rx.bind("inproc://db_rxtx"));
+    try!(sock_db_master_tx.connect("inproc://db_rxtx"));
+    try!(sock_master_pq_tx.bind("inproc://pq_txrx"));
+    try!(sock_pq_master_rx.connect("inproc://pq_txrx"));
+    try!(sock_master_pq_rx.bind("inproc://pq_rxtx"));
+    try!(sock_pq_master_tx.connect("inproc://pq_rxtx"));
 
-    spawn(move || worker_db(sock_db_master, db).unwrap());
-    spawn(move || worker_pq(sock_pq_master, pq).unwrap());
-    try!(master(sock_master_ext, sock_master_db, sock_master_pq));
+    spawn(move || worker_db(sock_db_master_tx, sock_db_master_rx, db).unwrap());
+    spawn(move || worker_pq(sock_pq_master_tx, sock_pq_master_rx, pq).unwrap());
+    try!(master(sock_master_ext, sock_master_db_tx, sock_master_db_rx, sock_master_pq_tx, sock_master_pq_rx));
     
     Ok(())
 }
@@ -72,23 +80,24 @@ fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
     Ok(())
 }
 
-fn worker_db(mut sock: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
+#[allow(unused_variables, unused_mut)]
+fn worker_db(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
-        let req_msg = try!(sock.recv_msg(0));
+        let req_msg = try!(sock_rx.recv_msg(0));
         match Req::decode(&req_msg) {
             Ok(Req::Local(LocalReq::Stop)) => {
-                try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
+                try!(proto_reply(&mut sock_tx, Rep::Local(LocalRep::StopAck)));
                 return Ok(())
             },
             Ok(..) =>
-                try!(proto_reply(&mut sock, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
+                try!(proto_reply(&mut sock_tx, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
             Err(proto_err) =>
-                try!(proto_reply(&mut sock, Rep::GlobalErr(proto_err))),
+                try!(proto_reply(&mut sock_tx, Rep::GlobalErr(proto_err))),
         }
     }
 }
 
-fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
+fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
     let mut pending_queue = VecDeque::new();
     loop {
         let timeout = if let Some(next_timeout) = pq.next_timeout() {
@@ -103,10 +112,10 @@ fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
             -1
         };
 
-        let mut pollitems = [sock.as_poll_item(zmq::POLLIN)];
+        let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
         let avail = try!(zmq::poll(&mut pollitems, timeout));
         if (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN) {
-            let req_msg = try!(sock.recv_msg(0));
+            let req_msg = try!(sock_rx.recv_msg(0));
             pending_queue.push_front(req_msg);
         }
 
@@ -115,14 +124,13 @@ fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
             Reply(Rep<'a>),
             DoNothing,
             Reenqueue,
+            Stop,
         }
 
         while let Some(msg) = pending_queue.pop_front() {
             let action = match Req::decode(&msg) {
-                Ok(Req::Local(LocalReq::Stop)) => {
-                    try!(proto_reply(&mut sock, Rep::Local(LocalRep::StopAck)));
-                    return Ok(())
-                },
+                Ok(Req::Local(LocalReq::Stop)) =>
+                    Action::Stop,
                 Ok(Req::Global(GlobalReq::Count)) => {
                     let count = pq.len();
                     Action::Reply(Rep::GlobalOk(GlobalRep::Count(count)))
@@ -152,12 +160,16 @@ fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
 
             match action {
                 Action::Reply(reply) => {
-                    try!(proto_reply(&mut sock, reply));
+                    try!(proto_reply(&mut sock_tx, reply));
                 },
                 Action::DoNothing =>
                     (),
                 Action::Reenqueue => {
                     tmp_queue.push_back(msg);
+                },
+                Action::Stop => {
+                    try!(proto_reply(&mut sock_tx, Rep::Local(LocalRep::StopAck)));
+                    return Ok(());
                 }
             }
         }
@@ -166,7 +178,12 @@ fn worker_pq(mut sock: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
     }
 }
 
-fn master(sock_ext: zmq::Socket, sock_db: zmq::Socket, sock_pq: zmq::Socket) -> Result<(), Error> {
+#[allow(unused_variables, unused_mut)]
+fn master(mut sock_ext: zmq::Socket,
+          mut sock_db_tx: zmq::Socket,
+          mut sock_db_rx: zmq::Socket,
+          mut sock_pq_tx: zmq::Socket,
+          mut sock_pq_rx: zmq::Socket) -> Result<(), Error> {
 
     Ok(())
 }
