@@ -19,7 +19,7 @@ pub mod proto;
 use proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
     Zmq(zmq::Error),
@@ -72,7 +72,15 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     Ok(())
 }
 
-fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
+pub fn proto_request(sock: &mut zmq::Socket, req: Req) -> Result<(), Error> {
+    let bytes_required = req.encode_len();
+    let mut msg = try!(zmq::Message::with_capacity(bytes_required));
+    req.encode(&mut msg);
+    try!(sock.send_msg(msg, 0));
+    Ok(())
+}
+
+pub fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
     let bytes_required = rep.encode_len();
     let mut msg = try!(zmq::Message::with_capacity(bytes_required));
     rep.encode(&mut msg);
@@ -97,7 +105,7 @@ fn worker_db(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut db: db::Dat
     }
 }
 
-fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
+pub fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
     let mut pending_queue = VecDeque::new();
     loop {
         let timeout = if let Some(next_timeout) = pq.next_timeout() {
@@ -209,5 +217,63 @@ fn main() {
 
 #[cfg(test)]
 mod test {
+    extern crate zmq;
+
+    use std::thread::spawn;
+    use super::{pq, worker_pq, proto_request};
+    use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
+
+    fn assert_request_reply(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, req: Req, rep: Rep) {
+        proto_request(sock_tx, req).unwrap();
+        let rep_msg = sock_rx.recv_msg(0).unwrap();
+        assert_eq!(Rep::decode(&rep_msg), Ok(rep));
+    }
+
+    #[test]
+    fn pq_worker() {
+        let pq = pq::PQueue::new(3);
+        let mut ctx = zmq::Context::new();
+        let mut sock_master_pq_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_master_pq_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_pq_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_pq_master_rx = ctx.socket(zmq::PULL).unwrap();
+
+        sock_master_pq_tx.bind("inproc://pq_txrx").unwrap();
+        sock_pq_master_rx.connect("inproc://pq_txrx").unwrap();
+        sock_master_pq_rx.bind("inproc://pq_rxtx").unwrap();
+        sock_pq_master_tx.connect("inproc://pq_rxtx").unwrap();
+
+        let worker = spawn(move || worker_pq(sock_pq_master_tx, sock_pq_master_rx, pq).unwrap());
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(3)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                             Rep::Local(LocalRep::Lend(0)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(2)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                             Rep::Local(LocalRep::Lend(1)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(1)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Repay(1, RepayStatus::Front)),
+                             Rep::GlobalOk(GlobalRep::Repaid));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(2)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                             Rep::Local(LocalRep::Lend(1)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(1)));
+
+        proto_request(&mut sock_master_pq_tx, Req::Local(LocalReq::Stop)).unwrap();
+        worker.join().unwrap();
+    }
 }
 
