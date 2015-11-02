@@ -43,6 +43,7 @@ pub enum LocalRep {
     Add(u32),
     Lend(u32),
     StopAck,
+    Panic(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -484,6 +485,8 @@ impl LocalRep {
             },
             (3, _) => 
                 Ok(LocalRep::StopAck),
+            (4, msg_buf) =>
+                Ok(LocalRep::Panic(unsafe { ::std::str::from_utf8_unchecked(msg_buf).to_owned() })),
             (tag, _) => 
                 return Err(ProtoError::InvalidLocalRepTag(tag)),
         }
@@ -493,6 +496,7 @@ impl LocalRep {
         size_of::<u8>() + match self {
             &LocalRep::Lend(..) | &LocalRep::Add(..) => size_of::<u32>(),
             &LocalRep::StopAck => 0,
+            &LocalRep::Panic(ref msg) => msg.as_bytes().len(),
         }
     }
 
@@ -508,6 +512,12 @@ impl LocalRep {
             },
             &LocalRep::StopAck =>
                 put_adv!(area, u8, write_u8, 3),
+            &LocalRep::Panic(ref msg) => {
+                let area = put_adv!(area, u8, write_u8, 4);
+                let msg_bytes = msg.as_bytes();
+                bytes::copy_memory(msg_bytes, area);
+                &mut area[msg_bytes.len() ..]
+            }
         }
     }
 }
@@ -769,5 +779,10 @@ mod test {
     #[test]
     fn rep_local_localrep_stopack() {
         assert_encode_decode_rep(Rep::Local(LocalRep::StopAck));
+    }
+
+    #[test]
+    fn rep_local_localrep_panic() {
+        assert_encode_decode_rep(Rep::Local(LocalRep::Panic("some panic message".to_owned())));
     }
 }
