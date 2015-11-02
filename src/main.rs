@@ -243,9 +243,10 @@ fn main() {
 mod test {
     extern crate zmq;
 
+    use std::fs;
     use std::thread::spawn;
     use time::SteadyTime;
-    use super::{pq, worker_pq_entrypoint, proto_request};
+    use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint, proto_request};
     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
 
     fn assert_request_reply(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, req: Req, rep: Rep) {
@@ -312,6 +313,28 @@ mod test {
         }
 
         proto_request(&mut sock_master_pq_tx, Req::Local(LocalReq::Stop)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn db_worker() {
+        let path = "/tmp/spiderq_main";
+        let _ = fs::remove_dir_all(path);
+        let db = db::Database::new(path).unwrap();
+        let mut ctx = zmq::Context::new();
+        let mut sock_master_db_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_master_db_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_db_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_db_master_rx = ctx.socket(zmq::PULL).unwrap();
+
+        sock_master_db_tx.bind("inproc://db_txrx").unwrap();
+        sock_db_master_rx.connect("inproc://db_txrx").unwrap();
+        sock_master_db_rx.bind("inproc://db_rxtx").unwrap();
+        sock_db_master_tx.connect("inproc://db_rxtx").unwrap();
+
+        let worker = spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
+
+        proto_request(&mut sock_master_db_tx, Req::Local(LocalReq::Stop)).unwrap();
         worker.join().unwrap();
     }
 }
