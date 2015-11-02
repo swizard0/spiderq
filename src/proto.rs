@@ -39,18 +39,18 @@ pub enum GlobalRep<'a> {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LocalRep {
+pub enum LocalRep<'a> {
     Add(u32),
     Lend(u32),
     StopAck,
-    Panic(String),
+    Panic(&'a str),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Rep<'a> {
     GlobalOk(GlobalRep<'a>),
     GlobalErr(ProtoError),
-    Local(LocalRep),
+    Local(LocalRep<'a>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -472,8 +472,8 @@ impl ProtoError {
     }
 }
 
-impl LocalRep {
-    pub fn decode(data: &[u8]) -> Result<LocalRep, ProtoError> {
+impl<'a> LocalRep<'a> {
+    pub fn decode(data: &'a [u8]) -> Result<LocalRep<'a>, ProtoError> {
         match try_get!(data, u8, read_u8, NotEnoughDataForLocalRepTag) {
             (1, id_buf) => {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalRepLendId);
@@ -486,7 +486,7 @@ impl LocalRep {
             (3, _) => 
                 Ok(LocalRep::StopAck),
             (4, msg_buf) =>
-                Ok(LocalRep::Panic(unsafe { ::std::str::from_utf8_unchecked(msg_buf).to_owned() })),
+                Ok(LocalRep::Panic(unsafe { ::std::str::from_utf8_unchecked(msg_buf) })),
             (tag, _) => 
                 return Err(ProtoError::InvalidLocalRepTag(tag)),
         }
@@ -783,6 +783,6 @@ mod test {
 
     #[test]
     fn rep_local_localrep_panic() {
-        assert_encode_decode_rep(Rep::Local(LocalRep::Panic("some panic message".to_owned())));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Panic("some panic message")));
     }
 }

@@ -91,7 +91,10 @@ pub fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
 pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, db: db::Database)  {
     match worker_db(&mut sock_tx, &mut sock_rx, db) {
         Ok(()) => (),
-        Err(e) => { proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(format!("{:?}", e)))).unwrap(); },
+        Err(e) => {
+            let panic_str = format!("{:?}", e);
+            proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
+        },
     }
 }
 
@@ -115,7 +118,10 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
 pub fn worker_pq_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, pq: pq::PQueue)  {
     match worker_pq(&mut sock_tx, &mut sock_rx, pq) {
         Ok(()) => (),
-        Err(e) => { proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(format!("{:?}", e)))).unwrap(); },
+        Err(e) => {
+            let panic_str = format!("{:?}", e);
+            proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
+        },
     }
 }
 
