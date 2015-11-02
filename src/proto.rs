@@ -20,6 +20,7 @@ pub enum GlobalReq<'a> {
 #[derive(Debug, PartialEq)]
 pub enum LocalReq {
     Load(u32),
+    AddEnqueue(u32),
     Stop,
 }
 
@@ -64,6 +65,7 @@ pub enum ProtoError {
     NotEnoughDataForLocalReqTag { required: usize, given: usize, },
     InvalidLocalReqTag(u8),
     NotEnoughDataForLocalReqLoadId { required: usize, given: usize, },
+    NotEnoughDataForLocalReqAddEnqueueId { required: usize, given: usize, },
     NotEnoughDataForRepTag { required: usize, given: usize, },
     InvalidRepTag(u8),
     NotEnoughDataForGlobalRepTag { required: usize, given: usize, },
@@ -212,7 +214,11 @@ impl LocalReq {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalReqLoadId);
                 Ok(LocalReq::Load(id))
             },
-            (2, _) => 
+            (2, id_buf) => {
+                let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalReqAddEnqueueId);
+                Ok(LocalReq::AddEnqueue(id))
+            },
+            (3, _) => 
                 Ok(LocalReq::Stop),
             (tag, _) => 
                 return Err(ProtoError::InvalidLocalReqTag(tag)),
@@ -221,7 +227,7 @@ impl LocalReq {
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
-            &LocalReq::Load(..) => size_of::<u32>(),
+            &LocalReq::Load(..) | &LocalReq::AddEnqueue(..) => size_of::<u32>(),
             &LocalReq::Stop => 0,
         }
     }
@@ -232,8 +238,12 @@ impl LocalReq {
                 let area = put_adv!(area, u8, write_u8, 1);
                 put_adv!(area, u32, write_u32, id)
             },
+            &LocalReq::AddEnqueue(id) => {
+                let area = put_adv!(area, u8, write_u8, 2);
+                put_adv!(area, u32, write_u32, id)
+            },
             &LocalReq::Stop =>
-                put_adv!(area, u8, write_u8, 2),
+                put_adv!(area, u8, write_u8, 3),
         }
     }
 }
@@ -364,24 +374,25 @@ impl ProtoError {
             (9, buf) => decode_not_enough!(buf, NotEnoughDataForLocalReqTag),
             (10, buf) => decode_tag!(buf, InvalidLocalReqTag),
             (11, buf) => decode_not_enough!(buf, NotEnoughDataForLocalReqLoadId),
-            (12, buf) => decode_not_enough!(buf, NotEnoughDataForRepTag),
-            (13, buf) => decode_tag!(buf, InvalidRepTag),
-            (14, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepTag),
-            (15, buf) => decode_tag!(buf, InvalidGlobalRepTag),
-            (16, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepCountCount),
-            (17, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepAddedId),
-            (18, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepLendId),
-            (19, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorTag),
-            (20, buf) => decode_tag!(buf, InvalidProtoErrorTag),
-            (21, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorRequired),
-            (22, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorGiven),
-            (23, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorInvalidTag),
-            (24, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepTag),
-            (25, buf) => decode_tag!(buf, InvalidLocalRepTag),
-            (26, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepLendId),
-            (27, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepAddId),
-            (28, _) => Ok(ProtoError::UnexpectedWorkerDbRequest),
-            (29, _) => Ok(ProtoError::UnexpectedWorkerPqRequest),
+            (12, buf) => decode_not_enough!(buf, NotEnoughDataForLocalReqAddEnqueueId),
+            (13, buf) => decode_not_enough!(buf, NotEnoughDataForRepTag),
+            (14, buf) => decode_tag!(buf, InvalidRepTag),
+            (15, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepTag),
+            (16, buf) => decode_tag!(buf, InvalidGlobalRepTag),
+            (17, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepCountCount),
+            (18, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepAddedId),
+            (19, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepLendId),
+            (20, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorTag),
+            (21, buf) => decode_tag!(buf, InvalidProtoErrorTag),
+            (22, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorRequired),
+            (23, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorGiven),
+            (24, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorInvalidTag),
+            (25, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepTag),
+            (26, buf) => decode_tag!(buf, InvalidLocalRepTag),
+            (27, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepLendId),
+            (28, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepAddId),
+            (29, _) => Ok(ProtoError::UnexpectedWorkerDbRequest),
+            (30, _) => Ok(ProtoError::UnexpectedWorkerPqRequest),
             (tag, _) => return Err(ProtoError::InvalidProtoErrorTag(tag)),
         }
     }
@@ -395,6 +406,7 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForGlobalReqRepayStatus { .. } |
             &ProtoError::NotEnoughDataForLocalReqTag { .. } |
             &ProtoError::NotEnoughDataForLocalReqLoadId { .. } |
+            &ProtoError::NotEnoughDataForLocalReqAddEnqueueId { .. } |
             &ProtoError::NotEnoughDataForRepTag { .. } |
             &ProtoError::NotEnoughDataForGlobalRepTag { .. } |
             &ProtoError::NotEnoughDataForGlobalRepCountCount { .. } |
@@ -436,24 +448,25 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForLocalReqTag { required: r, given: g, } => encode_not_enough!(area, 9, r, g),
             &ProtoError::InvalidLocalReqTag(tag) => encode_tag!(area, 10, tag),
             &ProtoError::NotEnoughDataForLocalReqLoadId { required: r, given: g, } => encode_not_enough!(area, 11, r, g),
-            &ProtoError::NotEnoughDataForRepTag { required: r, given: g, } => encode_not_enough!(area, 12, r, g),
-            &ProtoError::InvalidRepTag(tag) => encode_tag!(area, 13, tag),
-            &ProtoError::NotEnoughDataForGlobalRepTag { required: r, given: g, } => encode_not_enough!(area, 14, r, g),
-            &ProtoError::InvalidGlobalRepTag(tag) => encode_tag!(area, 15, tag),
-            &ProtoError::NotEnoughDataForGlobalRepCountCount { required: r, given: g, } => encode_not_enough!(area, 16, r, g),
-            &ProtoError::NotEnoughDataForGlobalRepAddedId { required: r, given: g, } => encode_not_enough!(area, 17, r, g),
-            &ProtoError::NotEnoughDataForGlobalRepLendId { required: r, given: g, } => encode_not_enough!(area, 18, r, g),
-            &ProtoError::NotEnoughDataForProtoErrorTag { required: r, given: g, } => encode_not_enough!(area, 19, r, g),
-            &ProtoError::InvalidProtoErrorTag(tag) => encode_tag!(area, 20, tag),
-            &ProtoError::NotEnoughDataForProtoErrorRequired { required: r, given: g, } => encode_not_enough!(area, 21, r, g),
-            &ProtoError::NotEnoughDataForProtoErrorGiven { required: r, given: g, } => encode_not_enough!(area, 22, r, g),
-            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: r, given: g, } => encode_not_enough!(area, 23, r, g),
-            &ProtoError::NotEnoughDataForLocalRepTag { required: r, given: g, } => encode_not_enough!(area, 24, r, g),
-            &ProtoError::InvalidLocalRepTag(tag) => encode_tag!(area, 25, tag),
-            &ProtoError::NotEnoughDataForLocalRepLendId { required: r, given: g, } => encode_not_enough!(area, 26, r, g),
-            &ProtoError::NotEnoughDataForLocalRepAddId { required: r, given: g, } => encode_not_enough!(area, 27, r, g),
-            &ProtoError::UnexpectedWorkerDbRequest => put_adv!(area, u8, write_u8, 28),
-            &ProtoError::UnexpectedWorkerPqRequest => put_adv!(area, u8, write_u8, 29),
+            &ProtoError::NotEnoughDataForLocalReqAddEnqueueId { required: r, given: g, } => encode_not_enough!(area, 12, r, g),
+            &ProtoError::NotEnoughDataForRepTag { required: r, given: g, } => encode_not_enough!(area, 13, r, g),
+            &ProtoError::InvalidRepTag(tag) => encode_tag!(area, 14, tag),
+            &ProtoError::NotEnoughDataForGlobalRepTag { required: r, given: g, } => encode_not_enough!(area, 15, r, g),
+            &ProtoError::InvalidGlobalRepTag(tag) => encode_tag!(area, 16, tag),
+            &ProtoError::NotEnoughDataForGlobalRepCountCount { required: r, given: g, } => encode_not_enough!(area, 17, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepAddedId { required: r, given: g, } => encode_not_enough!(area, 18, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepLendId { required: r, given: g, } => encode_not_enough!(area, 19, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorTag { required: r, given: g, } => encode_not_enough!(area, 20, r, g),
+            &ProtoError::InvalidProtoErrorTag(tag) => encode_tag!(area, 21, tag),
+            &ProtoError::NotEnoughDataForProtoErrorRequired { required: r, given: g, } => encode_not_enough!(area, 22, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorGiven { required: r, given: g, } => encode_not_enough!(area, 23, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: r, given: g, } => encode_not_enough!(area, 24, r, g),
+            &ProtoError::NotEnoughDataForLocalRepTag { required: r, given: g, } => encode_not_enough!(area, 25, r, g),
+            &ProtoError::InvalidLocalRepTag(tag) => encode_tag!(area, 26, tag),
+            &ProtoError::NotEnoughDataForLocalRepLendId { required: r, given: g, } => encode_not_enough!(area, 27, r, g),
+            &ProtoError::NotEnoughDataForLocalRepAddId { required: r, given: g, } => encode_not_enough!(area, 28, r, g),
+            &ProtoError::UnexpectedWorkerDbRequest => put_adv!(area, u8, write_u8, 29),
+            &ProtoError::UnexpectedWorkerPqRequest => put_adv!(area, u8, write_u8, 30),
         }
     }
 }
@@ -558,6 +571,11 @@ mod test {
     }
 
     #[test]
+    fn req_local_localreq_addenqueue() {
+        assert_encode_decode_req(Req::Local(LocalReq::AddEnqueue(597)));
+    }
+
+    #[test]
     fn req_local_localreq_stop() {
         assert_encode_decode_req(Req::Local(LocalReq::Stop));
     }
@@ -641,6 +659,11 @@ mod test {
     #[test]
     fn rep_globalerr_protoerror_notenoughdataforlocalreqloadid() {
         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqLoadId { required: 177, given: 167, }));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforlocalreqaddenqueueid() {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqAddEnqueueId { required: 137, given: 467, }));
     }
 
     #[test]
