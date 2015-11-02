@@ -127,9 +127,10 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
             let timeout = interval.num_milliseconds();
             if timeout < 0 {
                 pq.repay_timed_out();
-                continue;
+                0
+            } else {
+                timeout
             }
-            timeout
         } else {
             -1
         };
@@ -234,6 +235,7 @@ mod test {
     extern crate zmq;
 
     use std::thread::spawn;
+    use time::SteadyTime;
     use super::{pq, worker_pq_entrypoint, proto_request};
     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
 
@@ -285,6 +287,20 @@ mod test {
         assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
                              Req::Global(GlobalReq::Count),
                              Rep::GlobalOk(GlobalRep::Count(1)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Lend { timeout: 1000, }),
+                             Rep::Local(LocalRep::Lend(2)));
+        assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                             Req::Global(GlobalReq::Count),
+                             Rep::GlobalOk(GlobalRep::Count(0)));
+        {
+            let start = SteadyTime::now();
+            assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
+                                 Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                 Rep::Local(LocalRep::Lend(2)));
+            let interval = SteadyTime::now() - start;
+            assert_eq!(interval.num_seconds(), 1);
+        }
 
         proto_request(&mut sock_master_pq_tx, Req::Local(LocalReq::Stop)).unwrap();
         worker.join().unwrap();
