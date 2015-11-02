@@ -6,7 +6,7 @@ use byteorder::{ByteOrder, BigEndian};
 pub enum RepayStatus {
     Penalty,
     Reward,
-    Requeue,
+    Front,
 }
 
 #[derive(Debug, PartialEq)]
@@ -159,7 +159,7 @@ impl<'a> GlobalReq<'a> {
                 let status = match try_get!(status_buf, u8, read_u8, NotEnoughDataForGlobalReqRepayStatus) {
                     (1, _) => RepayStatus::Penalty,
                     (2, _) => RepayStatus::Reward,
-                    (3, _) => RepayStatus::Requeue,
+                    (3, _) => RepayStatus::Front,
                     (status_tag, _) => return Err(ProtoError::InvalidGlobalReqRepayStatusTag(status_tag)),
                 };
                 Ok(GlobalReq::Repay(id, status))
@@ -200,7 +200,7 @@ impl<'a> GlobalReq<'a> {
                 put_adv!(area, u8, write_u8, match status {
                     &RepayStatus::Penalty => 1,
                     &RepayStatus::Reward => 2,
-                    &RepayStatus::Requeue => 3,
+                    &RepayStatus::Front => 3,
                 })
             },
         }
@@ -561,8 +561,8 @@ mod test {
     }
 
     #[test]
-    fn req_global_globalreq_repay_requeue() {
-        assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, RepayStatus::Requeue)));
+    fn req_global_globalreq_repay_front() {
+        assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, RepayStatus::Front)));
     }
 
     #[test]

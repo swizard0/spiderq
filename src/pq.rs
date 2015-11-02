@@ -97,7 +97,7 @@ impl PQueue {
     
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { index: qi, .. }) = self.lentq.pop() {
-            self.repay(qi, RepayStatus::Requeue)
+            self.repay(qi, RepayStatus::Front)
         }
     }
 
@@ -105,17 +105,17 @@ impl PQueue {
         if let Some((_, mut entry)) = self.lentm.remove(&index) {
             self.serial += 1;
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
-            let total = self.queue.len() as u64;
+            let total = self.queue.len() as u64; // TODO: this is a bug (total = 1, min_priority = 2)
             let region = total - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
                 RepayStatus::Penalty => { entry.boost -= 1; entry.boost },
                 RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
                 RepayStatus::Reward => { entry.boost += 1; entry.boost },
-                RepayStatus::Requeue => 0,
+                RepayStatus::Front => 0,
             };
             entry.priority = match status {
-                RepayStatus::Requeue => 0,
+                RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
             };
             self.queue.push(entry)
