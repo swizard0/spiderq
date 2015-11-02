@@ -65,8 +65,8 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     try!(sock_master_pq_rx.bind("inproc://pq_rxtx"));
     try!(sock_pq_master_tx.connect("inproc://pq_rxtx"));
 
-    spawn(move || worker_db(sock_db_master_tx, sock_db_master_rx, db).unwrap());
-    spawn(move || worker_pq(sock_pq_master_tx, sock_pq_master_rx, pq).unwrap());
+    spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
+    spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
     try!(master(sock_master_ext, sock_master_db_tx, sock_master_db_rx, sock_master_pq_tx, sock_master_pq_rx));
     
     Ok(())
@@ -88,24 +88,38 @@ pub fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, db: db::Database)  {
+    match worker_db(&mut sock_tx, &mut sock_rx, db) {
+        Ok(()) => (),
+        Err(e) => { proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(format!("{:?}", e)))).unwrap(); },
+    }
+}
+
 #[allow(unused_variables, unused_mut)]
-fn worker_db(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut db: db::Database) -> Result<(), Error> {
+fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
         let req_msg = try!(sock_rx.recv_msg(0));
         match Req::decode(&req_msg) {
             Ok(Req::Local(LocalReq::Stop)) => {
-                try!(proto_reply(&mut sock_tx, Rep::Local(LocalRep::StopAck)));
+                try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
                 return Ok(())
             },
             Ok(..) =>
-                try!(proto_reply(&mut sock_tx, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
+                try!(proto_reply(sock_tx, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
             Err(proto_err) =>
-                try!(proto_reply(&mut sock_tx, Rep::GlobalErr(proto_err))),
+                try!(proto_reply(sock_tx, Rep::GlobalErr(proto_err))),
         }
     }
 }
 
-pub fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
+pub fn worker_pq_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, pq: pq::PQueue)  {
+    match worker_pq(&mut sock_tx, &mut sock_rx, pq) {
+        Ok(()) => (),
+        Err(e) => { proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(format!("{:?}", e)))).unwrap(); },
+    }
+}
+
+fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::PQueue) -> Result<(), Error> {
     let mut pending_queue = VecDeque::new();
     loop {
         let timeout = if let Some(next_timeout) = pq.next_timeout() {
@@ -168,7 +182,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq:
 
             match action {
                 Action::Reply(reply) => {
-                    try!(proto_reply(&mut sock_tx, reply));
+                    try!(proto_reply(sock_tx, reply));
                 },
                 Action::DoNothing =>
                     (),
@@ -176,7 +190,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, mut pq: pq:
                     tmp_queue.push_back(msg);
                 },
                 Action::Stop => {
-                    try!(proto_reply(&mut sock_tx, Rep::Local(LocalRep::StopAck)));
+                    try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
                     return Ok(());
                 }
             }
@@ -220,7 +234,7 @@ mod test {
     extern crate zmq;
 
     use std::thread::spawn;
-    use super::{pq, worker_pq, proto_request};
+    use super::{pq, worker_pq_entrypoint, proto_request};
     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
 
     fn assert_request_reply(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, req: Req, rep: Rep) {
@@ -243,7 +257,7 @@ mod test {
         sock_master_pq_rx.bind("inproc://pq_rxtx").unwrap();
         sock_pq_master_tx.connect("inproc://pq_rxtx").unwrap();
 
-        let worker = spawn(move || worker_pq(sock_pq_master_tx, sock_pq_master_rx, pq).unwrap());
+        let worker = spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
         assert_request_reply(&mut sock_master_pq_tx, &mut sock_master_pq_rx,
                              Req::Global(GlobalReq::Count),
                              Rep::GlobalOk(GlobalRep::Count(3)));
