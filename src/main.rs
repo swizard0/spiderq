@@ -106,6 +106,36 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
                 let id = try!(db.add(maybe_data.unwrap_or(&[])));
                 try!(proto_reply(sock_tx, Rep::Local(LocalRep::Add(id))));
             },
+            Ok(Req::Local(LocalReq::Load(id))) => {
+                struct MsgLoader {
+                    id: u32,
+                    msg: Option<(zmq::Message, usize)>,
+                }
+
+                impl db::Loader for MsgLoader {
+                    type Error = zmq::Error;
+
+                    fn set_len(&mut self, len: usize) -> Result<(), zmq::Error> {
+                        let base_rep = Rep::GlobalOk(GlobalRep::Lend(self.id, None));
+                        let base_len = base_rep.encode_len();
+                        let mut msg = try!(zmq::Message::with_capacity(base_len + len));
+                        base_rep.encode(&mut msg);
+                        self.msg = Some((msg, base_len));
+                        Ok(())
+                    }
+
+                    fn contents(&mut self) -> &mut [u8] {
+                        self.msg.as_mut().map(|&mut (ref mut msg, offset)| &mut msg[offset ..]).unwrap()
+                    }
+                }
+
+                let mut msg_loader = MsgLoader { id: id, msg: None };
+                match db.load(id, &mut msg_loader) {
+                    Ok(()) => try!(sock_tx.send_msg(msg_loader.msg.unwrap().0, 0)),
+                    Err(db::LoadError::Db(e)) => return Err(Error::Db(e)),
+                    Err(db::LoadError::Load(e)) => return Err(Error::Zmq(e)),
+                }
+            },
             Ok(Req::Local(LocalReq::Stop)) => {
                 try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
                 return Ok(())
@@ -340,9 +370,20 @@ mod test {
             "pq",
             move |sock_db_master_tx, sock_db_master_rx| worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db),
             move |sock_master_db_tx, sock_master_db_rx| {
+                let user_data_0 = "some user data #0".as_bytes();
+
                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
                                      Req::Global(GlobalReq::Add(None)),
                                      Rep::Local(LocalRep::Add(0)));
+                assert_request_reply(sock_master_db_tx, sock_master_db_rx,
+                                     Req::Global(GlobalReq::Add(Some(user_data_0))),
+                                     Rep::Local(LocalRep::Add(1)));
+                assert_request_reply(sock_master_db_tx, sock_master_db_rx,
+                                     Req::Local(LocalReq::Load(0)),
+                                     Rep::GlobalOk(GlobalRep::Lend(0, None)));
+                assert_request_reply(sock_master_db_tx, sock_master_db_rx,
+                                     Req::Local(LocalReq::Load(1)),
+                                     Rep::GlobalOk(GlobalRep::Lend(1, Some(user_data_0))));
             });
     }
 }
