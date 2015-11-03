@@ -7,6 +7,7 @@ extern crate byteorder;
 
 use std::{io, env, mem, process};
 use std::io::Write;
+use std::ops::Deref;
 use std::convert::From;
 use std::thread::spawn;
 use std::collections::VecDeque;
@@ -16,7 +17,7 @@ use time::{SteadyTime, Duration};
 pub mod db;
 pub mod pq;
 pub mod proto;
-use proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
+use proto::{RepayStatus, Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 
 #[derive(Debug)]
 pub enum Error {
@@ -80,43 +81,58 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
            &mut sock_master_pq_rx)
 }
 
-struct Message {
-    frames: VecDeque<zmq::Message>,
-}
+struct Frames(Vec<zmq::Message>);
 
-impl Message {
-    fn new() -> Message {
-        Message {
-            frames: VecDeque::new(),
-        }
-    }
-
-    fn recv(&mut self, sock: &mut zmq::Socket) -> Result<&[u8], Error> {
-        self.frames.clear();
+impl Frames {
+    fn recv(sock: &mut zmq::Socket) -> Result<Frames, Error> {
+        let mut frames = Vec::new();
         loop {
-            self.frames.push_back(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
+            frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
             if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
                 break
             }
         }
-        Ok(&self.frames.back().unwrap())
+
+        Ok(Frames(frames))
+    }
+
+    fn send(mut self, sock: &mut zmq::Socket, workload: zmq::Message) -> Result<(), Error> {
+        assert!(!self.0.is_empty());
+        self.0.pop();
+        for frame in self.0 {
+            try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+        sock.send_msg(workload, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
     }
 }
 
-pub fn proto_request(sock: &mut zmq::Socket, req: Req) -> Result<(), Error> {
-    let bytes_required = req.encode_len();
-    let mut msg = try!(zmq::Message::with_capacity(bytes_required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
-    req.encode(&mut msg);
-    try!(sock.send_msg(msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-    Ok(())
+impl Deref for Frames {
+    type Target = [u8];
+
+    fn deref<'a>(&'a self) -> &'a [u8] {
+        &self.0.last().unwrap()
+    }
 }
 
-pub fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
-    let bytes_required = rep.encode_len();
-    let mut msg = try!(zmq::Message::with_capacity(bytes_required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
-    rep.encode(&mut msg);
-    try!(sock.send_msg(msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-    Ok(())
+macro_rules! encode_into_msg {
+    ($packet:expr) => ({
+        let packet = $packet;
+        let bytes_required = packet.encode_len();
+        zmq::Message::with_capacity(bytes_required)
+            .map_err(|e| Error::Zmq(ZmqError::Message(e)))
+            .map(|mut msg| {
+                packet.encode(&mut msg);
+                msg
+            })
+    })
+}
+
+fn proto_request(sock: &mut zmq::Socket, frames: Frames, req: Req) -> Result<(), Error> {
+    frames.send(sock, try!(encode_into_msg!(req)))
+}
+
+fn proto_reply(sock: &mut zmq::Socket, frames: Frames, rep: Rep) -> Result<(), Error> {
+    frames.send(sock, try!(encode_into_msg!(rep)))
 }
 
 pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, db: db::Database)  {
@@ -124,18 +140,24 @@ pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
         Ok(()) => (),
         Err(e) => {
             let panic_str = format!("{:?}", e);
-            proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
+            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panic(&panic_str))).unwrap(), 0).unwrap();
         },
     }
 }
 
 fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
-        let req_msg = try!(sock_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
-        match Req::decode(&req_msg) {
+        enum Decision<'a> {
+            JustReply(Rep<'a>),
+            Stop,
+            ReplyMsg(zmq::Message),
+        }
+        
+        let req_frames = try!(Frames::recv(sock_rx));
+        let decision = match Req::decode(&req_frames) {
             Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
                 let id = try!(db.add(maybe_data.unwrap_or(&[])));
-                try!(proto_reply(sock_tx, Rep::Local(LocalRep::Add(id))));
+                Decision::JustReply(Rep::Local(LocalRep::Add(id)))
             },
             Ok(Req::Local(LocalReq::Load(id))) => {
                 struct MsgLoader {
@@ -162,19 +184,28 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
 
                 let mut msg_loader = MsgLoader { id: id, msg: None };
                 match db.load(id, &mut msg_loader) {
-                    Ok(()) => try!(sock_tx.send_msg(msg_loader.msg.unwrap().0, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))),
+                    Ok(()) => Decision::ReplyMsg(msg_loader.msg.unwrap().0),
                     Err(db::LoadError::Db(e)) => return Err(Error::Db(e)),
                     Err(db::LoadError::Load(e)) => return Err(Error::Zmq(e)),
                 }
             },
-            Ok(Req::Local(LocalReq::Stop)) => {
-                try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
+            Ok(Req::Local(LocalReq::Stop)) =>
+                Decision::Stop,
+            Ok(..) =>
+                Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest)),
+            Err(proto_err) =>
+                Decision::JustReply(Rep::GlobalErr(proto_err)),
+        };
+
+        match decision {
+            Decision::JustReply(rep) => 
+                try!(proto_reply(sock_tx, req_frames, rep)),
+            Decision::Stop => {
+                try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::StopAck)));
                 return Ok(())
             },
-            Ok(..) =>
-                try!(proto_reply(sock_tx, Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest))),
-            Err(proto_err) =>
-                try!(proto_reply(sock_tx, Rep::GlobalErr(proto_err))),
+            Decision::ReplyMsg(msg) =>
+                try!(req_frames.send(sock_tx, msg)),
         }
     }
 }
@@ -184,7 +215,7 @@ pub fn worker_pq_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
         Ok(()) => (),
         Err(e) => {
             let panic_str = format!("{:?}", e);
-            proto_reply(&mut sock_tx, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
+            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panic(&panic_str))).unwrap(), 0).unwrap();
         },
     }
 }
@@ -208,65 +239,66 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
         let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
         let avail = try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
         if (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN) {
-            let req_msg = try!(sock_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
-            pending_queue.push_front(req_msg);
+            pending_queue.push_front(try!(Frames::recv(sock_rx)));
         }
 
         let mut tmp_queue = VecDeque::new();
-        enum Action<'a> {
-            Reply(Rep<'a>),
-            DoNothing,
+        enum Decision<'a> {
+            JustReply(Rep<'a>),
             Reenqueue,
+            ProceedLend(u32, u64),
+            ProceedRepay(u32, RepayStatus),
+            DoNothing,
             Stop,
         }
 
-        while let Some(msg) = pending_queue.pop_front() {
-            let action = match Req::decode(&msg) {
+        while let Some(req_frames) = pending_queue.pop_front() {
+            let decision = match Req::decode(&req_frames) {
                 Ok(Req::Local(LocalReq::Stop)) =>
-                    Action::Stop,
-                Ok(Req::Global(GlobalReq::Count)) => {
-                    let count = pq.len();
-                    Action::Reply(Rep::GlobalOk(GlobalRep::Count(count)))
-                },
+                    Decision::Stop,
+                Ok(Req::Global(GlobalReq::Count)) =>
+                    Decision::JustReply(Rep::GlobalOk(GlobalRep::Count(pq.len()))),
                 Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
                     if let Some(id) = pq.top() {
-                        try!(proto_reply(sock_tx, Rep::Local(LocalRep::Lend(id))));
-                        let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
-                        assert_eq!(pq.lend(trigger_at), Some(id));
-                        Action::DoNothing
+                        Decision::ProceedLend(id, t)
                     } else {
-                        Action::Reenqueue
+                        Decision::Reenqueue
                     }
                 },
-                Ok(Req::Global(GlobalReq::Repay(id, status))) => {
-                    try!(proto_reply(sock_tx, Rep::GlobalOk(GlobalRep::Repaid)));
-                    pq.repay(id, status);
-                    Action::DoNothing
-                },
+                Ok(Req::Global(GlobalReq::Repay(id, status))) =>
+                    Decision::ProceedRepay(id, status),
                 Ok(Req::Local(LocalReq::AddEnqueue(expected_id))) => {
                     let new_id = pq.add();
                     assert_eq!(expected_id, new_id);
-                    Action::DoNothing
+                    Decision::DoNothing
                 },
                 Ok(..) =>
-                    Action::Reply(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest)),
+                    Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest)),
                 Err(proto_err) =>
-                    Action::Reply(Rep::GlobalErr(proto_err)),
+                    Decision::JustReply(Rep::GlobalErr(proto_err)),
             };
 
-            match action {
-                Action::Reply(reply) => {
-                    try!(proto_reply(sock_tx, reply));
+            match decision {
+                Decision::JustReply(rep) => 
+                    try!(proto_reply(sock_tx, req_frames, rep)),
+                Decision::Stop => {
+                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::StopAck)));
+                    return Ok(())
                 },
-                Action::DoNothing =>
+                Decision::ProceedLend(id, t) => {
+                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Lend(id))));
+                    let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
+                    assert_eq!(pq.lend(trigger_at), Some(id));
+                },
+                Decision::ProceedRepay(id, status) => {
+                    try!(proto_reply(sock_tx, req_frames, Rep::GlobalOk(GlobalRep::Repaid)));
+                    pq.repay(id, status);
+                },
+                Decision::DoNothing =>
                     (),
-                Action::Reenqueue => {
-                    tmp_queue.push_back(msg);
+                Decision::Reenqueue => {
+                    tmp_queue.push_back(req_frames);
                 },
-                Action::Stop => {
-                    try!(proto_reply(sock_tx, Rep::Local(LocalRep::StopAck)));
-                    return Ok(());
-                }
             }
         }
 
@@ -274,25 +306,11 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
     }
 }
 
-pub fn master_entrypoint(mut sock_ext: zmq::Socket,
-                         mut sock_db_tx: zmq::Socket,
-                         mut sock_db_rx: zmq::Socket,
-                         mut sock_pq_tx: zmq::Socket,
-                         mut sock_pq_rx: zmq::Socket) {
-    match master(&mut sock_ext, &mut sock_db_tx, &mut sock_db_rx, &mut sock_pq_tx, &mut sock_pq_rx) {
-        Ok(()) => (),
-        Err(e) => {
-            let panic_str = format!("{:?}", e);
-            proto_reply(&mut sock_ext, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
-        },
-    }
-}
-
-fn master(sock_ext: &mut zmq::Socket,
-          sock_db_tx: &mut zmq::Socket,
-          sock_db_rx: &mut zmq::Socket,
-          sock_pq_tx: &mut zmq::Socket,
-          sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
+pub fn master(sock_ext: &mut zmq::Socket,
+              sock_db_tx: &mut zmq::Socket,
+              sock_db_rx: &mut zmq::Socket,
+              sock_pq_tx: &mut zmq::Socket,
+              sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
     loop {
         let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                              sock_db_rx.as_poll_item(zmq::POLLIN),
@@ -337,11 +355,18 @@ mod test {
     use std::fs;
     use std::thread::spawn;
     use time::SteadyTime;
-    use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint, proto_request};
+    use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint};
     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
 
+    fn proto_request(sock: &mut zmq::Socket, req: Req) {
+        let bytes_required = req.encode_len();
+        let mut msg = zmq::Message::with_capacity(bytes_required).unwrap();
+        req.encode(&mut msg);
+        sock.send_msg(msg, 0).unwrap();
+    }
+
     fn assert_request_reply(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, req: Req, rep: Rep) {
-        proto_request(sock_tx, req).unwrap();
+        proto_request(sock_tx, req);
         let rep_msg = sock_rx.recv_msg(0).unwrap();
         assert_eq!(Rep::decode(&rep_msg), Ok(rep));
     }
@@ -364,7 +389,7 @@ mod test {
 
         let worker = spawn(move || worker_fn(sock_slave_master_tx, sock_slave_master_rx));
         master_fn(&mut sock_master_slave_tx, &mut sock_master_slave_rx);
-        proto_request(&mut sock_master_slave_tx, Req::Local(LocalReq::Stop)).unwrap();
+        proto_request(&mut sock_master_slave_tx, Req::Local(LocalReq::Stop));
         worker.join().unwrap();
     }
 
