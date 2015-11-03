@@ -1,6 +1,7 @@
 use std::{io, fs, mem};
 use std::ops::DerefMut;
 use std::io::{Seek, SeekFrom, Read, Write};
+use std::convert::From;
 use std::path::PathBuf;
 use byteorder::{ReadBytesExt, WriteBytesExt, NativeEndian};
 
@@ -49,14 +50,31 @@ fn file_size(fd: &fs::File, filename: &PathBuf) -> Result<u64, Error> {
     Ok(md.len())
 }
 
+#[derive(Debug)]
+pub enum LoadError<E> {
+    Db(Error),
+    Load(E),
+}
+
+impl<E> From<Error> for LoadError<E> {
+    fn from(err: Error) -> LoadError<E> {
+        LoadError::Db(err)
+    }
+}
+
 pub trait Loader {
-    fn set_len(&mut self, len: usize);
+    type Error;
+
+    fn set_len(&mut self, len: usize) -> Result<(), Self::Error>;
     fn contents(&mut self) -> &mut [u8];
 }
 
 impl Loader for Vec<u8> {
-    fn set_len(&mut self, len: usize) {
-        self.resize(len, 0)
+    type Error = ();
+
+    fn set_len(&mut self, len: usize) -> Result<(), ()> {
+        self.resize(len, 0);
+        Ok(())
     }
 
     fn contents(&mut self) -> &mut [u8] {
@@ -101,10 +119,10 @@ impl Database {
         Ok(try!(self.count()) as u32 - 1)
     }
 
-    pub fn load<'a, 'b, L>(&'a mut self, index: u32, loader: &'b mut L) -> Result<&'b L, Error> where L: Loader {
+    pub fn load<'a, 'b, E, L>(&'a mut self, index: u32, loader: &'b mut L) -> Result<(), LoadError<E>> where L: Loader<Error = E> {
         let total = try!(self.count()) as u32;
         if index >= total {
-            return Err(Error::IndexIsTooBig { given: index, total: total, })
+            return Err(LoadError::Db(Error::IndexIsTooBig { given: index, total: total, }))
         }
 
         try!(self.fd_idx.seek(SeekFrom::Start((index as usize * mem::size_of::<u64>()) as u64))
@@ -115,29 +133,29 @@ impl Database {
              .map_err(|e| Error::Seek(filename_as_string(&self.filename_db), e)));
         let data_len = try!(self.fd_db.read_u32::<NativeEndian>()
                             .map_err(|e| Error::Read(filename_as_string(&self.filename_db), From::from(e)))) as usize;
-        loader.set_len(data_len);
+        try!(loader.set_len(data_len).map_err(|e| LoadError::Load(e)));
 
         {
             let mut target = loader.contents();
             while !target.is_empty() {
                 match self.fd_db.read(target) {
                     Ok(0) if target.is_empty() => break,
-                    Ok(0) => return Err(Error::EofReadingData { index: index, len: data_len, read: data_len - target.len(), }),
+                    Ok(0) => return Err(LoadError::Db(Error::EofReadingData { index: index, len: data_len, read: data_len - target.len(), })),
                     Ok(n) => { let tmp = target; target = &mut tmp[n ..]; },
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => { },
-                    Err(e) => return Err(Error::Read(filename_as_string(&self.filename_db), e)),
+                    Err(e) => return Err(LoadError::Db(Error::Read(filename_as_string(&self.filename_db), e))),
                 }
             }
         }
 
-        Ok(loader)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
     use std::fs;
-    use super::{Database, Error};
+    use super::{Database, Error, LoadError};
 
     fn mkdb(path: &str) -> Database {
         let _ = fs::remove_dir_all(path);
@@ -188,11 +206,11 @@ mod test {
     fn open_database_check() {
         let mut db = mkfill("/tmp/spiderq_d");
         let mut data = Vec::new();
-        assert_eq!(db.load(0, &mut data).unwrap(), &[1, 2, 3]);
-        assert_eq!(db.load(1, &mut data).unwrap(), &[4, 5, 6, 7]);
-        assert_eq!(db.load(2, &mut data).unwrap(), &[8, 9]);
+        db.load(0, &mut data).unwrap(); assert_eq!(&data, &[1, 2, 3]);
+        db.load(1, &mut data).unwrap(); assert_eq!(&data, &[4, 5, 6, 7]);
+        db.load(2, &mut data).unwrap(); assert_eq!(&data, &[8, 9]);
         match db.load(3, &mut data) {
-            Err(Error::IndexIsTooBig { given: 3, total: 3, }) => (),
+            Err(LoadError::Db(Error::IndexIsTooBig { given: 3, total: 3, })) => (),
             other => panic!("unexpected Database::load return value: {:?}", other),
         }
     }
