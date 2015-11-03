@@ -22,18 +22,24 @@ use proto::{Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
 pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
-    Zmq(zmq::Error),
+    Zmq(ZmqError),
+}
+
+#[derive(Debug)]
+pub enum ZmqError {
+    Message(zmq::Error),
+    Socket(zmq::Error),
+    Connect(zmq::Error),
+    Bind(zmq::Error),
+    Recv(zmq::Error),
+    Send(zmq::Error),
+    Poll(zmq::Error),
+    GetSockOpt(zmq::Error),
 }
 
 impl From<db::Error> for Error {
     fn from(err: db::Error) -> Error {
         Error::Db(err)
-    }
-}
-
-impl From<zmq::Error> for Error {
-    fn from(err: zmq::Error) -> Error {
-        Error::Zmq(err)
     }
 }
 
@@ -45,46 +51,71 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let db = try!(db::Database::new(&database_dir).map_err(|e| Error::Db(e)));
     let pq = pq::PQueue::new(try!(db.count()));
     let mut ctx = zmq::Context::new();
-    let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER));
-    let mut sock_master_db_tx = try!(ctx.socket(zmq::PUSH));
-    let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL));
-    let mut sock_master_pq_tx = try!(ctx.socket(zmq::PUSH));
-    let mut sock_master_pq_rx = try!(ctx.socket(zmq::PULL));
-    let mut sock_db_master_tx = try!(ctx.socket(zmq::PUSH));
-    let mut sock_db_master_rx = try!(ctx.socket(zmq::PULL));
-    let mut sock_pq_master_tx = try!(ctx.socket(zmq::PUSH));
-    let mut sock_pq_master_rx = try!(ctx.socket(zmq::PULL));
+    let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_master_db_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_master_pq_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_master_pq_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_db_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_db_master_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_pq_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let mut sock_pq_master_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
 
-    try!(sock_master_ext.bind(&zmq_addr));
-    try!(sock_master_db_tx.bind("inproc://db_txrx"));
-    try!(sock_db_master_rx.connect("inproc://db_txrx"));
-    try!(sock_master_db_rx.bind("inproc://db_rxtx"));
-    try!(sock_db_master_tx.connect("inproc://db_rxtx"));
-    try!(sock_master_pq_tx.bind("inproc://pq_txrx"));
-    try!(sock_pq_master_rx.connect("inproc://pq_txrx"));
-    try!(sock_master_pq_rx.bind("inproc://pq_rxtx"));
-    try!(sock_pq_master_tx.connect("inproc://pq_rxtx"));
+    try!(sock_master_ext.bind(&zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_master_db_tx.bind("inproc://db_txrx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_db_master_rx.connect("inproc://db_txrx").map_err(|e| Error::Zmq(ZmqError::Connect(e))));
+    try!(sock_master_db_rx.bind("inproc://db_rxtx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_db_master_tx.connect("inproc://db_rxtx").map_err(|e| Error::Zmq(ZmqError::Connect(e))));
+    try!(sock_master_pq_tx.bind("inproc://pq_txrx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_pq_master_rx.connect("inproc://pq_txrx").map_err(|e| Error::Zmq(ZmqError::Connect(e))));
+    try!(sock_master_pq_rx.bind("inproc://pq_rxtx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_pq_master_tx.connect("inproc://pq_rxtx").map_err(|e| Error::Zmq(ZmqError::Connect(e))));
 
     spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
     spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
-    try!(master(sock_master_ext, sock_master_db_tx, sock_master_db_rx, sock_master_pq_tx, sock_master_pq_rx));
-    
-    Ok(())
+    master(&mut sock_master_ext,
+           &mut sock_master_db_tx,
+           &mut sock_master_db_rx,
+           &mut sock_master_pq_tx,
+           &mut sock_master_pq_rx)
+}
+
+struct Message {
+    frames: VecDeque<zmq::Message>,
+}
+
+impl Message {
+    fn new() -> Message {
+        Message {
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn recv(&mut self, sock: &mut zmq::Socket) -> Result<&[u8], Error> {
+        self.frames.clear();
+        loop {
+            self.frames.push_back(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
+            if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
+                break
+            }
+        }
+        Ok(&self.frames.back().unwrap())
+    }
 }
 
 pub fn proto_request(sock: &mut zmq::Socket, req: Req) -> Result<(), Error> {
     let bytes_required = req.encode_len();
-    let mut msg = try!(zmq::Message::with_capacity(bytes_required));
+    let mut msg = try!(zmq::Message::with_capacity(bytes_required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
     req.encode(&mut msg);
-    try!(sock.send_msg(msg, 0));
+    try!(sock.send_msg(msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
     Ok(())
 }
 
 pub fn proto_reply(sock: &mut zmq::Socket, rep: Rep) -> Result<(), Error> {
     let bytes_required = rep.encode_len();
-    let mut msg = try!(zmq::Message::with_capacity(bytes_required));
+    let mut msg = try!(zmq::Message::with_capacity(bytes_required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
     rep.encode(&mut msg);
-    try!(sock.send_msg(msg, 0));
+    try!(sock.send_msg(msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
     Ok(())
 }
 
@@ -100,7 +131,7 @@ pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
 
 fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::Database) -> Result<(), Error> {
     loop {
-        let req_msg = try!(sock_rx.recv_msg(0));
+        let req_msg = try!(sock_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
         match Req::decode(&req_msg) {
             Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
                 let id = try!(db.add(maybe_data.unwrap_or(&[])));
@@ -113,12 +144,12 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
                 }
 
                 impl db::Loader for MsgLoader {
-                    type Error = zmq::Error;
+                    type Error = ZmqError;
 
-                    fn set_len(&mut self, len: usize) -> Result<(), zmq::Error> {
+                    fn set_len(&mut self, len: usize) -> Result<(), ZmqError> {
                         let base_rep = Rep::GlobalOk(GlobalRep::Lend(self.id, None));
                         let base_len = base_rep.encode_len();
-                        let mut msg = try!(zmq::Message::with_capacity(base_len + len));
+                        let mut msg = try!(zmq::Message::with_capacity(base_len + len).map_err(|e| ZmqError::Message(e)));
                         base_rep.encode(&mut msg);
                         self.msg = Some((msg, base_len));
                         Ok(())
@@ -131,7 +162,7 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
 
                 let mut msg_loader = MsgLoader { id: id, msg: None };
                 match db.load(id, &mut msg_loader) {
-                    Ok(()) => try!(sock_tx.send_msg(msg_loader.msg.unwrap().0, 0)),
+                    Ok(()) => try!(sock_tx.send_msg(msg_loader.msg.unwrap().0, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))),
                     Err(db::LoadError::Db(e)) => return Err(Error::Db(e)),
                     Err(db::LoadError::Load(e)) => return Err(Error::Zmq(e)),
                 }
@@ -175,9 +206,9 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
         };
 
         let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
-        let avail = try!(zmq::poll(&mut pollitems, timeout));
+        let avail = try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
         if (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN) {
-            let req_msg = try!(sock_rx.recv_msg(0));
+            let req_msg = try!(sock_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
             pending_queue.push_front(req_msg);
         }
 
@@ -243,14 +274,41 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
     }
 }
 
-#[allow(unused_variables, unused_mut)]
-fn master(mut sock_ext: zmq::Socket,
-          mut sock_db_tx: zmq::Socket,
-          mut sock_db_rx: zmq::Socket,
-          mut sock_pq_tx: zmq::Socket,
-          mut sock_pq_rx: zmq::Socket) -> Result<(), Error> {
+pub fn master_entrypoint(mut sock_ext: zmq::Socket,
+                         mut sock_db_tx: zmq::Socket,
+                         mut sock_db_rx: zmq::Socket,
+                         mut sock_pq_tx: zmq::Socket,
+                         mut sock_pq_rx: zmq::Socket) {
+    match master(&mut sock_ext, &mut sock_db_tx, &mut sock_db_rx, &mut sock_pq_tx, &mut sock_pq_rx) {
+        Ok(()) => (),
+        Err(e) => {
+            let panic_str = format!("{:?}", e);
+            proto_reply(&mut sock_ext, Rep::Local(LocalRep::Panic(&panic_str))).unwrap();
+        },
+    }
+}
 
-    Ok(())
+fn master(sock_ext: &mut zmq::Socket,
+          sock_db_tx: &mut zmq::Socket,
+          sock_db_rx: &mut zmq::Socket,
+          sock_pq_tx: &mut zmq::Socket,
+          sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
+    loop {
+        let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
+                             sock_db_rx.as_poll_item(zmq::POLLIN),
+                             sock_pq_rx.as_poll_item(zmq::POLLIN)];
+        if try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
+            continue
+        }
+
+        if pollitems[0].get_revents() == zmq::POLLIN {
+            // sock_ext is online
+        } else if pollitems[1].get_revents() == zmq::POLLIN {
+            // sock_db is online
+        } else if pollitems[2].get_revents() == zmq::POLLIN {
+            // sock_pq is online
+        }
+    }
 }
 
 fn main() {
