@@ -691,6 +691,15 @@ mod test {
                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
                                  Rep::GlobalOk(GlobalRep::Lent(2, Some(entry_c))));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
+        // check blocking
+        {
+            let start = SteadyTime::now();
+            assert_request_reply_ext(&mut sock_master_ext_peer,
+                                     Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                     Rep::GlobalOk(GlobalRep::Lent(1, Some(entry_b))));
+            let interval = SteadyTime::now() - start;
+            assert_eq!(interval.num_seconds(), 1);
+        }
 
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::Stopped));
         master_thread.join().unwrap();
