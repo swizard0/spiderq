@@ -321,15 +321,21 @@ pub fn master(sock_ext: &mut zmq::Socket,
               sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
     enum StopState {
         NotTriggered,
-        WaitingPqAndDb,
-        WaitingPq,
-        WaitingDb,
-        Finished,
+        WaitingPqAndDb(Frames),
+        WaitingPq(Frames),
+        WaitingDb(Frames),
+        Finished(Frames),
     }
 
     let mut stop_state = StopState::NotTriggered;
     loop {
-        match stop_state { StopState::Finished => return Ok(()), _ => (), }
+        match stop_state {
+            StopState::Finished(frames) => {
+                try!(proto_reply(sock_ext, frames, Rep::Local(LocalRep::StopAck)));
+                return Ok(())
+            },
+            _ => (),
+        }
 
         let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                              sock_db_rx.as_poll_item(zmq::POLLIN),
@@ -373,7 +379,7 @@ pub fn master(sock_ext: &mut zmq::Socket,
                 Decision::BroadcastStop => {
                     try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
                     try!(sock_db_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-                    stop_state = StopState::WaitingPqAndDb;
+                    stop_state = StopState::WaitingPqAndDb(req_frames);
                 },
                 Decision::JustReply(rep) =>
                     try!(proto_reply(sock_ext, req_frames, rep)),
@@ -383,7 +389,7 @@ pub fn master(sock_ext: &mut zmq::Socket,
         if pollitems[1].get_revents() == zmq::POLLIN {
             // sock_db is online
             enum Decision {
-                PassPqAdd(u32),
+                PassPqAddAndReply(u32),
                 DoNothing,
                 TransmitExt,
             }
@@ -391,12 +397,12 @@ pub fn master(sock_ext: &mut zmq::Socket,
             let frames = try!(Frames::recv(sock_db_rx));
             let decision = match Rep::decode(&frames) {
                 Ok(Rep::Local(LocalRep::Add(id))) =>
-                    Decision::PassPqAdd(id),
+                    Decision::PassPqAddAndReply(id),
                 Ok(Rep::Local(LocalRep::StopAck)) => {
                     stop_state = match stop_state {
-                        StopState::NotTriggered | StopState::WaitingPq | StopState::Finished => unreachable!(),
-                        StopState::WaitingPqAndDb => StopState::WaitingPq,
-                        StopState::WaitingDb => StopState::Finished,
+                        StopState::NotTriggered | StopState::WaitingPq(..) | StopState::Finished(..) => unreachable!(),
+                        StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingPq(stop_frames),
+                        StopState::WaitingDb(stop_frames) => StopState::Finished(stop_frames),
                     };
                     Decision::DoNothing
                 },
@@ -411,8 +417,11 @@ pub fn master(sock_ext: &mut zmq::Socket,
             };
 
             match decision {
-                Decision::PassPqAdd(id) =>
-                    try!(proto_request(sock_pq_tx, frames, Req::Local(LocalReq::AddEnqueue(id)))),
+                Decision::PassPqAddAndReply(id) => {
+                    try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::AddEnqueue(id)))), 0)
+                         .map_err(|e| Error::Zmq(ZmqError::Send(e))));
+                    try!(proto_reply(sock_ext, frames, Rep::GlobalOk(GlobalRep::Added(id))));
+                },
                 Decision::DoNothing =>
                     (),
                 Decision::TransmitExt =>
@@ -434,9 +443,9 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     Decision::PassDbLoad(id),
                 Ok(Rep::Local(LocalRep::StopAck)) => {
                     stop_state = match stop_state {
-                        StopState::NotTriggered | StopState::WaitingDb | StopState::Finished => unreachable!(),
-                        StopState::WaitingPqAndDb => StopState::WaitingDb,
-                        StopState::WaitingPq => StopState::Finished,
+                        StopState::NotTriggered | StopState::WaitingDb(..) | StopState::Finished(..) => unreachable!(),
+                        StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingDb(stop_frames),
+                        StopState::WaitingPq(stop_frames) => StopState::Finished(stop_frames),
                     };
                     Decision::DoNothing
                 },
@@ -488,7 +497,7 @@ mod test {
     use std::fs;
     use std::thread::spawn;
     use time::SteadyTime;
-    use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint};
+    use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint, master};
     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
 
     fn proto_request(sock: &mut zmq::Socket, req: Req) {
@@ -522,7 +531,9 @@ mod test {
 
         let worker = spawn(move || worker_fn(sock_slave_master_tx, sock_slave_master_rx));
         master_fn(&mut sock_master_slave_tx, &mut sock_master_slave_rx);
-        proto_request(&mut sock_master_slave_tx, Req::Local(LocalReq::Stop));
+        assert_request_reply(&mut sock_master_slave_tx, &mut sock_master_slave_rx,
+                             Req::Local(LocalReq::Stop),
+                             Rep::Local(LocalRep::StopAck));
         worker.join().unwrap();
     }
 
@@ -601,6 +612,76 @@ mod test {
                                      Req::Local(LocalReq::Load(1)),
                                      Rep::GlobalOk(GlobalRep::Lend(1, Some(user_data_0))));
             });
+    }
+
+    fn assert_request_reply_ext(sock: &mut zmq::Socket, req: Req, rep: Rep) {
+        proto_request(sock, req);
+        let rep_msg = sock.recv_msg(0).unwrap();
+        assert_eq!(Rep::decode(&rep_msg), Ok(rep));
+    }
+
+    #[test]
+    fn full_server() {
+        let path = "/tmp/spiderq_master";
+        let _ = fs::remove_dir_all(path);
+        let db = db::Database::new(path).unwrap();
+        let pq = pq::PQueue::new(0);
+        let mut ctx = zmq::Context::new();
+        let mut sock_master_ext_peer = ctx.socket(zmq::REQ).unwrap();
+        let mut sock_master_ext = ctx.socket(zmq::ROUTER).unwrap();
+        let mut sock_master_db_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_master_db_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_master_pq_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_master_pq_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_db_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_db_master_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_pq_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let mut sock_pq_master_rx = ctx.socket(zmq::PULL).unwrap();
+
+        sock_master_ext_peer.bind("inproc://test_master_ext_txrx").unwrap();
+        sock_master_ext.connect("inproc://test_master_ext_txrx").unwrap();
+
+        sock_master_db_tx.bind("inproc://test_master_db_txrx").unwrap();
+        sock_db_master_rx.connect("inproc://test_master_db_txrx").unwrap();
+        sock_master_db_rx.bind("inproc://test_master_db_rxtx").unwrap();
+        sock_db_master_tx.connect("inproc://test_master_db_rxtx").unwrap();
+
+        sock_master_pq_tx.bind("inproc://test_master_pq_txrx").unwrap();
+        sock_pq_master_rx.connect("inproc://test_master_pq_txrx").unwrap();
+        sock_master_pq_rx.bind("inproc://test_master_pq_rxtx").unwrap();
+        sock_pq_master_tx.connect("inproc://test_master_pq_rxtx").unwrap();
+
+        let worker_db = spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
+        let worker_pq = spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
+        let master_thread = spawn(move || master(&mut sock_master_ext,
+                                                 &mut sock_master_db_tx,
+                                                 &mut sock_master_db_rx,
+                                                 &mut sock_master_pq_tx,
+                                                 &mut sock_master_pq_rx).unwrap());
+
+        let entry_a = "Entry A".as_bytes();
+        let entry_b = "Entry B".as_bytes();
+        let entry_c = "Entry C".as_bytes();
+
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(0)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_a))), Rep::GlobalOk(GlobalRep::Added(0)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(1)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_b))), Rep::GlobalOk(GlobalRep::Added(1)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(2)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_c))), Rep::GlobalOk(GlobalRep::Added(2)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(3)));
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                 Rep::GlobalOk(GlobalRep::Lend(0, Some(entry_a))));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(2)));
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Repay(0, RepayStatus::Front)),
+                                 Rep::GlobalOk(GlobalRep::Repaid));
+
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::StopAck));
+        master_thread.join().unwrap();
+        worker_pq.join().unwrap();
+        worker_db.join().unwrap();
     }
 }
 
