@@ -663,6 +663,7 @@ mod test {
         let entry_b = "Entry B".as_bytes();
         let entry_c = "Entry C".as_bytes();
 
+        // first fill
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_a))), Rep::GlobalOk(GlobalRep::Added(0)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(1)));
@@ -670,6 +671,7 @@ mod test {
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(2)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_c))), Rep::GlobalOk(GlobalRep::Added(2)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(3)));
+        // lend one and repay it back
         assert_request_reply_ext(&mut sock_master_ext_peer,
                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
                                  Rep::GlobalOk(GlobalRep::Lent(0, Some(entry_a))));
@@ -677,6 +679,18 @@ mod test {
         assert_request_reply_ext(&mut sock_master_ext_peer,
                                  Req::Global(GlobalReq::Repay(0, RepayStatus::Front)),
                                  Rep::GlobalOk(GlobalRep::Repaid));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(3)));
+        // lend all entries
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                 Rep::GlobalOk(GlobalRep::Lent(0, Some(entry_a))));
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Lend { timeout: 1000, }),
+                                 Rep::GlobalOk(GlobalRep::Lent(1, Some(entry_b))));
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Lend { timeout: 10000, }),
+                                 Rep::GlobalOk(GlobalRep::Lent(2, Some(entry_c))));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
 
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::Stopped));
         master_thread.join().unwrap();
