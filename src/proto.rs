@@ -85,6 +85,7 @@ pub enum ProtoError {
     NotEnoughDataForLocalRepAddId { required: usize, given: usize, },
     UnexpectedWorkerDbRequest,
     UnexpectedWorkerPqRequest,
+    UnexpectedMasterRequest,
 }
 
 macro_rules! try_get {
@@ -394,6 +395,7 @@ impl ProtoError {
             (28, buf) => decode_not_enough!(buf, NotEnoughDataForLocalRepAddId),
             (29, _) => Ok(ProtoError::UnexpectedWorkerDbRequest),
             (30, _) => Ok(ProtoError::UnexpectedWorkerPqRequest),
+            (31, _) => Ok(ProtoError::UnexpectedMasterRequest),
             (tag, _) => return Err(ProtoError::InvalidProtoErrorTag(tag)),
         }
     }
@@ -431,7 +433,8 @@ impl ProtoError {
             &ProtoError::InvalidLocalRepTag(..) =>
                 size_of::<u8>(),
             &ProtoError::UnexpectedWorkerDbRequest |
-            &ProtoError::UnexpectedWorkerPqRequest =>
+            &ProtoError::UnexpectedWorkerPqRequest |
+            &ProtoError::UnexpectedMasterRequest =>
                 0,
         }
     }
@@ -468,6 +471,7 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForLocalRepAddId { required: r, given: g, } => encode_not_enough!(area, 28, r, g),
             &ProtoError::UnexpectedWorkerDbRequest => put_adv!(area, u8, write_u8, 29),
             &ProtoError::UnexpectedWorkerPqRequest => put_adv!(area, u8, write_u8, 30),
+            &ProtoError::UnexpectedMasterRequest => put_adv!(area, u8, write_u8, 31),
         }
     }
 }
@@ -764,6 +768,11 @@ mod test {
     #[test]
     fn rep_globalerr_protoerror_unexpectedworkerpqrequest() {
         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_unexpectedmasterrequest() {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest));
     }
 
     #[test]
