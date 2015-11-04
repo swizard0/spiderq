@@ -148,7 +148,7 @@ pub fn worker_db_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
         Ok(()) => (),
         Err(e) => {
             let panic_str = format!("{:?}", e);
-            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panic(&panic_str))).unwrap(), 0).unwrap();
+            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panicked(&panic_str))).unwrap(), 0).unwrap();
         },
     }
 }
@@ -165,7 +165,7 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
         let decision = match Req::decode(&req_frames) {
             Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
                 let id = try!(db.add(maybe_data.unwrap_or(&[])));
-                Decision::JustReply(Rep::Local(LocalRep::Add(id)))
+                Decision::JustReply(Rep::Local(LocalRep::Added(id)))
             },
             Ok(Req::Local(LocalReq::Load(id))) => {
                 struct MsgLoader {
@@ -177,7 +177,7 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
                     type Error = ZmqError;
 
                     fn set_len(&mut self, len: usize) -> Result<(), ZmqError> {
-                        let base_rep = Rep::GlobalOk(GlobalRep::Lend(self.id, None));
+                        let base_rep = Rep::GlobalOk(GlobalRep::Lent(self.id, None));
                         let base_len = base_rep.encode_len();
                         let mut msg = try!(zmq::Message::with_capacity(base_len + len).map_err(|e| ZmqError::Message(e)));
                         base_rep.encode(&mut msg);
@@ -209,7 +209,7 @@ fn worker_db(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut db: db::D
             Decision::JustReply(rep) => 
                 try!(proto_reply(sock_tx, req_frames, rep)),
             Decision::Stop => {
-                try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::StopAck)));
+                try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Stopped)));
                 return Ok(())
             },
             Decision::ReplyMsg(msg) =>
@@ -223,7 +223,7 @@ pub fn worker_pq_entrypoint(mut sock_tx: zmq::Socket, mut sock_rx: zmq::Socket, 
         Ok(()) => (),
         Err(e) => {
             let panic_str = format!("{:?}", e);
-            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panic(&panic_str))).unwrap(), 0).unwrap();
+            sock_tx.send_msg(encode_into_msg!(Rep::Local(LocalRep::Panicked(&panic_str))).unwrap(), 0).unwrap();
         },
     }
 }
@@ -265,7 +265,7 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
                 Ok(Req::Local(LocalReq::Stop)) =>
                     Decision::Stop,
                 Ok(Req::Global(GlobalReq::Count)) =>
-                    Decision::JustReply(Rep::GlobalOk(GlobalRep::Count(pq.len()))),
+                    Decision::JustReply(Rep::GlobalOk(GlobalRep::Counted(pq.len()))),
                 Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
                     if let Some(id) = pq.top() {
                         Decision::ProceedLend(id, t)
@@ -290,11 +290,11 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
                 Decision::JustReply(rep) => 
                     try!(proto_reply(sock_tx, req_frames, rep)),
                 Decision::Stop => {
-                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::StopAck)));
+                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Stopped)));
                     return Ok(())
                 },
                 Decision::ProceedLend(id, t) => {
-                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Lend(id))));
+                    try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Lent(id))));
                     let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
                     assert_eq!(pq.lend(trigger_at), Some(id));
                 },
@@ -331,7 +331,7 @@ pub fn master(sock_ext: &mut zmq::Socket,
     loop {
         match stop_state {
             StopState::Finished(frames) => {
-                try!(proto_reply(sock_ext, frames, Rep::Local(LocalRep::StopAck)));
+                try!(proto_reply(sock_ext, frames, Rep::Local(LocalRep::Stopped)));
                 return Ok(())
             },
             _ => (),
@@ -396,9 +396,9 @@ pub fn master(sock_ext: &mut zmq::Socket,
 
             let frames = try!(Frames::recv(sock_db_rx));
             let decision = match Rep::decode(&frames) {
-                Ok(Rep::Local(LocalRep::Add(id))) =>
+                Ok(Rep::Local(LocalRep::Added(id))) =>
                     Decision::PassPqAddAndReply(id),
-                Ok(Rep::Local(LocalRep::StopAck)) => {
+                Ok(Rep::Local(LocalRep::Stopped)) => {
                     stop_state = match stop_state {
                         StopState::NotTriggered | StopState::WaitingPq(..) | StopState::Finished(..) => unreachable!(),
                         StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingPq(stop_frames),
@@ -406,9 +406,9 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     };
                     Decision::DoNothing
                 },
-                Ok(Rep::Local(LocalRep::Lend(..))) =>
+                Ok(Rep::Local(LocalRep::Lent(..))) =>
                     panic!("unexpected LocalRep::Lend reply from worker_db"),
-                Ok(Rep::Local(LocalRep::Panic(msg))) =>
+                Ok(Rep::Local(LocalRep::Panicked(msg))) =>
                     panic!("worker_db panic'd with message: {}", msg),
                 Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
                     Decision::TransmitExt,
@@ -439,9 +439,9 @@ pub fn master(sock_ext: &mut zmq::Socket,
 
             let frames = try!(Frames::recv(sock_pq_rx));
             let decision = match Rep::decode(&frames) {
-                Ok(Rep::Local(LocalRep::Lend(id))) =>
+                Ok(Rep::Local(LocalRep::Lent(id))) =>
                     Decision::PassDbLoad(id),
-                Ok(Rep::Local(LocalRep::StopAck)) => {
+                Ok(Rep::Local(LocalRep::Stopped)) => {
                     stop_state = match stop_state {
                         StopState::NotTriggered | StopState::WaitingDb(..) | StopState::Finished(..) => unreachable!(),
                         StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingDb(stop_frames),
@@ -449,9 +449,9 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     };
                     Decision::DoNothing
                 },
-                Ok(Rep::Local(LocalRep::Add(..))) =>
+                Ok(Rep::Local(LocalRep::Added(..))) =>
                     panic!("unexpected LocalRep::Add reply from worker_pq"),
-                Ok(Rep::Local(LocalRep::Panic(msg))) =>
+                Ok(Rep::Local(LocalRep::Panicked(msg))) =>
                     panic!("worker_pq panic'd with message: {}", msg),
                 Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
                     Decision::TransmitExt,
@@ -533,7 +533,7 @@ mod test {
         master_fn(&mut sock_master_slave_tx, &mut sock_master_slave_rx);
         assert_request_reply(&mut sock_master_slave_tx, &mut sock_master_slave_rx,
                              Req::Local(LocalReq::Stop),
-                             Rep::Local(LocalRep::StopAck));
+                             Rep::Local(LocalRep::Stopped));
         worker.join().unwrap();
     }
 
@@ -546,42 +546,42 @@ mod test {
             move |sock_master_pq_tx, sock_master_pq_rx| {
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(3)));
+                                     Rep::GlobalOk(GlobalRep::Counted(3)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                     Rep::Local(LocalRep::Lend(0)));
+                                     Rep::Local(LocalRep::Lent(0)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(2)));
+                                     Rep::GlobalOk(GlobalRep::Counted(2)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                     Rep::Local(LocalRep::Lend(1)));
+                                     Rep::Local(LocalRep::Lent(1)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(1)));
+                                     Rep::GlobalOk(GlobalRep::Counted(1)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Repay(1, RepayStatus::Front)),
                                      Rep::GlobalOk(GlobalRep::Repaid));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(2)));
+                                     Rep::GlobalOk(GlobalRep::Counted(2)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                     Rep::Local(LocalRep::Lend(1)));
+                                     Rep::Local(LocalRep::Lent(1)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(1)));
+                                     Rep::GlobalOk(GlobalRep::Counted(1)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Lend { timeout: 1000, }),
-                                     Rep::Local(LocalRep::Lend(2)));
+                                     Rep::Local(LocalRep::Lent(2)));
                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                      Req::Global(GlobalReq::Count),
-                                     Rep::GlobalOk(GlobalRep::Count(0)));
+                                     Rep::GlobalOk(GlobalRep::Counted(0)));
                 {
                     let start = SteadyTime::now();
                     assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
                                          Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                         Rep::Local(LocalRep::Lend(2)));
+                                         Rep::Local(LocalRep::Lent(2)));
                     let interval = SteadyTime::now() - start;
                     assert_eq!(interval.num_seconds(), 1);
                 }
@@ -601,16 +601,16 @@ mod test {
 
                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
                                      Req::Global(GlobalReq::Add(None)),
-                                     Rep::Local(LocalRep::Add(0)));
+                                     Rep::Local(LocalRep::Added(0)));
                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
                                      Req::Global(GlobalReq::Add(Some(user_data_0))),
-                                     Rep::Local(LocalRep::Add(1)));
+                                     Rep::Local(LocalRep::Added(1)));
                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
                                      Req::Local(LocalReq::Load(0)),
-                                     Rep::GlobalOk(GlobalRep::Lend(0, None)));
+                                     Rep::GlobalOk(GlobalRep::Lent(0, None)));
                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
                                      Req::Local(LocalReq::Load(1)),
-                                     Rep::GlobalOk(GlobalRep::Lend(1, Some(user_data_0))));
+                                     Rep::GlobalOk(GlobalRep::Lent(1, Some(user_data_0))));
             });
     }
 
@@ -663,22 +663,22 @@ mod test {
         let entry_b = "Entry B".as_bytes();
         let entry_c = "Entry C".as_bytes();
 
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(0)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_a))), Rep::GlobalOk(GlobalRep::Added(0)));
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(1)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(1)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_b))), Rep::GlobalOk(GlobalRep::Added(1)));
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(2)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(2)));
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_c))), Rep::GlobalOk(GlobalRep::Added(2)));
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(3)));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(3)));
         assert_request_reply_ext(&mut sock_master_ext_peer,
                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
-                                 Rep::GlobalOk(GlobalRep::Lend(0, Some(entry_a))));
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Count(2)));
+                                 Rep::GlobalOk(GlobalRep::Lent(0, Some(entry_a))));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(2)));
         assert_request_reply_ext(&mut sock_master_ext_peer,
                                  Req::Global(GlobalReq::Repay(0, RepayStatus::Front)),
                                  Rep::GlobalOk(GlobalRep::Repaid));
 
-        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::StopAck));
+        assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::Stopped));
         master_thread.join().unwrap();
         worker_pq.join().unwrap();
         worker_db.join().unwrap();

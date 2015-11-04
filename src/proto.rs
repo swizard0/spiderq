@@ -32,18 +32,18 @@ pub enum Req<'a> {
 
 #[derive(Debug, PartialEq)]
 pub enum GlobalRep<'a> {
-    Count(usize),
+    Counted(usize),
     Added(u32),
-    Lend(u32, Option<&'a [u8]>),
+    Lent(u32, Option<&'a [u8]>),
     Repaid,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum LocalRep<'a> {
-    Add(u32),
-    Lend(u32),
-    StopAck,
-    Panic(&'a str),
+    Added(u32),
+    Lent(u32),
+    Stopped,
+    Panicked(&'a str),
 }
 
 #[derive(Debug, PartialEq)]
@@ -282,7 +282,7 @@ impl<'a> GlobalRep<'a> {
         match try_get!(data, u8, read_u8, NotEnoughDataForGlobalRepTag) {
             (1, count_buf) => {
                 let (count, _) = try_get!(count_buf, u32, read_u32, NotEnoughDataForGlobalRepCountCount);
-                Ok(GlobalRep::Count(count as usize))
+                Ok(GlobalRep::Counted(count as usize))
             },
             (2, id_buf) => {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForGlobalRepAddedId);
@@ -290,7 +290,7 @@ impl<'a> GlobalRep<'a> {
             },
             (3, rest_buf) => {
                 let (id, lent_data) = try_get!(rest_buf, u32, read_u32, NotEnoughDataForGlobalRepLendId);
-                Ok(GlobalRep::Lend(id, if lent_data.len() == 0 { None } else { Some(lent_data) }))
+                Ok(GlobalRep::Lent(id, if lent_data.len() == 0 { None } else { Some(lent_data) }))
             },
             (4, _) => Ok(GlobalRep::Repaid),
             (tag, _) => return Err(ProtoError::InvalidGlobalRepTag(tag)),
@@ -299,16 +299,16 @@ impl<'a> GlobalRep<'a> {
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
-            &GlobalRep::Count(..) => size_of::<u32>(),
+            &GlobalRep::Counted(..) => size_of::<u32>(),
             &GlobalRep::Added(..) => size_of::<u32>(),
-            &GlobalRep::Lend(_, maybe_data) => size_of::<u32>() + maybe_data.map(|data| data.len()).unwrap_or(0),
+            &GlobalRep::Lent(_, maybe_data) => size_of::<u32>() + maybe_data.map(|data| data.len()).unwrap_or(0),
             &GlobalRep::Repaid => 0,
         }
     }
 
     pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
         match self {
-            &GlobalRep::Count(count) => {
+            &GlobalRep::Counted(count) => {
                 let area = put_adv!(area, u8, write_u8, 1);
                 put_adv!(area, u32, write_u32, count as u32)
             },
@@ -316,7 +316,7 @@ impl<'a> GlobalRep<'a> {
                 let area = put_adv!(area, u8, write_u8, 2);
                 put_adv!(area, u32, write_u32, id)
             },
-            &GlobalRep::Lend(id, maybe_data) => {
+            &GlobalRep::Lent(id, maybe_data) => {
                 let area = put_adv!(area, u8, write_u8, 3);
                 let area = put_adv!(area, u32, write_u32, id);
                 if let Some(data) = maybe_data {
@@ -481,16 +481,16 @@ impl<'a> LocalRep<'a> {
         match try_get!(data, u8, read_u8, NotEnoughDataForLocalRepTag) {
             (1, id_buf) => {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalRepLendId);
-                Ok(LocalRep::Lend(id))
+                Ok(LocalRep::Lent(id))
             },
             (2, id_buf) => {
                 let (id, _) = try_get!(id_buf, u32, read_u32, NotEnoughDataForLocalRepAddId);
-                Ok(LocalRep::Add(id))
+                Ok(LocalRep::Added(id))
             },
             (3, _) => 
-                Ok(LocalRep::StopAck),
+                Ok(LocalRep::Stopped),
             (4, msg_buf) =>
-                Ok(LocalRep::Panic(unsafe { ::std::str::from_utf8_unchecked(msg_buf) })),
+                Ok(LocalRep::Panicked(unsafe { ::std::str::from_utf8_unchecked(msg_buf) })),
             (tag, _) => 
                 return Err(ProtoError::InvalidLocalRepTag(tag)),
         }
@@ -498,25 +498,25 @@ impl<'a> LocalRep<'a> {
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
-            &LocalRep::Lend(..) | &LocalRep::Add(..) => size_of::<u32>(),
-            &LocalRep::StopAck => 0,
-            &LocalRep::Panic(ref msg) => msg.as_bytes().len(),
+            &LocalRep::Lent(..) | &LocalRep::Added(..) => size_of::<u32>(),
+            &LocalRep::Stopped => 0,
+            &LocalRep::Panicked(ref msg) => msg.as_bytes().len(),
         }
     }
 
     pub fn encode<'b>(&self, area: &'b mut [u8]) -> &'b mut [u8] {
         match self {
-            &LocalRep::Lend(id) => {
+            &LocalRep::Lent(id) => {
                 let area = put_adv!(area, u8, write_u8, 1);
                 put_adv!(area, u32, write_u32, id)
             },
-            &LocalRep::Add(id) => {
+            &LocalRep::Added(id) => {
                 let area = put_adv!(area, u8, write_u8, 2);
                 put_adv!(area, u32, write_u32, id)
             },
-            &LocalRep::StopAck =>
+            &LocalRep::Stopped =>
                 put_adv!(area, u8, write_u8, 3),
-            &LocalRep::Panic(ref msg) => {
+            &LocalRep::Panicked(ref msg) => {
                 let area = put_adv!(area, u8, write_u8, 4);
                 let msg_bytes = msg.as_bytes();
                 bytes::copy_memory(msg_bytes, area);
@@ -596,7 +596,7 @@ mod test {
 
     #[test]
     fn rep_globalok_globalrep_count() {
-        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Count(97)));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Counted(97)));
     }
 
     #[test]
@@ -606,13 +606,13 @@ mod test {
 
     #[test]
     fn rep_globalok_globalrep_lend_none() {
-        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lend(317, None)));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lent(317, None)));
     }
 
     #[test]
     fn rep_globalok_globalrep_lend_some() {
         let some_data = "hello world".as_bytes();
-        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lend(316, Some(some_data))));
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lent(316, Some(some_data))));
     }
 
     #[test]
@@ -777,21 +777,21 @@ mod test {
 
     #[test]
     fn rep_local_localrep_lend() {
-        assert_encode_decode_rep(Rep::Local(LocalRep::Lend(147)));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Lent(147)));
     }
 
     #[test]
     fn rep_local_localrep_add() {
-        assert_encode_decode_rep(Rep::Local(LocalRep::Add(87)));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Added(87)));
     }
 
     #[test]
     fn rep_local_localrep_stopack() {
-        assert_encode_decode_rep(Rep::Local(LocalRep::StopAck));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Stopped));
     }
 
     #[test]
     fn rep_local_localrep_panic() {
-        assert_encode_decode_rep(Rep::Local(LocalRep::Panic("some panic message")));
+        assert_encode_decode_rep(Rep::Local(LocalRep::Panicked("some panic message")));
     }
 }
