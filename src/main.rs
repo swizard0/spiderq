@@ -378,10 +378,86 @@ pub fn master(sock_ext: &mut zmq::Socket,
                 Decision::JustReply(rep) =>
                     try!(proto_reply(sock_ext, req_frames, rep)),
             }
-        } else if pollitems[1].get_revents() == zmq::POLLIN {
+        }
+
+        if pollitems[1].get_revents() == zmq::POLLIN {
             // sock_db is online
-        } else if pollitems[2].get_revents() == zmq::POLLIN {
+            enum Decision {
+                PassPqAdd(u32),
+                DoNothing,
+                TransmitExt,
+            }
+
+            let frames = try!(Frames::recv(sock_db_rx));
+            let decision = match Rep::decode(&frames) {
+                Ok(Rep::Local(LocalRep::Add(id))) =>
+                    Decision::PassPqAdd(id),
+                Ok(Rep::Local(LocalRep::StopAck)) => {
+                    stop_state = match stop_state {
+                        StopState::NotTriggered | StopState::WaitingPq | StopState::Finished => unreachable!(),
+                        StopState::WaitingPqAndDb => StopState::WaitingPq,
+                        StopState::WaitingDb => StopState::Finished,
+                    };
+                    Decision::DoNothing
+                },
+                Ok(Rep::Local(LocalRep::Lend(..))) =>
+                    panic!("unexpected LocalRep::Lend reply from worker_db"),
+                Ok(Rep::Local(LocalRep::Panic(msg))) =>
+                    panic!("worker_db panic'd with message: {}", msg),
+                Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
+                    Decision::TransmitExt,
+                Err(err) =>
+                    panic!("failed to decode worker_db reply: {:?}, error: {:?}", frames.deref(), err),
+            };
+
+            match decision {
+                Decision::PassPqAdd(id) =>
+                    try!(proto_request(sock_pq_tx, frames, Req::Local(LocalReq::AddEnqueue(id)))),
+                Decision::DoNothing =>
+                    (),
+                Decision::TransmitExt =>
+                    try!(frames.transmit(sock_ext)),
+            }
+        }
+
+        if pollitems[2].get_revents() == zmq::POLLIN {
             // sock_pq is online
+            enum Decision {
+                PassDbLoad(u32),
+                DoNothing,
+                TransmitExt,
+            }
+
+            let frames = try!(Frames::recv(sock_pq_rx));
+            let decision = match Rep::decode(&frames) {
+                Ok(Rep::Local(LocalRep::Lend(id))) =>
+                    Decision::PassDbLoad(id),
+                Ok(Rep::Local(LocalRep::StopAck)) => {
+                    stop_state = match stop_state {
+                        StopState::NotTriggered | StopState::WaitingDb | StopState::Finished => unreachable!(),
+                        StopState::WaitingPqAndDb => StopState::WaitingDb,
+                        StopState::WaitingPq => StopState::Finished,
+                    };
+                    Decision::DoNothing
+                },
+                Ok(Rep::Local(LocalRep::Add(..))) =>
+                    panic!("unexpected LocalRep::Add reply from worker_pq"),
+                Ok(Rep::Local(LocalRep::Panic(msg))) =>
+                    panic!("worker_pq panic'd with message: {}", msg),
+                Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
+                    Decision::TransmitExt,
+                Err(err) =>
+                    panic!("failed to decode worker_pq reply: {:?}, error: {:?}", frames.deref(), err),
+            };
+
+            match decision {
+                Decision::PassDbLoad(id) =>
+                    try!(proto_request(sock_db_tx, frames, Req::Local(LocalReq::Load(id)))),
+                Decision::DoNothing =>
+                    (),
+                Decision::TransmitExt =>
+                    try!(frames.transmit(sock_ext)),
+            }
         }
     }
 }
