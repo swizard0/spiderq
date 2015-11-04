@@ -319,7 +319,18 @@ pub fn master(sock_ext: &mut zmq::Socket,
               sock_db_rx: &mut zmq::Socket,
               sock_pq_tx: &mut zmq::Socket,
               sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
+    enum StopState {
+        NotTriggered,
+        WaitingPqAndDb,
+        WaitingPq,
+        WaitingDb,
+        Finished,
+    }
+
+    let mut stop_state = StopState::NotTriggered;
     loop {
+        match stop_state { StopState::Finished => return Ok(()), _ => (), }
+
         let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                              sock_db_rx.as_poll_item(zmq::POLLIN),
                              sock_pq_rx.as_poll_item(zmq::POLLIN)];
@@ -327,17 +338,46 @@ pub fn master(sock_ext: &mut zmq::Socket,
             continue
         }
 
-        // enum Decision<'a> {
-        // }
-
         if pollitems[0].get_revents() == zmq::POLLIN {
             // sock_ext is online        
-            // let req_frames = try!(Frames::recv(sock_ext));
-            // match Req::decode(&req_frames) {
-            //     Ok(Req::Global(GlobalReq::Add(..))) => {
+            enum Decision<'a> {
+                TransmitPq,
+                TransmitDb,
+                BroadcastStop,
+                JustReply(Rep<'a>),
+            }
 
-            //     },
-            // }
+            let req_frames = try!(Frames::recv(sock_ext));
+            let decision = match Req::decode(&req_frames) {
+                Ok(Req::Global(GlobalReq::Count)) =>
+                    Decision::TransmitPq,
+                Ok(Req::Global(GlobalReq::Add(..))) =>
+                    Decision::TransmitDb,
+                Ok(Req::Global(GlobalReq::Lend { .. })) =>
+                    Decision::TransmitPq,
+                Ok(Req::Global(GlobalReq::Repay(..))) =>
+                    Decision::TransmitPq,
+                Ok(Req::Local(LocalReq::Stop)) =>
+                    Decision::BroadcastStop,
+                Ok(..) =>
+                    Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest)),
+                Err(proto_err) =>
+                    Decision::JustReply(Rep::GlobalErr(proto_err)),
+            };
+
+            match decision {
+                Decision::TransmitPq =>
+                    try!(req_frames.transmit(sock_pq_tx)),
+                Decision::TransmitDb =>
+                    try!(req_frames.transmit(sock_db_tx)),
+                Decision::BroadcastStop => {
+                    try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+                    try!(sock_db_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+                    stop_state = StopState::WaitingPqAndDb;
+                },
+                Decision::JustReply(rep) =>
+                    try!(proto_reply(sock_ext, req_frames, rep)),
+            }
         } else if pollitems[1].get_revents() == zmq::POLLIN {
             // sock_db is online
         } else if pollitems[2].get_revents() == zmq::POLLIN {
