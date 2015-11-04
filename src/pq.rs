@@ -63,8 +63,9 @@ impl PQueue {
     }
 
     pub fn add(&mut self) -> u32 {
+        self.serial += 1;
         let last_index = self.len() as u32;
-        self.queue.push(PQueueEntry { priority: 0, index: last_index, boost: 0, });
+        self.queue.push(PQueueEntry { priority: self.serial, index: last_index, boost: 0, });
         last_index
     }
 
