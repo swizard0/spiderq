@@ -24,6 +24,7 @@ pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
     Zmq(ZmqError),
+    EmptyFramesTransmit,
 }
 
 #[derive(Debug)]
@@ -97,12 +98,19 @@ impl Frames {
     }
 
     fn send(mut self, sock: &mut zmq::Socket, workload: zmq::Message) -> Result<(), Error> {
-        assert!(!self.0.is_empty());
-        self.0.pop();
-        for frame in self.0 {
-            try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        self.0.last_mut().map(|m| mem::replace(m, workload));
+        self.transmit(sock)
+    }
+
+    fn transmit(mut self, sock: &mut zmq::Socket) -> Result<(), Error> {
+        if let Some(workload) = self.0.pop() {
+            for frame in self.0 {
+                try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+            }
+            sock.send_msg(workload, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+        } else {
+            Err(Error::EmptyFramesTransmit)
         }
-        sock.send_msg(workload, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
     }
 }
 
@@ -319,8 +327,17 @@ pub fn master(sock_ext: &mut zmq::Socket,
             continue
         }
 
+        // enum Decision<'a> {
+        // }
+
         if pollitems[0].get_revents() == zmq::POLLIN {
-            // sock_ext is online
+            // sock_ext is online        
+            // let req_frames = try!(Frames::recv(sock_ext));
+            // match Req::decode(&req_frames) {
+            //     Ok(Req::Global(GlobalReq::Add(..))) => {
+
+            //     },
+            // }
         } else if pollitems[1].get_revents() == zmq::POLLIN {
             // sock_db is online
         } else if pollitems[2].get_revents() == zmq::POLLIN {
