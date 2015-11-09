@@ -49,8 +49,9 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
+    let use_mem_cache = matches.opt_present("memory-cache");
 
-    let db = try!(db::Database::new(&database_dir).map_err(|e| Error::Db(e)));
+    let db = try!(db::Database::new(&database_dir, use_mem_cache).map_err(|e| Error::Db(e)));
     let pq = pq::PQueue::new(try!(db.count()));
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -485,6 +486,7 @@ fn main() {
     let mut opts = Options::new();
 
     opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
+    opts.optflag("m", "memory-cache", "use memory cache for database contents (optional, default: no cache)");
     opts.optopt("z", "zmq-addr", "zeromq interface listen address (optional, default: ipc://./spiderq.ipc)", "");
 
     match entrypoint(opts.parse(args)) {
@@ -600,7 +602,7 @@ mod test {
     fn db_worker() {
         let path = "/tmp/spiderq_main";
         let _ = fs::remove_dir_all(path);
-        let db = db::Database::new(path).unwrap();
+        let db = db::Database::new(path, false).unwrap();
         with_worker(
             "pq",
             move |sock_db_master_tx, sock_db_master_rx| worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db),
@@ -632,7 +634,7 @@ mod test {
     fn full_server() {
         let path = "/tmp/spiderq_master";
         let _ = fs::remove_dir_all(path);
-        let db = db::Database::new(path).unwrap();
+        let db = db::Database::new(path, false).unwrap();
         let pq = pq::PQueue::new(0);
         let mut ctx = zmq::Context::new();
         let mut sock_master_ext_peer = ctx.socket(zmq::REQ).unwrap();
