@@ -330,6 +330,12 @@ pub fn master(sock_ext: &mut zmq::Socket,
         Finished(Frames),
     }
 
+    let mut stats_count = 0;
+    let mut stats_add = 0;
+    let mut stats_lend = 0;
+    let mut stats_repay = 0;
+    let mut stats_stats = 0;
+
     let mut stop_state = StopState::NotTriggered;
     loop {
         match stop_state {
@@ -374,6 +380,16 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     Decision::TransmitPq,
                 Ok(Req::Local(LocalReq::Stop)) =>
                     Decision::BroadcastStop,
+                Ok(Req::Global(GlobalReq::Stats)) => {
+                    stats_stats += 1;
+                    Decision::JustReply(Rep::GlobalOk(GlobalRep::StatsGot {
+                        count: stats_count,
+                        add: stats_add,
+                        lend: stats_lend,
+                        repay: stats_repay,
+                        stats: stats_stats,
+                    }))
+                },
                 Ok(..) =>
                     Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest)),
                 Err(proto_err) =>
@@ -415,18 +431,31 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     };
                     Decision::DoNothing
                 },
+                Ok(Rep::GlobalOk(GlobalRep::Lent(..))) => {
+                    stats_lend += 1;
+                    Decision::TransmitExt
+                },
+                Ok(Rep::GlobalErr(..)) =>
+                    Decision::TransmitExt,
+                Ok(Rep::GlobalOk(GlobalRep::Counted(..))) =>
+                    panic!("unexpected GlobalRep::Counted reply from worker_db"),
+                Ok(Rep::GlobalOk(GlobalRep::Added(..))) =>
+                    panic!("unexpected GlobalRep::Added reply from worker_db"),
+                Ok(Rep::GlobalOk(GlobalRep::Repaid(..))) =>
+                    panic!("unexpected GlobalRep::Repaid reply from worker_db"),
+                Ok(Rep::GlobalOk(GlobalRep::StatsGot { .. })) =>
+                    panic!("unexpected GlobalRep::StatsGot reply from worker_db"),
                 Ok(Rep::Local(LocalRep::Lent(..))) =>
                     panic!("unexpected LocalRep::Lend reply from worker_db"),
                 Ok(Rep::Local(LocalRep::Panicked(msg))) =>
                     panic!("worker_db panic'd with message: {}", msg),
-                Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
-                    Decision::TransmitExt,
                 Err(err) =>
                     panic!("failed to decode worker_db reply: {:?}, error: {:?}", frames.deref(), err),
             };
 
             match decision {
                 Decision::PassPqAddAndReply(id) => {
+                    stats_add += 1;
                     try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::AddEnqueue(id)))), 0)
                          .map_err(|e| Error::Zmq(ZmqError::Send(e))));
                     try!(proto_reply(sock_ext, frames, Rep::GlobalOk(GlobalRep::Added(id))));
@@ -458,12 +487,26 @@ pub fn master(sock_ext: &mut zmq::Socket,
                     };
                     Decision::DoNothing
                 },
+                Ok(Rep::GlobalOk(GlobalRep::Counted(..))) => {
+                    stats_count += 1;
+                    Decision::TransmitExt
+                },
+                Ok(Rep::GlobalOk(GlobalRep::Repaid)) => {
+                    stats_repay += 1;
+                    Decision::TransmitExt
+                },
+                Ok(Rep::GlobalErr(..)) =>
+                    Decision::TransmitExt,
+                Ok(Rep::GlobalOk(GlobalRep::Added(..))) =>
+                    panic!("unexpected GlobalRep::Added reply from worker_pq"),
+                Ok(Rep::GlobalOk(GlobalRep::Lent(..))) =>
+                    panic!("unexpected GlobalRep::Lent reply from worker_pq"),
+                Ok(Rep::GlobalOk(GlobalRep::StatsGot { .. })) =>
+                    panic!("unexpected GlobalRep::StatsGot reply from worker_pq"),
                 Ok(Rep::Local(LocalRep::Added(..))) =>
-                    panic!("unexpected LocalRep::Add reply from worker_pq"),
+                    panic!("unexpected LocalRep::Added reply from worker_pq"),
                 Ok(Rep::Local(LocalRep::Panicked(msg))) =>
                     panic!("worker_pq panic'd with message: {}", msg),
-                Ok(Rep::GlobalOk(..)) | Ok(Rep::GlobalErr(..)) =>
-                    Decision::TransmitExt,
                 Err(err) =>
                     panic!("failed to decode worker_pq reply: {:?}, error: {:?}", frames.deref(), err),
             };
@@ -710,6 +753,16 @@ mod test {
             let interval = SteadyTime::now() - start;
             assert_eq!(interval.num_seconds(), 1);
         }
+
+        assert_request_reply_ext(&mut sock_master_ext_peer,
+                                 Req::Global(GlobalReq::Stats),
+                                 Rep::GlobalOk(GlobalRep::StatsGot { 
+                                     count: 7,
+                                     add: 3,
+                                     lend: 5,
+                                     repay: 1,
+                                     stats: 1,
+                                 }));
 
         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::Stopped));
         master_thread.join().unwrap();
