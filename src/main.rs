@@ -244,9 +244,11 @@ fn worker_pq(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, mut pq: pq::P
             -1
         };
 
-        let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
-        let avail = try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
-        if (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN) {
+        if {
+            let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
+            let avail = try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
+            (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN)
+        } {
             pending_queue.push_front(try!(Frames::recv(sock_rx)));
         }
 
@@ -337,14 +339,20 @@ pub fn master(sock_ext: &mut zmq::Socket,
             _ => (),
         }
 
-        let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
-                             sock_db_rx.as_poll_item(zmq::POLLIN),
-                             sock_pq_rx.as_poll_item(zmq::POLLIN)];
-        if try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
-            continue
-        }
+        let avail_socks = {
+            let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
+                                 sock_db_rx.as_poll_item(zmq::POLLIN),
+                                 sock_pq_rx.as_poll_item(zmq::POLLIN)];
+            if try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
+                continue
+            }
 
-        if pollitems[0].get_revents() == zmq::POLLIN {
+            [pollitems[0].get_revents() == zmq::POLLIN,
+             pollitems[1].get_revents() == zmq::POLLIN,
+             pollitems[2].get_revents() == zmq::POLLIN]
+        };
+
+        if avail_socks[0] {
             // sock_ext is online        
             enum Decision<'a> {
                 TransmitPq,
@@ -386,7 +394,7 @@ pub fn master(sock_ext: &mut zmq::Socket,
             }
         }
 
-        if pollitems[1].get_revents() == zmq::POLLIN {
+        if avail_socks[1] {
             // sock_db is online
             enum Decision {
                 PassPqAddAndReply(u32),
@@ -429,7 +437,7 @@ pub fn master(sock_ext: &mut zmq::Socket,
             }
         }
 
-        if pollitems[2].get_revents() == zmq::POLLIN {
+        if avail_socks[2] {
             // sock_pq is online
             enum Decision {
                 PassDbLoad(u32),
