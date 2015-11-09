@@ -15,6 +15,7 @@ pub enum GlobalReq<'a> {
     Add(Option<&'a [u8]>),
     Lend { timeout: u64 },
     Repay(u32, RepayStatus),
+    Stats,
 }
 
 #[derive(Debug, PartialEq)]
@@ -36,6 +37,7 @@ pub enum GlobalRep<'a> {
     Added(u32),
     Lent(u32, Option<&'a [u8]>),
     Repaid,
+    StatsGot { count: usize, add: usize, lend: usize, repay: usize, stats: usize, },
 }
 
 #[derive(Debug, PartialEq)]
@@ -86,6 +88,11 @@ pub enum ProtoError {
     UnexpectedWorkerDbRequest,
     UnexpectedWorkerPqRequest,
     UnexpectedMasterRequest,
+    NotEnoughDataForGlobalRepStatsCount { required: usize, given: usize, },
+    NotEnoughDataForGlobalRepStatsAdd { required: usize, given: usize, },
+    NotEnoughDataForGlobalRepStatsLend { required: usize, given: usize, },
+    NotEnoughDataForGlobalRepStatsRepay { required: usize, given: usize, },
+    NotEnoughDataForGlobalRepStatsStats { required: usize, given: usize, },
 }
 
 macro_rules! try_get {
@@ -147,7 +154,8 @@ impl<'a> Req<'a> {
 impl<'a> GlobalReq<'a> {
     pub fn decode(data: &'a [u8]) -> Result<GlobalReq<'a>, ProtoError> {
         match try_get!(data, u8, read_u8, NotEnoughDataForGlobalReqTag) {
-            (1, _) => Ok(GlobalReq::Count),
+            (1, _) => 
+                Ok(GlobalReq::Count),
             (2, data_to_add) if data_to_add.len() == 0 => 
                 Ok(GlobalReq::Add(None)),
             (2, data_to_add) => 
@@ -166,6 +174,8 @@ impl<'a> GlobalReq<'a> {
                 };
                 Ok(GlobalReq::Repay(id, status))
             },
+            (5, _) => 
+                Ok(GlobalReq::Stats),
             (tag, _) => 
                 return Err(ProtoError::InvalidGlobalReqTag(tag)),
         }
@@ -173,7 +183,7 @@ impl<'a> GlobalReq<'a> {
 
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
-            &GlobalReq::Count => 0,
+            &GlobalReq::Count | &GlobalReq::Stats => 0,
             &GlobalReq::Add(None) => 0,
             &GlobalReq::Add(Some(data)) => data.len(),
             &GlobalReq::Lend { .. } => size_of::<u64>(),
@@ -205,6 +215,8 @@ impl<'a> GlobalReq<'a> {
                     &RepayStatus::Front => 3,
                 })
             },
+            &GlobalReq::Stats =>
+                put_adv!(area, u8, write_u8, 5),
         }
     }
 }
@@ -292,8 +304,22 @@ impl<'a> GlobalRep<'a> {
                 let (id, lent_data) = try_get!(rest_buf, u32, read_u32, NotEnoughDataForGlobalRepLendId);
                 Ok(GlobalRep::Lent(id, if lent_data.len() == 0 { None } else { Some(lent_data) }))
             },
-            (4, _) => Ok(GlobalRep::Repaid),
-            (tag, _) => return Err(ProtoError::InvalidGlobalRepTag(tag)),
+            (4, _) => 
+                Ok(GlobalRep::Repaid),
+            (5, buf) => {
+                let (stats_count, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsCount);
+                let (stats_add, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsAdd);
+                let (stats_lend, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsLend);
+                let (stats_repay, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsRepay);
+                let (stats_stats, _) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsStats);
+                Ok(GlobalRep::StatsGot { count: stats_count as usize,
+                                         add: stats_add as usize,
+                                         lend: stats_lend as usize,
+                                         repay: stats_repay as usize,
+                                         stats: stats_stats as usize, })
+            },
+            (tag, _) => 
+                return Err(ProtoError::InvalidGlobalRepTag(tag)),
         }
     }
 
@@ -303,6 +329,7 @@ impl<'a> GlobalRep<'a> {
             &GlobalRep::Added(..) => size_of::<u32>(),
             &GlobalRep::Lent(_, maybe_data) => size_of::<u32>() + maybe_data.map(|data| data.len()).unwrap_or(0),
             &GlobalRep::Repaid => 0,
+            &GlobalRep::StatsGot { .. } => size_of::<u64>() * 5,
         }
     }
 
@@ -328,6 +355,15 @@ impl<'a> GlobalRep<'a> {
             },
             &GlobalRep::Repaid =>
                 put_adv!(area, u8, write_u8, 4),
+            &GlobalRep::StatsGot { count: stats_count, add: stats_add, lend: stats_lend, repay: stats_repay, stats: stats_stats, } => {
+                let area = put_adv!(area, u8, write_u8, 5);
+                let area = put_adv!(area, u64, write_u64, stats_count as u64);
+                let area = put_adv!(area, u64, write_u64, stats_add as u64);
+                let area = put_adv!(area, u64, write_u64, stats_lend as u64);
+                let area = put_adv!(area, u64, write_u64, stats_repay as u64);
+                let area = put_adv!(area, u64, write_u64, stats_stats as u64);
+                area
+            },
         }
     }
 }
@@ -396,6 +432,11 @@ impl ProtoError {
             (29, _) => Ok(ProtoError::UnexpectedWorkerDbRequest),
             (30, _) => Ok(ProtoError::UnexpectedWorkerPqRequest),
             (31, _) => Ok(ProtoError::UnexpectedMasterRequest),
+            (32, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepStatsCount),
+            (33, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepStatsAdd),
+            (34, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepStatsLend),
+            (35, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepStatsRepay),
+            (36, buf) => decode_not_enough!(buf, NotEnoughDataForGlobalRepStatsStats),
             (tag, _) => return Err(ProtoError::InvalidProtoErrorTag(tag)),
         }
     }
@@ -421,7 +462,12 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForProtoErrorInvalidTag { .. } |
             &ProtoError::NotEnoughDataForLocalRepTag { .. } |
             &ProtoError::NotEnoughDataForLocalRepLendId { .. } |
-            &ProtoError::NotEnoughDataForLocalRepAddId { .. } =>
+            &ProtoError::NotEnoughDataForLocalRepAddId { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepStatsCount { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepStatsAdd { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepStatsLend { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepStatsRepay { .. } |
+            &ProtoError::NotEnoughDataForGlobalRepStatsStats { .. } =>
                 size_of::<u32>() + size_of::<u32>(),
             &ProtoError::InvalidReqTag(..) |
             &ProtoError::InvalidGlobalReqTag(..) |
@@ -472,6 +518,11 @@ impl ProtoError {
             &ProtoError::UnexpectedWorkerDbRequest => put_adv!(area, u8, write_u8, 29),
             &ProtoError::UnexpectedWorkerPqRequest => put_adv!(area, u8, write_u8, 30),
             &ProtoError::UnexpectedMasterRequest => put_adv!(area, u8, write_u8, 31),
+            &ProtoError::NotEnoughDataForGlobalRepStatsCount { required: r, given: g, } => encode_not_enough!(area, 32, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepStatsAdd { required: r, given: g, } => encode_not_enough!(area, 33, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepStatsLend { required: r, given: g, } => encode_not_enough!(area, 34, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepStatsRepay { required: r, given: g, } => encode_not_enough!(area, 35, r, g),
+            &ProtoError::NotEnoughDataForGlobalRepStatsStats { required: r, given: g, } => encode_not_enough!(area, 36, r, g),
         }
     }
 }
@@ -580,6 +631,11 @@ mod test {
     }
 
     #[test]
+    fn req_global_globalreq_stats() {
+        assert_encode_decode_req(Req::Global(GlobalReq::Stats));
+    }
+
+    #[test]
     fn req_local_localreq_load() {
         assert_encode_decode_req(Req::Local(LocalReq::Load(217)));
     }
@@ -618,6 +674,11 @@ mod test {
     #[test]
     fn rep_globalok_globalrep_repaid() {
         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Repaid));
+    }
+
+    #[test]
+    fn rep_globalok_globalrep_stats() {
+        assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::StatsGot { count: 177, add: 277, lend: 377, repay: 477, stats: 577, }));
     }
 
     #[test]
@@ -773,6 +834,31 @@ mod test {
     #[test]
     fn rep_globalerr_protoerror_unexpectedmasterrequest() {
         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforglobalrepstatscount () {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsCount { required: 177, given: 167, }));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsadd () {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsAdd { required: 177, given: 167, }));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforglobalrepstatslend () {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsLend { required: 177, given: 167, }));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsrepay () {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsRepay { required: 177, given: 167, }));
+    }
+
+    #[test]
+    fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsstats () {
+        assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsStats { required: 177, given: 167, }));
     }
 
     #[test]
