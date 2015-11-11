@@ -556,7 +556,7 @@ mod test {
 
     #[test]
     fn globalrep_error_invalidglobalreqtag() {
-        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqTag(377)));
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqTag(177)));
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod test {
 
     #[test]
     fn globalrep_error_invalidglobalreqrepayrepaystatustag() {
-        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqRepayRepayStatusTag(377)));
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqRepayRepayStatusTag(177)));
     }
 
     #[test]
@@ -621,7 +621,7 @@ mod test {
 
     #[test]
     fn globalrep_error_invalidglobalreptag() {
-        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalRepTag(377)));
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalRepTag(177)));
     }
 
     #[test]
@@ -681,7 +681,7 @@ mod test {
 
     #[test]
     fn globalrep_error_invalidprotoerrortag() {
-        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidProtoErrorTag(377)));
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidProtoErrorTag(177)));
     }
 
     #[test]
