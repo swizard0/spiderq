@@ -127,7 +127,7 @@ macro_rules! try_get_vec {
         if buf.len() < len {
             return Err(ProtoError::$err_val { required: len, given: buf.len(), })
         } else {
-            (Arc::new(buf[0 .. len].to_owned()), buf)
+            (Arc::new(buf[0 .. len].to_owned()), &buf[len ..])
         }
     })
 }
@@ -444,307 +444,258 @@ impl ProtoError {
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     use super::{RepayStatus, Req, GlobalReq, LocalReq, Rep, GlobalRep, LocalRep, ProtoError};
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+    use super::{Key, Value, RepayStatus, GlobalReq, GlobalRep, ProtoError};
 
-//     macro_rules! defassert_encode_decode {
-//         ($name:ident, $ty:ty, $class:ident) => (fn $name(r: $ty) {
-//             let bytes_required = r.encode_len();
-//             let mut area: Vec<_> = (0 .. bytes_required).map(|_| 0).collect();
-//             assert!(r.encode(&mut area).len() == 0);
-//             let assert_r = $class::decode(&area).unwrap();
-//             assert_eq!(r, assert_r);
-//         })
-//     }
+    macro_rules! defassert_encode_decode {
+        ($name:ident, $ty:ty, $class:ident) => (fn $name(r: $ty) {
+            let bytes_required = r.encode_len();
+            let mut area: Vec<_> = (0 .. bytes_required).map(|_| 0).collect();
+            assert!(r.encode(&mut area).len() == 0);
+            let (assert_r, rest) = $class::decode(&area).unwrap();
+            assert_eq!(rest.len(), 0);
+            assert_eq!(r, assert_r);
+        })
+    }
 
-//     defassert_encode_decode!(assert_encode_decode_req, Req, Req);
-//     defassert_encode_decode!(assert_encode_decode_rep, Rep, Rep);
+    defassert_encode_decode!(assert_encode_decode_req, GlobalReq, GlobalReq);
+    defassert_encode_decode!(assert_encode_decode_rep, GlobalRep, GlobalRep);
 
-//     #[test]
-//     fn req_global_globalreq_count() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Count));
-//     }
+    fn dummy_key_value() -> (Key, Value) {
+        (Arc::new("some key".as_bytes().to_owned()),
+         Arc::new("some value".as_bytes().to_owned()))
+    }
 
-//     #[test]
-//     fn req_global_globalreq_add_none() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Add(None)));
-//     }
+    #[test]
+    fn globalreq_count() {
+        assert_encode_decode_req(GlobalReq::Count);
+    }
 
-//     #[test]
-//     fn req_global_globalreq_add_some() {
-//         let some_data = "hello world".as_bytes();
-//         assert_encode_decode_req(Req::Global(GlobalReq::Add(Some(some_data))));
-//     }
+    #[test]
+    fn globalreq_add() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_req(GlobalReq::Add(key, value));
+    }
 
-//     #[test]
-//     fn req_global_globalreq_lend() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Lend { timeout: 177, }));
-//     }
+    #[test]
+    fn globalreq_lend() {
+        assert_encode_decode_req(GlobalReq::Lend { timeout: 177, });
+    }
 
-//     #[test]
-//     fn req_global_globalreq_repay_penalty() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Repay(17, RepayStatus::Penalty)));
-//     }
+    #[test]
+    fn globalreq_repay_penalty() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_req(GlobalReq::Repay(key, value, RepayStatus::Penalty));
+    }
 
-//     #[test]
-//     fn req_global_globalreq_repay_reward() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Repay(18, RepayStatus::Reward)));
-//     }
+    #[test]
+    fn globalreq_repay_reward() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_req(GlobalReq::Repay(key, value, RepayStatus::Reward));
+    }
 
-//     #[test]
-//     fn req_global_globalreq_repay_front() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Repay(19, RepayStatus::Front)));
-//     }
+    #[test]
+    fn globalreq_repay_front() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_req(GlobalReq::Repay(key, value, RepayStatus::Front));
+    }
 
-//     #[test]
-//     fn req_global_globalreq_stats() {
-//         assert_encode_decode_req(Req::Global(GlobalReq::Stats));
-//     }
+    #[test]
+    fn globalreq_repay_drop() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_req(GlobalReq::Repay(key, value, RepayStatus::Drop));
+    }
 
-//     #[test]
-//     fn req_local_localreq_load() {
-//         assert_encode_decode_req(Req::Local(LocalReq::Load(217)));
-//     }
+    #[test]
+    fn globalreq_stats() {
+        assert_encode_decode_req(GlobalReq::Stats);
+    }
 
-//     #[test]
-//     fn req_local_localreq_addenqueue() {
-//         assert_encode_decode_req(Req::Local(LocalReq::AddEnqueue(597)));
-//     }
+    #[test]
+    fn globalreq_terminate() {
+        assert_encode_decode_req(GlobalReq::Terminate);
+    }
 
-//     #[test]
-//     fn req_local_localreq_stop() {
-//         assert_encode_decode_req(Req::Local(LocalReq::Stop));
-//     }
+    #[test]
+    fn globalrep_counted() {
+        assert_encode_decode_rep(GlobalRep::Counted(97));
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_count() {
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Counted(97)));
-//     }
+    #[test]
+    fn globalrep_added() {
+        assert_encode_decode_rep(GlobalRep::Added);
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_added() {
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Added(167)));
-//     }
+    #[test]
+    fn globalrep_kept() {
+        assert_encode_decode_rep(GlobalRep::Kept);
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_lend_none() {
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lent(317, None)));
-//     }
+    #[test]
+    fn globalrep_lent() {
+        let (key, value) = dummy_key_value();
+        assert_encode_decode_rep(GlobalRep::Lent(key, value));
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_lend_some() {
-//         let some_data = "hello world".as_bytes();
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Lent(316, Some(some_data))));
-//     }
+    #[test]
+    fn globalrep_repaid() {
+        assert_encode_decode_rep(GlobalRep::Repaid);
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_repaid() {
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::Repaid));
-//     }
+    #[test]
+    fn globalrep_stats() {
+        assert_encode_decode_rep(GlobalRep::StatsGot { count: 177, add: 277, lend: 377, repay: 477, stats: 577, });
+    }
 
-//     #[test]
-//     fn rep_globalok_globalrep_stats() {
-//         assert_encode_decode_rep(Rep::GlobalOk(GlobalRep::StatsGot { count: 177, add: 277, lend: 377, repay: 477, stats: 577, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqtag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqTag { required: 177, given: 277, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForReqTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_invalidglobalreqtag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqTag(377)));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidReqTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqaddkeylen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqAddKeyLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqaddkey() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqAddKey { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidglobalreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalReqTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqaddvaluelen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqAddValueLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreqlendtimeout() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqLendTimeout { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqaddvalue() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqAddValue { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreqrepayid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqRepayId { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqlendtimeout() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqLendTimeout { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreqrepaystatus() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalReqRepayStatus { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqrepaykeylen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqRepayKeyLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidglobalreqrepaystatustag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalReqRepayStatusTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqrepaykey() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqRepayKey { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqrepayvaluelen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqRepayValueLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidlocalreqtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidLocalReqTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqrepayvalue() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqRepayValue { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalreqloadid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqLoadId { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreqrepayrepaystatus() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalReqRepayRepayStatus { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalreqaddenqueueid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalReqAddEnqueueId { required: 137, given: 467, }));
-//     }
+    #[test]
+    fn globalrep_error_invalidglobalreqrepayrepaystatustag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalReqRepayRepayStatusTag(377)));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForRepTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreptag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepTag { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidRepTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_invalidglobalreptag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidGlobalRepTag(377)));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepcountcount() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepCountCount { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidglobalreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidGlobalRepTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreplentkeylen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepLentKeyLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepcountcount() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepCountCount { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreplentkey() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepLentKey { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepaddedid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepAddedId { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreplentvaluelen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepLentValueLen { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalreplendid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepLendId { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalreplentvalue() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepLentValue { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforprotoerrortag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepstatscount() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepStatsCount { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidprotoerrortag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidProtoErrorTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepstatsadd() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepStatsAdd { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforprotoerrorrequired() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorRequired { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepstatslend() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepStatsLend { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforprotoerrorgiven() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorGiven { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepstatsrepay() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepStatsRepay { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforprotoerrorinvalidtag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforglobalrepstatsstats() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForGlobalRepStatsStats { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepTag { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrortag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorTag { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_invalidlocalreptag() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::InvalidLocalRepTag(157)));
-//     }
+    #[test]
+    fn globalrep_error_invalidprotoerrortag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::InvalidProtoErrorTag(377)));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalreplendid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepLendId { required: 177, given: 167, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrorrequired() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorRequired { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforlocalrepaddid() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForLocalRepAddId { required: 337, given: 27, }));
-//     }
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrorgiven() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorGiven { required: 177, given: 177, }));
+    }
 
-//     #[test]
-//     fn rep_globalerr_protoerror_unexpectedworkerdbrequest() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_unexpectedworkerpqrequest() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_unexpectedmasterrequest() {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepstatscount () {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsCount { required: 177, given: 167, }));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsadd () {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsAdd { required: 177, given: 167, }));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepstatslend () {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsLend { required: 177, given: 167, }));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsrepay () {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsRepay { required: 177, given: 167, }));
-//     }
-
-//     #[test]
-//     fn rep_globalerr_protoerror_notenoughdataforglobalrepstatsstats () {
-//         assert_encode_decode_rep(Rep::GlobalErr(ProtoError::NotEnoughDataForGlobalRepStatsStats { required: 177, given: 167, }));
-//     }
-
-//     #[test]
-//     fn rep_local_localrep_lend() {
-//         assert_encode_decode_rep(Rep::Local(LocalRep::Lent(147)));
-//     }
-
-//     #[test]
-//     fn rep_local_localrep_add() {
-//         assert_encode_decode_rep(Rep::Local(LocalRep::Added(87)));
-//     }
-
-//     #[test]
-//     fn rep_local_localrep_stopack() {
-//         assert_encode_decode_rep(Rep::Local(LocalRep::Stopped));
-//     }
-
-//     #[test]
-//     fn rep_local_localrep_panic() {
-//         assert_encode_decode_rep(Rep::Local(LocalRep::Panicked("some panic message")));
-//     }
-// }
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrorinvalidtag() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: 177, given: 177, }));
+    }
+}
