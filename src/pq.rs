@@ -1,12 +1,15 @@
+use std::rc::Rc;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use time::SteadyTime;
 use super::proto::RepayStatus;
 
+type Key = Rc<Vec<u8>>;
+
 #[derive(PartialEq, Eq)]
 struct PQueueEntry {
+    key: Key,
     priority: u64,
-    index: u32,
     boost: u32,
 }
 
@@ -26,7 +29,7 @@ impl PartialOrd for PQueueEntry {
 struct LentEntry {
     trigger_at: SteadyTime,
     snapshot: u64,
-    index: u32,
+    key: Key,
 }
 
 impl Ord for LentEntry {
@@ -44,15 +47,15 @@ impl PartialOrd for LentEntry {
 pub struct PQueue {
     serial: u64,
     queue: BinaryHeap<PQueueEntry>,
-    lentm: HashMap<u32, (u64, PQueueEntry)>,
+    lentm: HashMap<Key, (u64, PQueueEntry)>,
     lentq: BinaryHeap<LentEntry>,
 }
 
 impl PQueue {
-    pub fn new(count: usize) -> PQueue {
+    pub fn new() -> PQueue {
         PQueue {
             serial: count as u64,
-            queue: (0 .. count).map(|i| PQueueEntry { priority: i as u64, index: i as u32, boost: 0, }).collect(),
+            queue: BinaryHeap::new(),
             lentm: HashMap::new(),
             lentq: BinaryHeap::new(),
         }
