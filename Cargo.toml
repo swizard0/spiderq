@@ -1,6 +1,6 @@
 [package]
 name = "spiderq"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
