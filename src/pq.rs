@@ -113,6 +113,7 @@ impl PQueue {
                 RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
                 RepayStatus::Reward => { entry.boost += 1; entry.boost },
                 RepayStatus::Front => 0,
+                RepayStatus::Drop => unimplemented!(),
             };
             entry.priority = match status {
                 RepayStatus::Front => 0,
