@@ -1,11 +1,12 @@
 use std::{io, fs, mem};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::thread::{spawn, JoinHandle};
 use std::collections::HashMap;
 use tempdir::TempDir;
-use byteorder::{WriteBytesExt, ByteOrder, NativeEndian};
+use byteorder::{ReadBytesExt, WriteBytesExt, ByteOrder, NativeEndian};
 use super::proto::{Key, Value};
 
 type Index = HashMap<Key, Value>;
@@ -16,10 +17,11 @@ pub enum Error {
     DatabaseStat(io::Error),
     DatabaseMkdir(io::Error),
     DatabaseTmpFile(String, io::Error),
-    DatabaseFile(String, io::Error),
+    DatabaseFileOpen(String, io::Error),
     DatabaseWrite(io::Error),
-    DatabaseRead(io::Error),
     DatabaseMove(String, String, io::Error),
+    DatabaseRead(io::Error),
+    DatabaseUnexpectedEof,
 }
 
 enum Snapshot {
@@ -80,10 +82,15 @@ impl Database {
             Err(e) => return Err(Error::DatabaseStat(e)),
         }
 
+        let mut snapshots = vec![Snapshot::Memory(Index::new())];
+        if let Some(persisted_index) = try!(load_index(database_dir)) {
+            snapshots.push(Snapshot::Persisted(Arc::new(persisted_index)));
+        }
+
         Ok(Database {
             database_dir: Arc::new(PathBuf::from(database_dir)),
             flush_limit: flush_limit,
-            snapshots: Some(Snapshot::Memory(Index::new())).into_iter().collect(),
+            snapshots: snapshots,
         })
     }
 
@@ -107,19 +114,19 @@ impl Database {
         } else {
             panic!("unexpected snapshots layout");
         }
-        self.update_snapshots();
+        self.update_snapshots(false);
     }
 
-    fn update_snapshots(&mut self) {
+    fn update_snapshots(&mut self, flush_mode: bool) {
         loop {
             // Check if memory part overflowed
-            if let Some(frozen_index) = match self.snapshots.first_mut() {
-                Some(&mut Snapshot::Memory(ref mut idx)) if idx.len() >= self.flush_limit =>
+            if let Some(index_to_freeze) = match self.snapshots.first_mut() {
+                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (idx.len() != 0 && flush_mode) =>
                     Some(mem::replace(idx, Index::new())),
                 _ =>
                     None,
             } {
-                self.snapshots.insert(1, Snapshot::Frozen(Arc::new(frozen_index)));
+                self.snapshots.insert(1, Snapshot::Frozen(Arc::new(index_to_freeze)));
                 continue;
             }
 
@@ -179,11 +186,18 @@ impl Database {
             }) {
                 let done_index =
                     if let &mut Snapshot::Persisting { index: ref idx, chan: ref rx, .. } = persisting_snapshot {
-                        match rx.try_recv() {
-                            Ok(Ok(())) => Some(idx.clone()),
-                            Ok(Err(e)) => panic!("persisting thread failed: {:?}", e),
-                            Err(TryRecvError::Empty) => None,
-                            Err(TryRecvError::Disconnected) => panic!("persisting thread is down"),
+                        if !flush_mode {
+                            match rx.try_recv() {
+                                Ok(Ok(())) => Some(idx.clone()),
+                                Ok(Err(e)) => panic!("persisting thread failed: {:?}", e),
+                                Err(TryRecvError::Empty) => None,
+                                Err(TryRecvError::Disconnected) => panic!("persisting thread is down"),
+                            }
+                        } else {
+                            match rx.recv().unwrap() {
+                                Ok(()) => Some(idx.clone()),
+                                Err(e) => panic!("persisting thread failed: {:?}", e),
+                            }
                         }
                     } else {
                         unreachable!()
@@ -208,10 +222,14 @@ impl Database {
             }) {
                 let done_index =
                     if let &mut Snapshot::Merging { chan: ref rx, .. } = merging_snapshot {
-                        match rx.try_recv() {
-                            Ok(merged_index) => Some(merged_index),
-                            Err(TryRecvError::Empty) => None,
-                            Err(TryRecvError::Disconnected) => panic!("merging thread is down"),
+                        if !flush_mode {
+                            match rx.try_recv() {
+                                Ok(merged_index) => Some(merged_index),
+                                Err(TryRecvError::Empty) => None,
+                                Err(TryRecvError::Disconnected) => panic!("merging thread is down"),
+                            }
+                        } else {
+                            Some(rx.recv().unwrap())
                         }
                     } else {
                         unreachable!()
@@ -234,8 +252,50 @@ impl Database {
     }
 }
 
+impl Drop for Database {
+    fn drop(&mut self) {
+        self.update_snapshots(true);
+    }
+}
+
 fn filename_as_string(filename: &PathBuf) -> String {
     filename.to_string_lossy().into_owned()
+}
+
+fn read_vec<R>(source: &mut R) -> Result<Option<Vec<u8>>, Error> where R: io::Read {
+    let len = try!(source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e))));
+    let source_ref = source.by_ref();
+    let mut buffer = Vec::with_capacity(len as usize);
+    match source_ref.take(len as u64).read_to_end(&mut buffer) {
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(buffer)),
+        Err(e) => Err(Error::DatabaseRead(e)),
+    }
+}
+
+fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
+    let mut db_file = PathBuf::new();
+    db_file.push(database_dir);
+    db_file.push("snapshot");
+
+    match fs::File::open(&db_file) {
+        Ok(file) => {
+            let mut index = Index::new();
+            let mut source = io::BufReader::new(file);
+            while let Some(key) = try!(read_vec(&mut source)) {
+                if let Some(value) = try!(read_vec(&mut source)) {
+                    index.insert(Arc::new(key), Arc::new(value));
+                } else {
+                    return Err(Error::DatabaseUnexpectedEof)
+                }
+            }
+            Ok(Some(index))
+        },
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
+            Ok(None),
+        Err(e) =>
+            return Err(Error::DatabaseFileOpen(filename_as_string(&db_file), e)),
+    }
 }
 
 fn write_vec<W>(value: &Arc<Vec<u8>>, target: &mut W) -> Result<(), Error> where W: io::Write {
