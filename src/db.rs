@@ -1,10 +1,11 @@
 use std::{io, fs, mem};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::thread::{spawn, JoinHandle};
 use std::collections::HashMap;
 use tempdir::TempDir;
+use byteorder::{WriteBytesExt, ByteOrder, NativeEndian};
 use super::proto::{Key, Value};
 
 type Index = HashMap<Key, Value>;
@@ -14,7 +15,11 @@ pub enum Error {
     DatabaseIsNotADir(String),
     DatabaseStat(io::Error),
     DatabaseMkdir(io::Error),
-    DatabaseFile(String, String, io::Error),
+    DatabaseTmpFile(String, io::Error),
+    DatabaseFile(String, io::Error),
+    DatabaseWrite(io::Error),
+    DatabaseRead(io::Error),
+    DatabaseMove(String, String, io::Error),
 }
 
 enum Snapshot {
@@ -37,6 +42,24 @@ impl Snapshot {
             &Snapshot::Persisting { index: ref idx, .. } => idx.len(),
             &Snapshot::Persisted(ref idx) => idx.len(),
             &Snapshot::Merging { indices: ref idxs, .. } => idxs.iter().fold(0, |total, idx| total + idx.len()),
+        }
+    }
+
+    fn lookup(&self, key: &Key) -> Option<&Value> {
+        match self {
+            &Snapshot::Memory(ref idx) => idx.get(key),
+            &Snapshot::Frozen(ref idx) => idx.get(key),
+            &Snapshot::Persisting { index: ref idx, .. } => idx.get(key),
+            &Snapshot::Persisted(ref idx) => idx.get(key),
+            &Snapshot::Merging { indices: ref idxs, .. } => {
+                for idx in idxs.iter() {
+                    if let Some(value) = idx.get(key) {
+                        return Some(value)
+                    }
+                }
+
+                None
+            }
         }
     }
 }
@@ -64,7 +87,21 @@ impl Database {
         })
     }
 
-    pub fn add(&mut self, key: Key, value: Value) {
+    pub fn count(&self) -> usize {
+        self.snapshots.iter().fold(0, |total, snapshot| total + snapshot.count())
+    }
+
+    pub fn lookup(&self, key: &Key) -> Option<&Value> {
+        for snapshot in self.snapshots.iter() {
+            if let Some(value) = snapshot.lookup(key) {
+                return Some(value)
+            }
+        }
+
+        None
+    }
+
+    pub fn insert(&mut self, key: Key, value: Value) {
         if let Some(&mut Snapshot::Memory(ref mut idx)) = self.snapshots.first_mut() {
             idx.insert(key, value);
         } else {
@@ -86,7 +123,7 @@ impl Database {
                 continue;
             }
 
-            // Check if last snapshot is unpersisted
+            // Check if last snapshot is not persisted
             if let Some(last_snapshot) = self.snapshots.last_mut() {
                 if let Some(index_to_persist) = match last_snapshot {
                     &mut Snapshot::Frozen(ref idx) => Some(idx.clone()),
@@ -105,6 +142,7 @@ impl Database {
                 }
             }
 
+            // Check if several snapshots should be merged
             enum MergeLayout { FirstMemory, SomeFrozen, LastPersisted, }
             let merge_decision = 
                 self.snapshots.iter().fold(Some(MergeLayout::FirstMemory), |state, snapshot| match (state, snapshot) {
@@ -134,199 +172,130 @@ impl Database {
                 continue;
             }
 
+            // Check if persisting is finished
+            if let Some(persisting_snapshot) = self.snapshots.iter_mut().find(|snapshot| match snapshot {
+                &&mut Snapshot::Persisting { .. } => true,
+                _ => false,
+            }) {
+                let done_index =
+                    if let &mut Snapshot::Persisting { index: ref idx, chan: ref rx, .. } = persisting_snapshot {
+                        match rx.try_recv() {
+                            Ok(Ok(())) => Some(idx.clone()),
+                            Ok(Err(e)) => panic!("persisting thread failed: {:?}", e),
+                            Err(TryRecvError::Empty) => None,
+                            Err(TryRecvError::Disconnected) => panic!("persisting thread is down"),
+                        }
+                    } else {
+                        unreachable!()
+                    };
+
+                if let Some(persisted_index) = done_index {
+                    if let Snapshot::Persisting { slave: thread, .. } =
+                        mem::replace(persisting_snapshot, Snapshot::Persisted(persisted_index)) {
+                            thread.join().unwrap();
+                        } else {
+                            unreachable!()
+                        }
+
+                    continue;
+                }
+            }
+
+            // Check if merging is finished
+            if let Some(merging_snapshot) = self.snapshots.iter_mut().find(|snapshot| match snapshot {
+                &&mut Snapshot::Merging { .. } => true,
+                _ => false,
+            }) {
+                let done_index =
+                    if let &mut Snapshot::Merging { chan: ref rx, .. } = merging_snapshot {
+                        match rx.try_recv() {
+                            Ok(merged_index) => Some(merged_index),
+                            Err(TryRecvError::Empty) => None,
+                            Err(TryRecvError::Disconnected) => panic!("merging thread is down"),
+                        }
+                    } else {
+                        unreachable!()
+                    };
+
+                if let Some(merged_index) = done_index {
+                    if let Snapshot::Merging { slave: thread, .. } =
+                        mem::replace(merging_snapshot, Snapshot::Persisted(Arc::new(merged_index))) {
+                            thread.join().unwrap();
+                        } else {
+                            unreachable!()
+                        }
+
+                    continue;
+                }
+            }
+
             break;
         }
     }
 }
 
-fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
+fn filename_as_string(filename: &PathBuf) -> String {
+    filename.to_string_lossy().into_owned()
+}
+
+fn write_vec<W>(value: &Arc<Vec<u8>>, target: &mut W) -> Result<(), Error> where W: io::Write {
+    try!(target.write_u32::<NativeEndian>(value.len() as u32).map_err(|e| Error::DatabaseWrite(From::from(e))));
+    try!(target.write_all(&value[..]).map_err(|e| Error::DatabaseWrite(e)));
     Ok(())
 }
 
-fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
-    Index::new()
+fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
+    let db_filename = "snapshot";
+    let tmp_dir = try!(TempDir::new_in(&*dir, "snapshot").map_err(|e| Error::DatabaseMkdir(e)));
+    let mut tmp_db_file = PathBuf::new();
+    tmp_db_file.push(tmp_dir.path());
+    tmp_db_file.push(db_filename);
+
+    {
+        let mut file = io::BufWriter::new(
+            try!(fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))));
+        for (key, value) in &*index {
+            try!(write_vec(key, &mut file));
+            try!(write_vec(value, &mut file));
+        }
+    }
+
+    let mut db_file = PathBuf::new();
+    db_file.push(&*dir);
+    db_file.push(db_filename);
+
+    fs::rename(&tmp_db_file, &db_file).map_err(|e| Error::DatabaseMove(filename_as_string(&tmp_db_file), filename_as_string(&db_file), e))
 }
 
-// fn open_rw(database_dir: &str, filename: &str) -> Result<(PathBuf, fs::File), Error> {
-//     let mut full_filename = PathBuf::new();
-//     full_filename.push(database_dir);
-//     full_filename.push(filename);
-//     let file = 
-//         try!(fs::OpenOptions::new()
-//              .read(true)
-//              .write(true)
-//              .append(true)
-//              .create(true)
-//              .open(&full_filename)
-//              .map_err(|e| Error::DatabaseFile(database_dir.to_owned(), filename.to_owned(), e)));
-//     Ok((full_filename, file))
-// }
+fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
+    let mut iter = indices.iter();
+    let mut base_index = (**(iter.next().unwrap())).clone();
+    for index in iter {
+        for (key, value) in &**index {
+            if !base_index.contains_key(key) {
+                base_index.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    
+    base_index
+}
 
-// fn filename_as_string(filename: &PathBuf) -> String {
-//     filename.to_string_lossy().into_owned()
-// }
+#[cfg(test)]
+mod test {
+    use std::fs;
+    use super::{Database, Error};
+    
+    fn mkdb(path: &str, flush_limit: usize) -> Database {
+        let _ = fs::remove_dir_all(path);
+        Database::new(path, flush_limit).unwrap()
+    }
 
-// fn file_size(fd: &fs::File, filename: &PathBuf) -> Result<u64, Error> {
-//     let md = try!(fd.metadata().map_err(|e| Error::Metadata(filename_as_string(filename), e)));
-//     Ok(md.len())
-// }
-
-// #[derive(Debug)]
-// pub enum LoadError<E> {
-//     Db(Error),
-//     Load(E),
-// }
-
-// impl<E> From<Error> for LoadError<E> {
-//     fn from(err: Error) -> LoadError<E> {
-//         LoadError::Db(err)
-//     }
-// }
-
-// pub trait Loader {
-//     type Error;
-
-//     fn set_len(&mut self, len: usize) -> Result<(), Self::Error>;
-//     fn contents(&mut self) -> &mut [u8];
-// }
-
-// impl Loader for Vec<u8> {
-//     type Error = ();
-
-//     fn set_len(&mut self, len: usize) -> Result<(), ()> {
-//         self.resize(len, 0);
-//         Ok(())
-//     }
-
-//     fn contents(&mut self) -> &mut [u8] {
-//         self.deref_mut()
-//     }
-// }
-
-// impl Database {
-//     pub fn new(database_dir: &str, use_mem_cache: bool) -> Result<Database, Error> {
-//         match fs::metadata(database_dir) {
-//             Ok(ref metadata) if metadata.is_dir() => (),
-//             Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
-//             Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-//                 try!(fs::create_dir(database_dir).map_err(|e| Error::DatabaseMkdir(e))),
-//             Err(e) => return Err(Error::DatabaseStat(e)),
-//         }
-
-//         let (filename_idx, mut fd_idx) = try!(open_rw(database_dir, "spiderq.idx"));
-//         let (filename_db, mut fd_db) = try!(open_rw(database_dir, "spiderq.db"));
-//         let cache_idx = if use_mem_cache {
-//             let mut cache = Vec::with_capacity(try!(file_size(&fd_idx, &filename_idx)) as usize);
-//             try!(fd_idx.read_to_end(&mut cache).map_err(|e| Error::Read(filename_as_string(&filename_idx), e)));
-//             Some(cache)
-//         } else {
-//             None
-//         };
-//         let cache_db = if use_mem_cache {
-//             let mut cache = Vec::with_capacity(try!(file_size(&fd_db, &filename_db)) as usize);
-//             try!(fd_db.read_to_end(&mut cache).map_err(|e| Error::Read(filename_as_string(&filename_db), e)));
-//             Some(cache)
-//         } else {
-//             None
-//         };
-
-//         Ok(Database {
-//             filename_idx: filename_idx,
-//             filename_db: filename_db,
-//             fd_idx: fd_idx,
-//             fd_db: fd_db,
-//             cache_idx: cache_idx,
-//             cache_db: cache_db,
-//         })
-//     }
-
-//     pub fn count(&self) -> Result<usize, Error> {
-//         Ok(if let Some(ref cache) = self.cache_idx {
-//             cache.len()
-//         } else {
-//             try!(file_size(&self.fd_idx, &self.filename_idx)) as usize
-//         } / mem::size_of::<u64>())
-//     }
-
-//     pub fn add(&mut self, data: &[u8]) -> Result<u32, Error> {
-//         let last_offset = try!(file_size(&self.fd_db, &self.filename_db));
-//         try!(self.fd_idx.seek(SeekFrom::End(0)).map_err(|e| Error::Seek(filename_as_string(&self.filename_idx), e)));
-//         try!(self.fd_idx.write_u64::<NativeEndian>(last_offset)
-//              .map_err(|e| Error::Write(filename_as_string(&self.filename_idx), From::from(e))));
-        
-//         try!(self.fd_db.seek(SeekFrom::End(0)).map_err(|e| Error::Seek(filename_as_string(&self.filename_db), e)));
-//         try!(self.fd_db.write_u32::<NativeEndian>(data.len() as u32)
-//              .map_err(|e| Error::Write(filename_as_string(&self.filename_db), From::from(e))));
-//         try!(self.fd_db.write(data).map_err(|e| Error::Write(filename_as_string(&self.filename_db), e)));
-
-//         if let (Some(cache_idx), Some(cache_db)) = (self.cache_idx.as_mut(), self.cache_db.as_mut()) {
-//             let last_offset = cache_db.len() as u64;
-//             cache_idx.write_u64::<NativeEndian>(last_offset).unwrap();
-//             cache_db.write_u32::<NativeEndian>(data.len() as u32).unwrap();
-//             cache_db.write(data).unwrap();
-//         }
-
-//         Ok(try!(self.count()) as u32 - 1)
-//     }
-
-//     pub fn load<'a, 'b, E, L>(&'a mut self, index: u32, loader: &'b mut L) -> Result<(), LoadError<E>> where L: Loader<Error = E> {
-//         let total = try!(self.count()) as u32;
-//         if index >= total {
-//             return Err(LoadError::Db(Error::IndexIsTooBig { given: index, total: total, }))
-//         }
-
-//         if let (Some(cache_idx), Some(cache_db)) = (self.cache_idx.as_ref(), self.cache_db.as_ref()) {
-//             let offset = (&cache_idx[(index as usize * mem::size_of::<u64>()) ..]).read_u64::<NativeEndian>().unwrap() as usize;
-//             let data_len = (&cache_db[offset ..]).read_u32::<NativeEndian>().unwrap() as usize;
-//             try!(loader.set_len(data_len).map_err(|e| LoadError::Load(e)));
-//             let mut target = loader.contents();
-//             let start = offset + mem::size_of::<u32>();
-//             let end = start + data_len;
-//             bytes::copy_memory(&cache_db[start .. end], target);
-//         } else {
-//             try!(self.fd_idx.seek(SeekFrom::Start((index as usize * mem::size_of::<u64>()) as u64))
-//                  .map_err(|e| Error::Seek(filename_as_string(&self.filename_idx), e)));
-//             let offset = try!(self.fd_idx.read_u64::<NativeEndian>()
-//                               .map_err(|e| Error::Read(filename_as_string(&self.filename_idx), From::from(e))));
-//             try!(self.fd_db.seek(SeekFrom::Start(offset))
-//                  .map_err(|e| Error::Seek(filename_as_string(&self.filename_db), e)));
-//             let data_len = try!(self.fd_db.read_u32::<NativeEndian>()
-//                                 .map_err(|e| Error::Read(filename_as_string(&self.filename_db), From::from(e)))) as usize;
-//             try!(loader.set_len(data_len).map_err(|e| LoadError::Load(e)));
-
-//             {
-//                 let mut target = loader.contents();
-//                 while !target.is_empty() {
-//                     match self.fd_db.read(target) {
-//                         Ok(0) if target.is_empty() => break,
-//                         Ok(0) => return Err(LoadError::Db(Error::EofReadingData { index: index, len: data_len, read: data_len - target.len(), })),
-//                         Ok(n) => { let tmp = target; target = &mut tmp[n ..]; },
-//                         Err(ref e) if e.kind() == io::ErrorKind::Interrupted => { },
-//                         Err(e) => return Err(LoadError::Db(Error::Read(filename_as_string(&self.filename_db), e))),
-//                     }
-//                 }
-//             }
-//         }
-
-//         Ok(())
-//     }
-// }
-
-// #[cfg(test)]
-// mod test {
-//     use std::fs;
-//     use super::{Database, Error, LoadError};
-
-//     fn mkdb(path: &str, use_mem_cache: bool) -> Database {
-//         let _ = fs::remove_dir_all(path);
-//         Database::new(path, use_mem_cache).unwrap()
-//     }
-
-//     #[test]
-//     fn make() {
-//         let db = mkdb("/tmp/spiderq_a", false);
-//         assert_eq!(db.count().unwrap(), 0);
-//     }
+    #[test]
+    fn make() {
+        let db = mkdb("/tmp/spiderq_a", 10);
+        assert_eq!(db.count(), 0);
+    }
 
 //     #[test]
 //     fn reopen() {
@@ -387,5 +356,5 @@ fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
 //     fn open_database_check_cache() {
 //         open_database_check_db(mkfill("/tmp/spiderq_f", true));
 //     }
-// }
+}
 
