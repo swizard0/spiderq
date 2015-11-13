@@ -1,14 +1,15 @@
-#![feature(vec_resize, slice_bytes)]
+#![feature(drain, slice_bytes)]
 
 extern crate zmq;
 extern crate time;
 extern crate getopts;
+extern crate tempdir;
 extern crate byteorder;
 
 use std::{io, env, process};
 use std::io::Write;
 // use std::ops::Deref;
-use std::convert::From;
+// use std::convert::From;
 use std::thread::spawn;
 use std::sync::mpsc::{channel, Sender, Receiver};
 // use std::collections::VecDeque;
@@ -23,7 +24,7 @@ use proto::{GlobalReq, LocalReq, GlobalRep, LocalRep};
 #[derive(Debug)]
 pub enum Error {
     Getopts(getopts::Fail),
-    Db(db::Error),
+    // Db(db::Error),
     Zmq(ZmqError),
     EmptyFramesTransmit,
 }
@@ -40,37 +41,41 @@ pub enum ZmqError {
     GetSockOpt(zmq::Error),
 }
 
-impl From<db::Error> for Error {
-    fn from(err: db::Error) -> Error {
-        Error::Db(err)
-    }
-}
+// impl From<db::Error> for Error {
+//     fn from(err: db::Error) -> Error {
+//         Error::Db(err)
+//     }
+// }
 
 struct Frames(Vec<zmq::Message>);
 
+#[allow(dead_code)]
 enum Req {
     Global(GlobalReq),
     Local(LocalReq),
 }
 
+#[allow(dead_code)]
 enum Rep {
     Global(GlobalRep),
     Local(LocalRep),
 }
 
+#[allow(dead_code)]
 struct Message<T> {
     header: Frames,
     load: T,
 }
 
+#[allow(unused_variables)]
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
     let use_mem_cache = matches.opt_present("memory-cache");
 
-    let db = try!(db::Database::new(&database_dir, use_mem_cache).map_err(|e| Error::Db(e)));
-    let pq = pq::PQueue::new(try!(db.count()));
+    // let db = try!(db::Database::new(&database_dir, use_mem_cache).map_err(|e| Error::Db(e)));
+    let pq = pq::PQueue::new();
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -89,7 +94,7 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let (chan_master_pq_tx, chan_pq_master_rx) = channel();
     let (chan_pq_master_tx, chan_master_pq_rx) = channel();
 
-    spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap());
+    spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx /*, db */).unwrap());
     spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap());
 //     master(sock_master_ext,
 //            sock_master_db_rx,
@@ -160,10 +165,11 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
 //     frames.send(sock, try!(encode_into_msg!(rep)))
 // }
 
+#[allow(unused_variables, unused_mut)]
 fn worker_db(mut sock_tx: zmq::Socket, 
              chan_tx: Sender<Message<Req>>,
-             chan_rx: Receiver<Message<Rep>>,
-             mut db: db::Database) -> Result<(), Error> 
+             chan_rx: Receiver<Message<Rep>> /*,
+             mut db: db::Database */) -> Result<(), Error> 
 {
 //     loop {
 //         enum Decision<'a> {
@@ -230,6 +236,7 @@ fn worker_db(mut sock_tx: zmq::Socket,
     Ok(())
 }
 
+#[allow(unused_variables, unused_mut)]
 fn worker_pq(mut sock_tx: zmq::Socket, 
              chan_tx: Sender<Message<Req>>,
              chan_rx: Receiver<Message<Rep>>,

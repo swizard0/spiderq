@@ -7,4 +7,5 @@ authors = ["Alexey Voznyuk <me@swizard.info>"]
 getopts = "*"
 byteorder = "*"
 time = "*"
+tempdir = "*"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
