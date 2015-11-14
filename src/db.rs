@@ -264,24 +264,13 @@ fn filename_as_string(filename: &PathBuf) -> String {
     filename.to_string_lossy().into_owned()
 }
 
-fn read_vec<R>(source: &mut R) -> Result<Option<Vec<u8>>, Error> where R: io::Read {
-    let mut buffer = Vec::with_capacity(4);
-    let len = {
-        let source_ref = source.by_ref();
-        match source_ref.take(4).read_to_end(&mut buffer) {
-            Ok(0) => return Ok(None),
-            Ok(4) => NativeEndian::read_u32(&buffer[..]),
-            Ok(_) => return Err(Error::DatabaseUnexpectedEof),
-            Err(e) => return Err(Error::DatabaseRead(e)),
-        }
-    };
-
-    buffer.clear();
-    buffer.reserve(len as usize);
+fn read_vec<R>(source: &mut R) -> Result<Vec<u8>, Error> where R: io::Read {
+    let len = try!(source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))) as usize;
+    let mut buffer = Vec::with_capacity(len);
     let source_ref = source.by_ref();
     match source_ref.take(len as u64).read_to_end(&mut buffer) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(buffer)),
+        Ok(bytes_read) if bytes_read == len => Ok(buffer),
+        Ok(_) => Err(Error::DatabaseUnexpectedEof),
         Err(e) => Err(Error::DatabaseRead(e)),
     }
 }
@@ -293,14 +282,12 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
 
     match fs::File::open(&db_file) {
         Ok(file) => {
-            let mut index = Index::new();
             let mut source = io::BufReader::new(file);
-            while let Some(key) = try!(read_vec(&mut source)) {
-                if let Some(value) = try!(read_vec(&mut source)) {
-                    index.insert(Arc::new(key), Arc::new(value));
-                } else {
-                    return Err(Error::DatabaseUnexpectedEof)
-                }
+            let total = try!(source.read_u64::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))) as usize;
+            let mut index = Index::with_capacity(total);
+            for _ in 0 .. total {
+                let (key, value) = (try!(read_vec(&mut source)), try!(read_vec(&mut source)));
+                index.insert(Arc::new(key), Arc::new(value));
             }
             Ok(Some(index))
         },
@@ -327,6 +314,7 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
     {
         let mut file = io::BufWriter::new(
             try!(fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))));
+        try!(file.write_u64::<NativeEndian>(index.len() as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
         for (key, value) in &*index {
             try!(write_vec(key, &mut file));
             try!(write_vec(value, &mut file));
@@ -341,17 +329,18 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
 }
 
 fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
-    let mut iter = indices.iter();
-    let mut base_index = (**(iter.next().unwrap())).clone();
-    for index in iter {
-        for (key, value) in &**index {
-            if !base_index.contains_key(key) {
-                base_index.insert(key.clone(), value.clone());
+    let mut base_index: Option<Index> = None;
+    for index in indices.iter().rev() {
+        if let Some(ref mut base) = base_index {
+            for (key, value) in &**index {
+                base.insert(key.clone(), value.clone());
             }
+        } else {
+            base_index = Some((**index).clone());
         }
     }
     
-    base_index
+    base_index.take().unwrap()
 }
 
 #[cfg(test)]
