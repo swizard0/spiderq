@@ -114,6 +114,7 @@ impl Database {
         } else {
             panic!("unexpected snapshots layout");
         }
+
         self.update_snapshots(false);
     }
 
@@ -150,12 +151,13 @@ impl Database {
             }
 
             // Check if several snapshots should be merged
-            enum MergeLayout { FirstMemory, SomeFrozen, LastPersisted, }
+            enum MergeLayout { FirstMemory, AtLeastOneFrozen, MaybeMoreFrozen, LastPersisted, }
             let merge_decision = 
                 self.snapshots.iter().fold(Some(MergeLayout::FirstMemory), |state, snapshot| match (state, snapshot) {
-                    (Some(MergeLayout::FirstMemory), &Snapshot::Memory(..)) => Some(MergeLayout::SomeFrozen),
-                    (Some(MergeLayout::SomeFrozen), &Snapshot::Frozen(..)) => Some(MergeLayout::SomeFrozen),
-                    (Some(MergeLayout::SomeFrozen), &Snapshot::Persisted(..)) => Some(MergeLayout::LastPersisted),
+                    (Some(MergeLayout::FirstMemory), &Snapshot::Memory(..)) => Some(MergeLayout::AtLeastOneFrozen),
+                    (Some(MergeLayout::AtLeastOneFrozen), &Snapshot::Frozen(..)) => Some(MergeLayout::MaybeMoreFrozen),
+                    (Some(MergeLayout::MaybeMoreFrozen), &Snapshot::Frozen(..)) => Some(MergeLayout::MaybeMoreFrozen),
+                    (Some(MergeLayout::MaybeMoreFrozen), &Snapshot::Persisted(..)) => Some(MergeLayout::LastPersisted),
                     _ => None,
                 });
             if let Some(MergeLayout::LastPersisted) = merge_decision {
@@ -347,7 +349,7 @@ mod test {
     use std::sync::Arc;
     use std::collections::HashMap;
     use rand::{thread_rng, sample, Rng};
-    use super::{Database, Error};
+    use super::{Database};
     use super::super::proto::{Key, Value};
     
     fn mkdb(path: &str, flush_limit: usize) -> Database {
@@ -359,8 +361,8 @@ mod test {
         let mut rng = thread_rng();
         let key_len = rng.gen_range(1, 64);
         let value_len = rng.gen_range(1, 64);
-        (Arc::new(sample(&mut rng, 0 .. 256, key_len)),
-         Arc::new(sample(&mut rng, 0 .. 256, value_len)))
+        (Arc::new(sample(&mut rng, 0 .. 255, key_len)),
+         Arc::new(sample(&mut rng, 0 .. 255, value_len)))
     }
 
     fn rnd_fill_check(db: &mut Database, check_table: &mut HashMap<Key, Value>, count: usize) {
