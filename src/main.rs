@@ -5,6 +5,7 @@ extern crate time;
 extern crate getopts;
 extern crate tempdir;
 extern crate byteorder;
+#[cfg(test)] extern crate rand;
 
 use std::{io, env, process};
 use std::io::Write;

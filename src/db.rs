@@ -344,17 +344,50 @@ fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
 #[cfg(test)]
 mod test {
     use std::fs;
+    use std::sync::Arc;
+    use std::collections::HashMap;
+    use rand::{thread_rng, sample, Rng};
     use super::{Database, Error};
+    use super::super::proto::{Key, Value};
     
     fn mkdb(path: &str, flush_limit: usize) -> Database {
         let _ = fs::remove_dir_all(path);
         Database::new(path, flush_limit).unwrap()
     }
 
+    fn rnd_kv() -> (Key, Value) {
+        let mut rng = thread_rng();
+        let key_len = rng.gen_range(1, 64);
+        let value_len = rng.gen_range(1, 64);
+        (Arc::new(sample(&mut rng, 0 .. 256, key_len)),
+         Arc::new(sample(&mut rng, 0 .. 256, value_len)))
+    }
+
+    fn rnd_fill_check(db: &mut Database, check_table: &mut HashMap<Key, Value>, count: usize) {
+        for _ in 0 .. count {
+            let (k, v) = rnd_kv();
+            check_table.insert(k.clone(), v.clone());
+            db.insert(k.clone(), v.clone());
+        }
+        assert_eq!(db.count(), check_table.len());
+
+        for (k, v) in &*check_table {
+            assert_eq!(db.lookup(k), Some(v));
+        }
+    }
+
     #[test]
     fn make() {
         let db = mkdb("/tmp/spiderq_a", 10);
         assert_eq!(db.count(), 0);
+    }
+
+    #[test]
+    fn insert_lookup() {
+        let mut db = mkdb("/tmp/spiderq_b", 16);
+        assert_eq!(db.count(), 0);
+        let mut check_table = HashMap::new();
+        rnd_fill_check(&mut db, &mut check_table, 10);
     }
 
 //     #[test]
