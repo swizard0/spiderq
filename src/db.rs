@@ -265,9 +265,20 @@ fn filename_as_string(filename: &PathBuf) -> String {
 }
 
 fn read_vec<R>(source: &mut R) -> Result<Option<Vec<u8>>, Error> where R: io::Read {
-    let len = try!(source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e))));
+    let mut buffer = Vec::with_capacity(4);
+    let len = {
+        let source_ref = source.by_ref();
+        match source_ref.take(4).read_to_end(&mut buffer) {
+            Ok(0) => return Ok(None),
+            Ok(4) => NativeEndian::read_u32(&buffer[..]),
+            Ok(_) => return Err(Error::DatabaseUnexpectedEof),
+            Err(e) => return Err(Error::DatabaseRead(e)),
+        }
+    };
+
+    buffer.clear();
+    buffer.reserve(len as usize);
     let source_ref = source.by_ref();
-    let mut buffer = Vec::with_capacity(len as usize);
     match source_ref.take(len as u64).read_to_end(&mut buffer) {
         Ok(0) => Ok(None),
         Ok(_) => Ok(Some(buffer)),
@@ -371,9 +382,12 @@ mod test {
             check_table.insert(k.clone(), v.clone());
             db.insert(k.clone(), v.clone());
         }
-        assert_eq!(db.count(), check_table.len());
+        check_against(db, check_table);
+    }
 
-        for (k, v) in &*check_table {
+    fn check_against(db: &Database, check_table: &HashMap<Key, Value>) {
+        assert_eq!(db.count(), check_table.len());
+        for (k, v) in check_table {
             assert_eq!(db.lookup(k), Some(v));
         }
     }
@@ -392,64 +406,19 @@ mod test {
         rnd_fill_check(&mut db, &mut check_table, 10);
     }
 
-//     #[test]
-//     fn reopen() {
-//         {
-//             let db = mkdb("/tmp/spiderq_b", false);
-//             assert_eq!(db.count().unwrap(), 0);
-//         }
-//         {
-//             let db = Database::new("/tmp/spiderq_b", false).unwrap();
-//             assert_eq!(db.count().unwrap(), 0);
-//         }
-//     }
-
-//     #[test]
-//     fn open_database_fail() {
-//         match Database::new("/qwe", false) {
-//             Ok(..) => panic!("expected fail"),
-//             Err(..) => (),
-//         }
-//     }
-
-//     fn mkfill(path: &str, use_mem_cache: bool) -> Database {
-//         let mut db = mkdb(path, use_mem_cache);
-//         assert_eq!(db.add(&[1, 2, 3]).unwrap(), 0);
-//         assert_eq!(db.add(&[4, 5, 6, 7]).unwrap(), 1);
-//         assert_eq!(db.add(&[8, 9]).unwrap(), 2);
-//         assert_eq!(db.count().unwrap(), 3);
-//         db
-//     }
-
-//     #[test]
-//     fn open_database_fill() {
-//         let _ = mkfill("/tmp/spiderq_c", false);
-//     }
-
-//     #[test]
-//     fn open_database_fill_cache() {
-//         let _ = mkfill("/tmp/spiderq_d", true);
-//     }
-
-//     fn open_database_check_db(mut db: Database) {
-//         let mut data = Vec::new();
-//         db.load(0, &mut data).unwrap(); assert_eq!(&data, &[1, 2, 3]);
-//         db.load(1, &mut data).unwrap(); assert_eq!(&data, &[4, 5, 6, 7]);
-//         db.load(2, &mut data).unwrap(); assert_eq!(&data, &[8, 9]);
-//         match db.load(3, &mut data) {
-//             Err(LoadError::Db(Error::IndexIsTooBig { given: 3, total: 3, })) => (),
-//             other => panic!("unexpected Database::load return value: {:?}", other),
-//         }
-//     }
-
-//     #[test]
-//     fn open_database_check() {
-//         open_database_check_db(mkfill("/tmp/spiderq_e", false));
-//     }
-
-//     #[test]
-//     fn open_database_check_cache() {
-//         open_database_check_db(mkfill("/tmp/spiderq_f", true));
-//     }
+    #[test]
+    fn save_load() {
+        let mut check_table = HashMap::new();
+        {
+            let mut db = mkdb("/tmp/spiderq_c", 16);
+            assert_eq!(db.count(), 0);
+            rnd_fill_check(&mut db, &mut check_table, 10);
+        }
+        {
+            let db = Database::new("/tmp/spiderq_c", 16).unwrap();
+            assert_eq!(db.count(), 10);
+            check_against(&db, &check_table);
+        }
+    }
 }
 
