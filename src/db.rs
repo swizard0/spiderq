@@ -94,7 +94,7 @@ impl Database {
         })
     }
 
-    pub fn count(&self) -> usize {
+    pub fn approx_count(&self) -> usize {
         self.snapshots.iter().fold(0, |total, snapshot| total + snapshot.count())
     }
 
@@ -239,7 +239,7 @@ impl Database {
 
                 if let Some(merged_index) = done_index {
                     if let Snapshot::Merging { slave: thread, .. } =
-                        mem::replace(merging_snapshot, Snapshot::Persisted(Arc::new(merged_index))) {
+                        mem::replace(merging_snapshot, Snapshot::Frozen(Arc::new(merged_index))) {
                             thread.join().unwrap();
                         } else {
                             unreachable!()
@@ -386,7 +386,10 @@ mod test {
     }
 
     fn check_against(db: &Database, check_table: &HashMap<Key, Value>) {
-        assert_eq!(db.count(), check_table.len());
+        if db.approx_count() < check_table.len() {
+            panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
+        }
+
         for (k, v) in check_table {
             assert_eq!(db.lookup(k), Some(v));
         }
@@ -395,13 +398,13 @@ mod test {
     #[test]
     fn make() {
         let db = mkdb("/tmp/spiderq_a", 10);
-        assert_eq!(db.count(), 0);
+        assert_eq!(db.approx_count(), 0);
     }
 
     #[test]
     fn insert_lookup() {
         let mut db = mkdb("/tmp/spiderq_b", 16);
-        assert_eq!(db.count(), 0);
+        assert_eq!(db.approx_count(), 0);
         let mut check_table = HashMap::new();
         rnd_fill_check(&mut db, &mut check_table, 10);
     }
@@ -411,12 +414,26 @@ mod test {
         let mut check_table = HashMap::new();
         {
             let mut db = mkdb("/tmp/spiderq_c", 16);
-            assert_eq!(db.count(), 0);
+            assert_eq!(db.approx_count(), 0);
             rnd_fill_check(&mut db, &mut check_table, 10);
         }
         {
             let db = Database::new("/tmp/spiderq_c", 16).unwrap();
-            assert_eq!(db.count(), 10);
+            assert_eq!(db.approx_count(), 10);
+            check_against(&db, &check_table);
+        }
+    }
+
+    #[test]
+    fn stress() {
+        let mut check_table = HashMap::new();
+        {
+            let mut db = mkdb("/tmp/spiderq_d", 160);
+            rnd_fill_check(&mut db, &mut check_table, 2560);
+        }
+        {
+            let db = Database::new("/tmp/spiderq_d", 160).unwrap();
+            assert!(db.approx_count() <= 2560);
             check_against(&db, &check_table);
         }
     }
