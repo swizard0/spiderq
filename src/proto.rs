@@ -29,7 +29,10 @@ pub enum GlobalReq {
 pub enum LocalReq {
     NextTrigger,
     Enqueue(Key),
+    LendUntil(u64, SteadyTime),
     LoadLent(Key),
+    RepayUpdate(Key, Value),
+    RepayQueue(Key, RepayStatus),
     Stop,
 }
 
@@ -50,6 +53,7 @@ pub enum LocalRep {
     Added(Key),
     Kept,
     Lent(Key),
+    EmptyQueueHit { timeout: u64, },
     Stopped,
 }
 
@@ -85,6 +89,9 @@ pub enum ProtoError {
     NotEnoughDataForProtoErrorRequired { required: usize, given: usize, },
     NotEnoughDataForProtoErrorGiven { required: usize, given: usize, },
     NotEnoughDataForProtoErrorInvalidTag { required: usize, given: usize, },
+    DbQueueOutOfSync(Key),
+    NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen { required: usize, given: usize, },
+    NotEnoughDataForProtoErrorDbQueueOutOfSyncKey { required: usize, given: usize, },
 }
 
 macro_rules! try_get {
@@ -367,6 +374,13 @@ impl ProtoError {
             (28, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorRequired),
             (29, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorGiven),
             (30, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorInvalidTag),
+            (31, buf) => {
+                let (key, buf) =
+                    try_get_vec!(buf, NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen, NotEnoughDataForProtoErrorDbQueueOutOfSyncKey);
+                Ok((ProtoError::DbQueueOutOfSync(key), buf))
+            },
+            (32, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen),
+            (33, buf) => decode_not_enough!(buf, NotEnoughDataForProtoErrorDbQueueOutOfSyncKey),
             (tag, _) => return Err(ProtoError::InvalidProtoErrorTag(tag)),
         }
     }
@@ -398,13 +412,17 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForProtoErrorTag { .. } |
             &ProtoError::NotEnoughDataForProtoErrorRequired { .. } |
             &ProtoError::NotEnoughDataForProtoErrorGiven { .. } |
-            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { .. } =>
+            &ProtoError::NotEnoughDataForProtoErrorInvalidTag { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen { .. } |
+            &ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKey { .. } =>
                 size_of::<u32>() + size_of::<u32>(),
             &ProtoError::InvalidGlobalRepTag(..) |
             &ProtoError::InvalidGlobalReqTag(..) |
             &ProtoError::InvalidGlobalReqRepayRepayStatusTag(..) |
             &ProtoError::InvalidProtoErrorTag(..) =>
                 size_of::<u8>(),
+            &ProtoError::DbQueueOutOfSync(ref key) => size_of::<u32>() + key.len(),
+
         }
     }
 
@@ -440,6 +458,13 @@ impl ProtoError {
             &ProtoError::NotEnoughDataForProtoErrorRequired { required: r, given: g, } => encode_not_enough!(area, 28, r, g),
             &ProtoError::NotEnoughDataForProtoErrorGiven { required: r, given: g, } => encode_not_enough!(area, 29, r, g),
             &ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: r, given: g, } => encode_not_enough!(area, 30, r, g),
+            &ProtoError::DbQueueOutOfSync(ref key) => {
+                let area = put_adv!(area, u8, write_u8, 31);
+                let area = put_vec_adv!(area, key);
+                area
+            },
+            &ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen { required: r, given: g, } => encode_not_enough!(area, 32, r, g),
+            &ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKey { required: r, given: g, } => encode_not_enough!(area, 33, r, g),
         }
     }
 }
