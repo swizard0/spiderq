@@ -263,10 +263,10 @@ pub fn master(mut sock_ext: zmq::Socket,
 {
     enum StopState {
         NotTriggered,
-        WaitingPqAndDb(Headers),
-        WaitingPq(Headers),
-        WaitingDb(Headers),
-        Finished(Headers),
+        WaitingPqAndDb(Option<Headers>),
+        WaitingPq(Option<Headers>),
+        WaitingDb(Option<Headers>),
+        Finished(Option<Headers>),
     }
 
     let mut stats_count = 0;
@@ -282,7 +282,7 @@ pub fn master(mut sock_ext: zmq::Socket,
         // check if it is time to quit
         match stop_state {
             StopState::Finished(headers) => {
-                try!(tx_sock(GlobalRep::Terminated, Some(headers), &mut sock_ext));
+                try!(tx_sock(GlobalRep::Terminated, headers, &mut sock_ext));
                 return Ok(())
             },
             _ => (),
@@ -402,219 +402,41 @@ pub fn master(mut sock_ext: zmq::Socket,
         }
 
         // process incoming messages
-        for (headers, req) in incoming_queue.drain(..) {
+        for (headers, global_req) in incoming_queue.drain(..) {
+            match global_req {
+                req @ GlobalReq::Count =>
+                    tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
+                req @ GlobalReq::Add(..) =>
+                    tx_chan(DbReq::Global(req), headers, &chan_db_tx),
+                GlobalReq::Lend { timeout: t, } => {
+                    let trigger_at = current_time + Duration::milliseconds(t as i64);
+                    tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at)), headers, &chan_pq_tx);
+                },
+                GlobalReq::Repay(key, value, status) => {
+                    tx_chan(PqReq::Local(PqLocalReq::RepayQueue(key.clone(), status)), None, &chan_pq_tx);
+                    tx_chan(DbReq::Local(DbLocalReq::RepayUpdate(key, value)), None, &chan_db_tx);
+                    stats_repay += 1;
+                    try!(tx_sock(GlobalRep::Repaid, headers, &mut sock_ext));
+                },
+                GlobalReq::Stats => {
+                    stats_stats += 1;
+                    try!(tx_sock(GlobalRep::StatsGot { count: stats_count,
+                                                       add: stats_add,
+                                                       lend: stats_lend,
+                                                       repay: stats_repay,
+                                                       stats: stats_stats, }, headers, &mut sock_ext));
+                },
+                GlobalReq::Terminate => {
+                    tx_chan(PqReq::Local(PqLocalReq::Stop), None, &chan_pq_tx);
+                    tx_chan(DbReq::Local(DbLocalReq::Stop), None, &chan_db_tx);
+                    stop_state = StopState::WaitingPqAndDb(headers);
+                },
+            }
         }
 
         mem::swap(&mut incoming_queue, &mut pending_queue);
     }
 }
-
-
-// pub fn master(sock_ext: &mut zmq::Socket,
-//               sock_db_tx: &mut zmq::Socket,
-//               sock_db_rx: &mut zmq::Socket,
-//               sock_pq_tx: &mut zmq::Socket,
-//               sock_pq_rx: &mut zmq::Socket) -> Result<(), Error> {
-//     enum StopState {
-//         NotTriggered,
-//         WaitingPqAndDb(Frames),
-//         WaitingPq(Frames),
-//         WaitingDb(Frames),
-//         Finished(Frames),
-//     }
-
-//     let mut stats_count = 0;
-//     let mut stats_add = 0;
-//     let mut stats_lend = 0;
-//     let mut stats_repay = 0;
-//     let mut stats_stats = 0;
-
-//     let mut stop_state = StopState::NotTriggered;
-//     loop {
-//         match stop_state {
-//             StopState::Finished(frames) => {
-//                 try!(proto_reply(sock_ext, frames, Rep::Local(LocalRep::Stopped)));
-//                 return Ok(())
-//             },
-//             _ => (),
-//         }
-
-//         let avail_socks = {
-//             let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
-//                                  sock_db_rx.as_poll_item(zmq::POLLIN),
-//                                  sock_pq_rx.as_poll_item(zmq::POLLIN)];
-//             if try!(zmq::poll(&mut pollitems, -1).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
-//                 continue
-//             }
-
-//             [pollitems[0].get_revents() == zmq::POLLIN,
-//              pollitems[1].get_revents() == zmq::POLLIN,
-//              pollitems[2].get_revents() == zmq::POLLIN]
-//         };
-
-//         if avail_socks[0] {
-//             // sock_ext is online        
-//             enum Decision<'a> {
-//                 TransmitPq,
-//                 TransmitDb,
-//                 BroadcastStop,
-//                 JustReply(Rep<'a>),
-//             }
-
-//             let req_frames = try!(Frames::recv(sock_ext));
-//             let decision = match Req::decode(&req_frames) {
-//                 Ok(Req::Global(GlobalReq::Count)) =>
-//                     Decision::TransmitPq,
-//                 Ok(Req::Global(GlobalReq::Add(..))) =>
-//                     Decision::TransmitDb,
-//                 Ok(Req::Global(GlobalReq::Lend { .. })) =>
-//                     Decision::TransmitPq,
-//                 Ok(Req::Global(GlobalReq::Repay(..))) =>
-//                     Decision::TransmitPq,
-//                 Ok(Req::Local(LocalReq::Stop)) =>
-//                     Decision::BroadcastStop,
-//                 Ok(Req::Global(GlobalReq::Stats)) => {
-//                     stats_stats += 1;
-//                     Decision::JustReply(Rep::GlobalOk(GlobalRep::StatsGot {
-//                         count: stats_count,
-//                         add: stats_add,
-//                         lend: stats_lend,
-//                         repay: stats_repay,
-//                         stats: stats_stats,
-//                     }))
-//                 },
-//                 Ok(..) =>
-//                     Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedMasterRequest)),
-//                 Err(proto_err) =>
-//                     Decision::JustReply(Rep::GlobalErr(proto_err)),
-//             };
-
-//             match decision {
-//                 Decision::TransmitPq =>
-//                     try!(req_frames.transmit(sock_pq_tx)),
-//                 Decision::TransmitDb =>
-//                     try!(req_frames.transmit(sock_db_tx)),
-//                 Decision::BroadcastStop => {
-//                     try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-//                     try!(sock_db_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::Stop))), 0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-//                     stop_state = StopState::WaitingPqAndDb(req_frames);
-//                 },
-//                 Decision::JustReply(rep) =>
-//                     try!(proto_reply(sock_ext, req_frames, rep)),
-//             }
-//         }
-
-//         if avail_socks[1] {
-//             // sock_db is online
-//             enum Decision {
-//                 PassPqAddAndReply(u32),
-//                 DoNothing,
-//                 TransmitExt,
-//             }
-
-//             let frames = try!(Frames::recv(sock_db_rx));
-//             let decision = match Rep::decode(&frames) {
-//                 Ok(Rep::Local(LocalRep::Added(id))) =>
-//                     Decision::PassPqAddAndReply(id),
-//                 Ok(Rep::Local(LocalRep::Stopped)) => {
-//                     stop_state = match stop_state {
-//                         StopState::NotTriggered | StopState::WaitingPq(..) | StopState::Finished(..) => unreachable!(),
-//                         StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingPq(stop_frames),
-//                         StopState::WaitingDb(stop_frames) => StopState::Finished(stop_frames),
-//                     };
-//                     Decision::DoNothing
-//                 },
-//                 Ok(Rep::GlobalOk(GlobalRep::Lent(..))) => {
-//                     stats_lend += 1;
-//                     Decision::TransmitExt
-//                 },
-//                 Ok(Rep::GlobalErr(..)) =>
-//                     Decision::TransmitExt,
-//                 Ok(Rep::GlobalOk(GlobalRep::Counted(..))) =>
-//                     panic!("unexpected GlobalRep::Counted reply from worker_db"),
-//                 Ok(Rep::GlobalOk(GlobalRep::Added(..))) =>
-//                     panic!("unexpected GlobalRep::Added reply from worker_db"),
-//                 Ok(Rep::GlobalOk(GlobalRep::Repaid(..))) =>
-//                     panic!("unexpected GlobalRep::Repaid reply from worker_db"),
-//                 Ok(Rep::GlobalOk(GlobalRep::StatsGot { .. })) =>
-//                     panic!("unexpected GlobalRep::StatsGot reply from worker_db"),
-//                 Ok(Rep::Local(LocalRep::Lent(..))) =>
-//                     panic!("unexpected LocalRep::Lend reply from worker_db"),
-//                 Ok(Rep::Local(LocalRep::Panicked(msg))) =>
-//                     panic!("worker_db panic'd with message: {}", msg),
-//                 Err(err) =>
-//                     panic!("failed to decode worker_db reply: {:?}, error: {:?}", frames.deref(), err),
-//             };
-
-//             match decision {
-//                 Decision::PassPqAddAndReply(id) => {
-//                     stats_add += 1;
-//                     try!(sock_pq_tx.send_msg(try!(encode_into_msg!(Req::Local(LocalReq::AddEnqueue(id)))), 0)
-//                          .map_err(|e| Error::Zmq(ZmqError::Send(e))));
-//                     try!(proto_reply(sock_ext, frames, Rep::GlobalOk(GlobalRep::Added(id))));
-//                 },
-//                 Decision::DoNothing =>
-//                     (),
-//                 Decision::TransmitExt =>
-//                     try!(frames.transmit(sock_ext)),
-//             }
-//         }
-
-//         if avail_socks[2] {
-//             // sock_pq is online
-//             enum Decision {
-//                 PassDbLoad(u32),
-//                 DoNothing,
-//                 TransmitExt,
-//             }
-
-//             let frames = try!(Frames::recv(sock_pq_rx));
-//             let decision = match Rep::decode(&frames) {
-//                 Ok(Rep::Local(LocalRep::Lent(id))) =>
-//                     Decision::PassDbLoad(id),
-//                 Ok(Rep::Local(LocalRep::Stopped)) => {
-//                     stop_state = match stop_state {
-//                         StopState::NotTriggered | StopState::WaitingDb(..) | StopState::Finished(..) => unreachable!(),
-//                         StopState::WaitingPqAndDb(stop_frames) => StopState::WaitingDb(stop_frames),
-//                         StopState::WaitingPq(stop_frames) => StopState::Finished(stop_frames),
-//                     };
-//                     Decision::DoNothing
-//                 },
-//                 Ok(Rep::GlobalOk(GlobalRep::Counted(..))) => {
-//                     stats_count += 1;
-//                     Decision::TransmitExt
-//                 },
-//                 Ok(Rep::GlobalOk(GlobalRep::Repaid)) => {
-//                     stats_repay += 1;
-//                     Decision::TransmitExt
-//                 },
-//                 Ok(Rep::GlobalErr(..)) =>
-//                     Decision::TransmitExt,
-//                 Ok(Rep::GlobalOk(GlobalRep::Added(..))) =>
-//                     panic!("unexpected GlobalRep::Added reply from worker_pq"),
-//                 Ok(Rep::GlobalOk(GlobalRep::Lent(..))) =>
-//                     panic!("unexpected GlobalRep::Lent reply from worker_pq"),
-//                 Ok(Rep::GlobalOk(GlobalRep::StatsGot { .. })) =>
-//                     panic!("unexpected GlobalRep::StatsGot reply from worker_pq"),
-//                 Ok(Rep::Local(LocalRep::Added(..))) =>
-//                     panic!("unexpected LocalRep::Added reply from worker_pq"),
-//                 Ok(Rep::Local(LocalRep::Panicked(msg))) =>
-//                     panic!("worker_pq panic'd with message: {}", msg),
-//                 Err(err) =>
-//                     panic!("failed to decode worker_pq reply: {:?}, error: {:?}", frames.deref(), err),
-//             };
-
-//             match decision {
-//                 Decision::PassDbLoad(id) =>
-//                     try!(proto_request(sock_db_tx, frames, Req::Local(LocalReq::Load(id)))),
-//                 Decision::DoNothing =>
-//                     (),
-//                 Decision::TransmitExt =>
-//                     try!(frames.transmit(sock_ext)),
-//             }
-//         }
-//     }
-// }
 
 fn main() {
     let mut args = env::args();
@@ -636,10 +458,8 @@ fn main() {
     }
 }
 
-// #[cfg(test)]
-// mod test {
-//     extern crate zmq;
-
+#[cfg(test)]
+mod test {
 //     use std::fs;
 //     use std::thread::spawn;
 //     use time::SteadyTime;
@@ -862,5 +682,5 @@ fn main() {
 //         worker_pq.join().unwrap();
 //         worker_db.join().unwrap();
 //     }
-// }
+}
 
