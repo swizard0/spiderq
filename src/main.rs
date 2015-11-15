@@ -10,7 +10,7 @@ extern crate byteorder;
 use std::{io, env, mem, process};
 use std::io::Write;
 use std::convert::From;
-use std::thread::spawn;
+use std::thread::{spawn, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::num::ParseIntError;
 use getopts::Options;
@@ -47,13 +47,16 @@ impl From<db::Error> for Error {
     }
 }
 
-fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
+pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHandle<()>), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
     let flush_limit: usize = try!(matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(|e| Error::InvalidFlushLimit(e)));
+    entrypoint(&zmq_addr, &database_dir, flush_limit)
+}
 
-    let db = try!(db::Database::new(&database_dir, flush_limit).map_err(|e| Error::Db(e)));
+pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    let db = try!(db::Database::new(database_dir, flush_limit).map_err(|e| Error::Db(e)));
     let pq = pq::PQueue::new();
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -62,7 +65,7 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let mut sock_db_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     let mut sock_pq_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
 
-    try!(sock_master_ext.bind(&zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(e))));
+    try!(sock_master_ext.bind(zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(e))));
     try!(sock_master_db_rx.bind("inproc://db_rxtx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
     try!(sock_db_master_tx.connect("inproc://db_rxtx").map_err(|e| Error::Zmq(ZmqError::Connect(e))));
     try!(sock_master_pq_rx.bind("inproc://pq_rxtx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
@@ -75,13 +78,15 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
 
     spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap());
     spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap());
-    master(sock_master_ext,
-           sock_master_db_rx,
-           sock_master_pq_rx,
-           chan_master_db_tx,
-           chan_master_db_rx,
-           chan_master_pq_tx,
-           chan_master_pq_rx)
+    let master_thread =
+   	spawn(move || master(sock_master_ext,
+                             sock_master_db_rx,
+                             sock_master_pq_rx,
+                             chan_master_db_tx,
+                             chan_master_db_rx,
+                             chan_master_pq_tx,
+                             chan_master_pq_rx).unwrap());
+    Ok((ctx, master_thread))
 }
 
 #[derive(Debug, PartialEq)]
@@ -146,7 +151,7 @@ pub struct Message<R> {
     pub load: R,
 }
 
-pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq, ProtoError>), Error> {
+fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq, ProtoError>), Error> {
     let mut frames = Vec::new();
     loop {
         frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
@@ -159,7 +164,7 @@ pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<Global
     Ok((Some(frames), GlobalReq::decode(&load_msg).map(|p| p.0)))
 }
 
-pub fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
+fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
     let required = packet.encode_len();
     let mut load_msg = try!(zmq::Message::with_capacity(required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
     packet.encode(&mut load_msg);
@@ -252,13 +257,13 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
     }
 }
 
-pub fn master(mut sock_ext: zmq::Socket,
-              mut sock_db_rx: zmq::Socket,
-              mut sock_pq_rx: zmq::Socket,
-              chan_db_tx: Sender<Message<DbReq>>,
-              chan_db_rx: Receiver<Message<DbRep>>,
-              chan_pq_tx: Sender<Message<PqReq>>,
-              chan_pq_rx: Receiver<Message<PqRep>>) -> Result<(), Error>
+fn master(mut sock_ext: zmq::Socket,
+          mut sock_db_rx: zmq::Socket,
+          mut sock_pq_rx: zmq::Socket,
+          chan_db_tx: Sender<Message<DbReq>>,
+          chan_db_rx: Receiver<Message<DbRep>>,
+          chan_pq_tx: Sender<Message<PqReq>>,
+          chan_pq_rx: Receiver<Message<PqRep>>) -> Result<(), Error>
 {
     enum StopState {
         NotTriggered,
@@ -450,15 +455,16 @@ fn main() {
     opts.optopt("l", "flush-limit", "database disk sync threshold (items modified before flush) (optional, default: 131072)", "");
     opts.optopt("z", "zmq-addr", "zeromq interface listen address (optional, default: ipc://./spiderq.ipc)", "");
 
-    match entrypoint(opts.parse(args)) {
-        Ok(()) => (),
+    match bootstrap(opts.parse(args)) {
+        Ok((_ctx, master_thread)) =>
+            master_thread.join().unwrap(),
         Err(cause) => {
             let _ = writeln!(&mut io::stderr(), "Error: {:?}", cause);
             let usage = format!("Usage: {}", cmd_proc);
             let _ = writeln!(&mut io::stderr(), "{}", opts.usage(&usage[..]));
             process::exit(1);
         }
-    }
+    };
 }
 
 #[cfg(test)]
@@ -467,10 +473,11 @@ mod test {
     use std::sync::Arc;
     use std::fmt::Debug;
     use std::thread::spawn;
+    use time::{SteadyTime, Duration};
     use rand::{thread_rng, sample, Rng};
     use std::sync::mpsc::{channel, Sender, Receiver};
-    use super::proto::{Key, Value, GlobalReq, GlobalRep, ProtoError};
-    use super::{zmq, db, pq, worker_db, worker_pq, tx_chan};
+    use super::proto::{Key, Value, RepayStatus, GlobalReq, GlobalRep, ProtoError};
+    use super::{zmq, db, pq, worker_db, worker_pq, tx_chan, entrypoint};
     use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
     fn with_worker<WF, MF, Req, Rep>(base_addr: &str, worker_fn: WF, master_fn: MF) where
@@ -553,8 +560,74 @@ mod test {
             "pq",
             move |sock_pq_master_tx, chan_tx, chan_rx| worker_pq(sock_pq_master_tx, chan_tx, chan_rx, pq).unwrap(),
             move |mut sock, tx, rx| {
+                let ((key_a, _), (key_b, _)) = (rnd_kv(), rnd_kv());
+                let now = SteadyTime::now();
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(0)));
+                tx_chan(PqReq::Local(PqLocalReq::Enqueue(key_a.clone())), None, &tx);
+                tx_chan(PqReq::Local(PqLocalReq::Enqueue(key_b.clone())), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(1000, now + Duration::milliseconds(1000))),
+                                  PqRep::Local(PqLocalRep::Lent(key_a.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::NextTrigger),
+                                  PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(1000)))));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqRep::Local(PqLocalRep::Lent(key_b.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::NextTrigger),
+                                  PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(500)))));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(250, SteadyTime::now() + Duration::milliseconds(250))),
+                                  PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: 250 }));
+                tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::NextTrigger),
+                                  PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(1000)))));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqRep::Local(PqLocalRep::Lent(key_b.clone())));
+                tx_chan(PqReq::Local(PqLocalReq::RepayQueue(key_a.clone(), RepayStatus::Penalty)), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::NextTrigger),
+                                  PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(500)))));
+                tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(2)));
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqRep::Local(PqLocalRep::Lent(key_b.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::Stop), PqRep::Local(PqLocalRep::Stopped));
             });
+    }
+
+    fn tx_sock(packet: GlobalReq, sock: &mut zmq::Socket) {
+        let required = packet.encode_len();
+        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        packet.encode(&mut msg);
+        sock.send_msg(msg, 0).unwrap();
+    }
+
+    fn rx_sock(sock: &mut zmq::Socket) -> GlobalRep {
+        let msg = sock.recv_msg(0).unwrap();
+        assert!(!sock.get_rcvmore().unwrap());
+        let (rep, _) = GlobalRep::decode(&msg).unwrap();
+        rep
+    }
+
+    #[test]
+    fn server() {
+        let path = "/tmp/spiderq_server";
+        let _ = fs::remove_dir_all(path);
+        let zmq_addr = "inproc://server";
+        let (mut ctx, master_thread) = entrypoint(zmq_addr, path, 16).unwrap();
+        let mut sock_ftd = ctx.socket(zmq::REQ).unwrap();
+        sock_ftd.connect(zmq_addr).unwrap();
+        let sock = &mut sock_ftd;
+
+        tx_sock(GlobalReq::Terminate, sock); assert_eq!(rx_sock(sock), GlobalRep::Terminated);
+        master_thread.join().unwrap();
     }
 }
 
