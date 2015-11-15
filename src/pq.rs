@@ -71,7 +71,7 @@ impl PQueue {
         self.queue.peek().map(|e| e.key.clone())
     }
 
-    pub fn lend(&mut self, trigger_at: SteadyTime) {
+    pub fn lend(&mut self, trigger_at: SteadyTime)  {
         if let Some(entry) = self.queue.pop() {
             self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
             self.lentm.insert(entry.key.clone(), (self.serial, entry));
@@ -96,25 +96,25 @@ impl PQueue {
     
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { key: k, .. }) = self.lentq.pop() {
-            self.repay(k, &RepayStatus::Front)
+            self.repay(k, RepayStatus::Front)
         }
     }
 
-    pub fn repay(&mut self, key: Key, status: &RepayStatus) {
+    pub fn repay(&mut self, key: Key, status: RepayStatus) {
         if let Some((_, mut entry)) = self.lentm.remove(&key) {
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
-                &RepayStatus::Penalty if entry.boost == 0 => 0,
-                &RepayStatus::Penalty => { entry.boost -= 1; entry.boost },
-                &RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
-                &RepayStatus::Reward => { entry.boost += 1; entry.boost },
-                &RepayStatus::Front => 0,
-                &RepayStatus::Drop => return,
+                RepayStatus::Penalty if entry.boost == 0 => 0,
+                RepayStatus::Penalty => { entry.boost -= 1; entry.boost },
+                RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
+                RepayStatus::Reward => { entry.boost += 1; entry.boost },
+                RepayStatus::Front => 0,
+                RepayStatus::Drop => return,
             };
             self.serial += 1;
             entry.priority = match status {
-                &RepayStatus::Front => 0,
+                RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
             };
             self.queue.push(entry)
@@ -152,7 +152,7 @@ mod test {
         pq.lend(time + Duration::seconds(5)); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        pq.repay(as_key(1), &RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/10>
+        pq.repay(as_key(1), RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
@@ -189,7 +189,7 @@ mod test {
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(15)); // | <0/10> <1/15>
         assert_eq!(pq.len(), 0);
-        pq.repay(as_key(1), &RepayStatus::Penalty); // 1 | <0/10>
+        pq.repay(as_key(1), RepayStatus::Penalty); // 1 | <0/10>
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(20)); // | <0/10> <1/20>
         assert_eq!(pq.len(), 0);
