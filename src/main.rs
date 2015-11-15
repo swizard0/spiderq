@@ -9,25 +9,26 @@ extern crate byteorder;
 
 use std::{io, env, process};
 use std::io::Write;
-// use std::ops::Deref;
-// use std::convert::From;
+use std::convert::From;
 use std::thread::spawn;
 use std::sync::mpsc::{channel, Sender, Receiver};
-// use std::collections::VecDeque;
+use std::num::ParseIntError;
+use std::collections::VecDeque;
 use getopts::Options;
-// use time::{SteadyTime, Duration};
+use time::{SteadyTime, Duration};
 
 pub mod db;
 pub mod pq;
 pub mod proto;
-use proto::{GlobalReq, LocalReq, GlobalRep, LocalRep};
+use proto::{ProtoError, GlobalReq, LocalReq, GlobalRep, LocalRep};
 
 #[derive(Debug)]
 pub enum Error {
     Getopts(getopts::Fail),
-    // Db(db::Error),
+    Db(db::Error),
     Zmq(ZmqError),
-    EmptyFramesTransmit,
+    Proto(ProtoError),
+    InvalidFlushLimit(ParseIntError),
 }
 
 #[derive(Debug)]
@@ -42,40 +43,29 @@ pub enum ZmqError {
     GetSockOpt(zmq::Error),
 }
 
-// impl From<db::Error> for Error {
-//     fn from(err: db::Error) -> Error {
-//         Error::Db(err)
-//     }
-// }
+impl From<db::Error> for Error {
+    fn from(err: db::Error) -> Error {
+        Error::Db(err)
+    }
+}
 
-struct Frames(Vec<zmq::Message>);
-
-#[allow(dead_code)]
-enum Req {
+pub enum Req {
     Global(GlobalReq),
     Local(LocalReq),
 }
 
-#[allow(dead_code)]
-enum Rep {
+pub enum Rep {
     Global(GlobalRep),
     Local(LocalRep),
 }
 
-#[allow(dead_code)]
-struct Message<T> {
-    header: Frames,
-    load: T,
-}
-
-#[allow(unused_variables)]
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = try!(maybe_matches.map_err(|e| Error::Getopts(e)));
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
-    let use_mem_cache = matches.opt_present("memory-cache");
+    let flush_limit: usize = try!(matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(|e| Error::InvalidFlushLimit(e)));
 
-    // let db = try!(db::Database::new(&database_dir, use_mem_cache).map_err(|e| Error::Db(e)));
+    let db = try!(db::Database::new(&database_dir, flush_limit).map_err(|e| Error::Db(e)));
     let pq = pq::PQueue::new();
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
@@ -95,154 +85,168 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let (chan_master_pq_tx, chan_pq_master_rx) = channel();
     let (chan_pq_master_tx, chan_master_pq_rx) = channel();
 
-    spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx /*, db */).unwrap());
+    spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap());
     spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap());
-//     master(sock_master_ext,
-//            sock_master_db_rx,
-//            sock_master_pq_rx,
-//            chan_master_db_tx,
-//            chan_master_db_rx,
-//            chan_master_pq_tx,
-//            chan_master_pq_rx)
-    Ok(())
+    master(sock_master_ext,
+           sock_master_db_rx,
+           sock_master_pq_rx,
+           chan_master_db_tx,
+           chan_master_db_rx,
+           chan_master_pq_tx,
+           chan_master_pq_rx)
 }
 
-// impl Frames {
-//     fn recv(sock: &mut zmq::Socket) -> Result<Frames, Error> {
-//         let mut frames = Vec::new();
-//         loop {
-//             frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
-//             if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
-//                 break
-//             }
-//         }
-
-//         Ok(Frames(frames))
-//     }
-
-//     fn send(mut self, sock: &mut zmq::Socket, workload: zmq::Message) -> Result<(), Error> {
-//         self.0.last_mut().map(|m| mem::replace(m, workload));
-//         self.transmit(sock)
-//     }
-
-//     fn transmit(mut self, sock: &mut zmq::Socket) -> Result<(), Error> {
-//         if let Some(workload) = self.0.pop() {
-//             for frame in self.0 {
-//                 try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-//             }
-//             sock.send_msg(workload, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
-//         } else {
-//             Err(Error::EmptyFramesTransmit)
-//         }
-//     }
-// }
-
-// impl Deref for Frames {
-//     type Target = [u8];
-
-//     fn deref<'a>(&'a self) -> &'a [u8] {
-//         &self.0.last().unwrap()
-//     }
-// }
-
-// macro_rules! encode_into_msg {
-//     ($packet:expr) => ({
-//         let packet = $packet;
-//         let bytes_required = packet.encode_len();
-//         zmq::Message::with_capacity(bytes_required)
-//             .map_err(|e| Error::Zmq(ZmqError::Message(e)))
-//             .map(|mut msg| {
-//                 packet.encode(&mut msg);
-//                 msg
-//             })
-//     })
-// }
-
-// fn proto_request(sock: &mut zmq::Socket, frames: Frames, req: Req) -> Result<(), Error> {
-//     frames.send(sock, try!(encode_into_msg!(req)))
-// }
-
-// fn proto_reply(sock: &mut zmq::Socket, frames: Frames, rep: Rep) -> Result<(), Error> {
-//     frames.send(sock, try!(encode_into_msg!(rep)))
-// }
-
-#[allow(unused_variables, unused_mut)]
-fn worker_db(mut sock_tx: zmq::Socket, 
-             chan_tx: Sender<Message<Req>>,
-             chan_rx: Receiver<Message<Rep>> /*,
-             mut db: db::Database */) -> Result<(), Error> 
-{
-//     loop {
-//         enum Decision<'a> {
-//             JustReply(Rep<'a>),
-//             Stop,
-//             ReplyMsg(zmq::Message),
-//         }
-        
-//         let req_frames = try!(Frames::recv(sock_rx));
-//         let decision = match Req::decode(&req_frames) {
-//             Ok(Req::Global(GlobalReq::Add(maybe_data))) => {
-//                 let id = try!(db.add(maybe_data.unwrap_or(&[])));
-//                 Decision::JustReply(Rep::Local(LocalRep::Added(id)))
-//             },
-//             Ok(Req::Local(LocalReq::Load(id))) => {
-//                 struct MsgLoader {
-//                     id: u32,
-//                     msg: Option<(zmq::Message, usize)>,
-//                 }
-
-//                 impl db::Loader for MsgLoader {
-//                     type Error = ZmqError;
-
-//                     fn set_len(&mut self, len: usize) -> Result<(), ZmqError> {
-//                         let base_rep = Rep::GlobalOk(GlobalRep::Lent(self.id, None));
-//                         let base_len = base_rep.encode_len();
-//                         let mut msg = try!(zmq::Message::with_capacity(base_len + len).map_err(|e| ZmqError::Message(e)));
-//                         base_rep.encode(&mut msg);
-//                         self.msg = Some((msg, base_len));
-//                         Ok(())
-//                     }
-
-//                     fn contents(&mut self) -> &mut [u8] {
-//                         self.msg.as_mut().map(|&mut (ref mut msg, offset)| &mut msg[offset ..]).unwrap()
-//                     }
-//                 }
-
-//                 let mut msg_loader = MsgLoader { id: id, msg: None };
-//                 match db.load(id, &mut msg_loader) {
-//                     Ok(()) => Decision::ReplyMsg(msg_loader.msg.unwrap().0),
-//                     Err(db::LoadError::Db(e)) => return Err(Error::Db(e)),
-//                     Err(db::LoadError::Load(e)) => return Err(Error::Zmq(e)),
-//                 }
-//             },
-//             Ok(Req::Local(LocalReq::Stop)) =>
-//                 Decision::Stop,
-//             Ok(..) =>
-//                 Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedWorkerDbRequest)),
-//             Err(proto_err) =>
-//                 Decision::JustReply(Rep::GlobalErr(proto_err)),
-//         };
-
-//         match decision {
-//             Decision::JustReply(rep) => 
-//                 try!(proto_reply(sock_tx, req_frames, rep)),
-//             Decision::Stop => {
-//                 try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Stopped)));
-//                 return Ok(())
-//             },
-//             Decision::ReplyMsg(msg) =>
-//                 try!(req_frames.send(sock_tx, msg)),
-//         }
-//     }
-    Ok(())
+pub struct Message<R> {
+    header: Vec<zmq::Message>,
+    load: R,
 }
 
-#[allow(unused_variables, unused_mut)]
-fn worker_pq(mut sock_tx: zmq::Socket, 
-             chan_tx: Sender<Message<Req>>,
-             chan_rx: Receiver<Message<Rep>>,
-             mut pq: pq::PQueue) -> Result<(), Error> 
+pub trait MessageLoad: Sized {
+    fn decode_load(msg: zmq::Message) -> Result<Self, ProtoError>;
+    fn encode_load(self) -> Result<zmq::Message, zmq::Error>;
+}
+
+impl MessageLoad for GlobalReq {
+    fn decode_load(msg: zmq::Message) -> Result<GlobalReq, ProtoError> {
+        GlobalReq::decode(&msg).map(|p| p.0)
+    }
+
+    fn encode_load(self) -> Result<zmq::Message, zmq::Error> {
+        let required = self.encode_len();
+        let mut msg = try!(zmq::Message::with_capacity(required));
+        self.encode(&mut msg);
+        Ok(msg)
+    }
+}
+
+impl MessageLoad for GlobalRep {
+    fn decode_load(msg: zmq::Message) -> Result<GlobalRep, ProtoError> {
+        GlobalRep::decode(&msg).map(|p| p.0)
+    }
+
+    fn encode_load(self) -> Result<zmq::Message, zmq::Error> {
+        let required = self.encode_len();
+        let mut msg = try!(zmq::Message::with_capacity(required));
+        self.encode(&mut msg);
+        Ok(msg)
+    }
+}
+
+impl<R> Message<R> {
+    pub fn recv(sock: &mut zmq::Socket) -> Result<Message<R>, Error> where R: MessageLoad {
+        let mut frames = Vec::new();
+        loop {
+            frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
+            if !try!(sock.get_rcvmore().map_err(|e| Error::Zmq(ZmqError::GetSockOpt(e)))) {
+                break
+            }
+        }
+
+        let load_msg = frames.pop().unwrap();
+        Ok(Message {
+            header: frames,
+            load: try!(R::decode_load(load_msg).map_err(|e| Error::Proto(e))),
+        })
+    }
+
+    pub fn transmit<SR>(self, sock: &mut zmq::Socket, load: SR) -> Result<(), Error> where SR: MessageLoad {
+        let load_msg = try!(load.encode_load().map_err(|e| Error::Zmq(ZmqError::Message(e))));
+        for frame in self.header {
+            try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+
+        sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+    }
+
+    fn reply<SR>(self, load: SR) -> Message<SR> {
+        Message { header: self.header, load: load, }
+    }
+}
+
+pub fn worker_db(mut sock_tx: zmq::Socket, 
+                 chan_tx: Sender<Message<Rep>>,
+                 chan_rx: Receiver<Message<Req>>,
+                 mut db: db::Database) -> Result<(), Error>
 {
+    loop {
+        let req = chan_rx.recv().unwrap();
+        let maybe_rep =
+            match req.load {
+                Req::Global(GlobalReq::Add(ref key, ref value)) => {
+                    if db.lookup(key).is_some() {
+                        Some(Rep::Global(GlobalRep::Kept))
+                    } else {
+                        db.insert(key.clone(), value.clone());
+                        Some(Rep::Local(LocalRep::Added(key.clone())))
+                    }
+                },
+                Req::Local(LocalReq::LoadLent(ref key)) => {
+                    if let Some(value) = db.lookup(key) {
+                        Some(Rep::Global(GlobalRep::Lent(key.clone(), value.clone())))
+                    } else {
+                        Some(Rep::Global(GlobalRep::Error(ProtoError::DbQueueOutOfSync(key.clone()))))
+                    }
+                },
+                Req::Local(LocalReq::RepayUpdate(ref key, ref value)) => {
+                    db.insert(key.clone(), value.clone());
+                    None
+                },
+                Req::Local(LocalReq::Stop) =>
+                    return Ok(()),
+                _ =>
+                    unreachable!(),
+            };
+
+        if let Some(rep) = maybe_rep {
+            chan_tx.send(req.reply(rep)).unwrap();
+            try!(sock_tx.send_msg(
+                try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 
+                0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+    }
+}
+
+pub fn worker_pq(mut sock_tx: zmq::Socket, 
+                 chan_tx: Sender<Message<Rep>>,
+                 chan_rx: Receiver<Message<Req>>,
+                 mut pq: pq::PQueue) -> Result<(), Error> 
+{
+    loop {
+        let req = chan_rx.recv().unwrap();
+        let (maybe_rep, maybe_lend_trigger_at, force_break) =
+            match req.load {
+                Req::Global(GlobalReq::Count) =>
+                    (Some(Rep::Global(GlobalRep::Counted(pq.len()))), None, false),
+                Req::Local(LocalReq::LendUntil(timeout, trigger_at)) =>
+                    if let Some(key) = pq.top() {
+                        (Some(Rep::Local(LocalRep::Lent(key))), Some(trigger_at), false)
+                    } else {
+                        (Some(Rep::Local(LocalRep::EmptyQueueHit { timeout: timeout })), None, false)
+                    },
+                Req::Local(LocalReq::RepayQueue(ref key, ref status)) => {
+                    pq.repay(key.clone(), status);
+                    (None, None, false)
+                },
+                Req::Local(LocalReq::Stop) =>
+                    (Some(Rep::Local(LocalRep::Stopped)), None, true),
+                _ =>
+                    unreachable!(),
+            };
+
+        if let Some(rep) = maybe_rep {
+            chan_tx.send(req.reply(rep)).unwrap();
+            try!(sock_tx.send_msg(
+                try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 
+                0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+
+        maybe_lend_trigger_at.map(|trigger_at| pq.lend(trigger_at));
+        if force_break {
+            return Ok(())
+        }
+    }
+}
+
 //     let mut pending_queue = VecDeque::new();
 //     loop {
 //         let timeout = if let Some(next_timeout) = pq.next_timeout() {
@@ -328,8 +332,20 @@ fn worker_pq(mut sock_tx: zmq::Socket,
 
 //         mem::replace(&mut pending_queue, tmp_queue);
 //     }
+//     Ok(())
+// }
+
+pub fn master(mut sock_ext: zmq::Socket,
+              mut sock_master_db_rx: zmq::Socket,
+              mut sock_master_pq_rx: zmq::Socket,
+              chan_master_db_tx: Sender<Message<Req>>,
+              chan_master_db_rx: Receiver<Message<Rep>>,
+              chan_master_pq_tx: Sender<Message<Req>>,
+              chan_master_pq_rx: Receiver<Message<Rep>>) -> Result<(), Error>
+{
     Ok(())
 }
+
 
 // pub fn master(sock_ext: &mut zmq::Socket,
 //               sock_db_tx: &mut zmq::Socket,
@@ -543,6 +559,7 @@ fn main() {
     let mut opts = Options::new();
 
     opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
+    opts.optopt("l", "flush-limit", "database disk sync threshold (items modified before flush) (optional, default: 131072)", "");
     opts.optopt("z", "zmq-addr", "zeromq interface listen address (optional, default: ipc://./spiderq.ipc)", "");
 
     match entrypoint(opts.parse(args)) {
