@@ -31,6 +31,7 @@ pub enum LocalReq {
     Enqueue(Key),
     LendUntil(u64, SteadyTime),
     LoadLent(Key),
+    RepayTimedOut,
     RepayUpdate(Key, Value),
     RepayQueue(Key, RepayStatus),
     Stop,
@@ -44,12 +45,13 @@ pub enum GlobalRep {
     Lent(Key, Value),
     Repaid,
     StatsGot { count: usize, add: usize, lend: usize, repay: usize, stats: usize, },
+    Terminated,
     Error(ProtoError),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum LocalRep {
-    TriggerGot(SteadyTime),
+    TriggerGot(Option<SteadyTime>),
     Added(Key),
     Kept,
     Lent(Key),
@@ -261,6 +263,8 @@ impl GlobalRep {
                 let (err, buf) = try!(ProtoError::decode(buf));
                 Ok((GlobalRep::Error(err), buf))
             },
+            (8, buf) =>
+                Ok((GlobalRep::Terminated, buf)),
             (tag, _) => 
                 return Err(ProtoError::InvalidGlobalRepTag(tag)),
         }
@@ -269,7 +273,7 @@ impl GlobalRep {
     pub fn encode_len(&self) -> usize {
         size_of::<u8>() + match self {
             &GlobalRep::Counted(..) => size_of::<u32>(),
-            &GlobalRep::Added | &GlobalRep::Kept | &GlobalRep::Repaid => 0,
+            &GlobalRep::Added | &GlobalRep::Kept | &GlobalRep::Repaid | &GlobalRep::Terminated => 0,
             &GlobalRep::Lent(ref key, ref value) => size_of::<u32>() * 2 + key.len() + value.len(),
             &GlobalRep::StatsGot { .. } => size_of::<u64>() * 5,
             &GlobalRep::Error(ref err) => err.encode_len(),
@@ -307,6 +311,8 @@ impl GlobalRep {
                 let area = put_adv!(area, u8, write_u8, 7);
                 err.encode(area)
             },
+            &GlobalRep::Terminated =>
+                put_adv!(area, u8, write_u8, 8),
         }
     }
 }
@@ -572,6 +578,11 @@ mod test {
     #[test]
     fn globalrep_stats() {
         assert_encode_decode_rep(GlobalRep::StatsGot { count: 177, add: 277, lend: 377, repay: 477, stats: 577, });
+    }
+
+    #[test]
+    fn globalrep_terminated() {
+        assert_encode_decode_rep(GlobalRep::Terminated);
     }
 
     #[test]
