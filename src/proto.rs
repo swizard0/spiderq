@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::mem::size_of;
 use std::slice::bytes;
-use time::SteadyTime;
 use byteorder::{ByteOrder, BigEndian};
 
 pub type Key = Arc<Vec<u8>>;
@@ -26,18 +25,6 @@ pub enum GlobalReq {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LocalReq {
-    NextTrigger,
-    Enqueue(Key),
-    LendUntil(u64, SteadyTime),
-    LoadLent(Key),
-    RepayTimedOut,
-    RepayUpdate(Key, Value),
-    RepayQueue(Key, RepayStatus),
-    Stop,
-}
-
-#[derive(Debug, PartialEq)]
 pub enum GlobalRep {
     Counted(usize),
     Added,
@@ -47,16 +34,6 @@ pub enum GlobalRep {
     StatsGot { count: usize, add: usize, lend: usize, repay: usize, stats: usize, },
     Terminated,
     Error(ProtoError),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum LocalRep {
-    TriggerGot(Option<SteadyTime>),
-    Added(Key),
-    Kept,
-    Lent(Key),
-    EmptyQueueHit { timeout: u64, },
-    Stopped,
 }
 
 #[derive(Debug, PartialEq)]
