@@ -10,7 +10,7 @@ extern crate byteorder;
 use std::{io, env, mem, process};
 use std::io::Write;
 use std::convert::From;
-use std::thread::{spawn, JoinHandle};
+use std::thread::{Builder, JoinHandle};
 use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::num::ParseIntError;
 use getopts::Options;
@@ -20,6 +20,8 @@ pub mod db;
 pub mod pq;
 pub mod proto;
 use proto::{Key, Value, RepayStatus, ProtoError, GlobalReq, GlobalRep};
+
+const MAX_POLL_TIMEOUT: i64 = 100;
 
 #[derive(Debug)]
 pub enum Error {
@@ -76,16 +78,19 @@ pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Res
     let (chan_master_pq_tx, chan_pq_master_rx) = channel();
     let (chan_pq_master_tx, chan_master_pq_rx) = channel();
 
-    spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap());
-    spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap());
-    let master_thread =
-   	spawn(move || master(sock_master_ext,
-                             sock_master_db_rx,
-                             sock_master_pq_rx,
-                             chan_master_db_tx,
-                             chan_master_db_rx,
-                             chan_master_pq_tx,
-                             chan_master_pq_rx).unwrap());
+    Builder::new().name("worker_db".to_owned())
+        .spawn(move || worker_db(sock_db_master_tx, chan_db_master_tx, chan_db_master_rx, db).unwrap()).unwrap();
+    Builder::new().name("worker_pq".to_owned())
+        .spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap()).unwrap();
+    let master_thread = Builder::new().name("master".to_owned())
+   	.spawn(move || master(sock_master_ext,
+                              sock_master_db_rx,
+                              sock_master_pq_rx,
+                              chan_master_db_tx,
+                              chan_master_db_rx,
+                              chan_master_pq_tx,
+                              chan_master_pq_rx).unwrap())
+        .unwrap();
     Ok((ctx, master_thread))
 }
 
@@ -181,11 +186,14 @@ pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Messa
     chan.send(Message { headers: maybe_headers, load: packet, }).unwrap()
 }
 
-fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>, notify_sock: &mut zmq::Socket) -> Result<(), Error> {
-    tx_chan(packet, maybe_headers, chan);
-    notify_sock
-        .send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
+fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
+    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
         .map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
+fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>, sock: &mut zmq::Socket) -> Result<(), Error> {
+    tx_chan(packet, maybe_headers, chan);
+    notify_sock(sock)
 }
 
 
@@ -194,16 +202,18 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                  chan_rx: Receiver<Message<DbReq>>,
                  mut db: db::Database) -> Result<(), Error>
 {
+    try!(notify_sock(&mut sock_tx));
     loop {
         let req = chan_rx.recv().unwrap();
         match req.load {
-            DbReq::Global(GlobalReq::Add(key, value)) =>
+            DbReq::Global(GlobalReq::Add(key, value)) => {
                 if db.lookup(&key).is_some() {
                     try!(tx_chan_n(DbRep::Global(GlobalRep::Kept), req.headers, &chan_tx, &mut sock_tx))
                 } else {
                     db.insert(key.clone(), value);
                     try!(tx_chan_n(DbRep::Local(DbLocalRep::Added(key)), req.headers, &chan_tx, &mut sock_tx))
-                },
+                }
+            },
             DbReq::Global(..) =>
                 unreachable!(),
             DbReq::Local(DbLocalReq::LoadLent(key)) =>
@@ -227,6 +237,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                  chan_rx: Receiver<Message<PqReq>>,
                  mut pq: pq::PQueue) -> Result<(), Error> 
 {
+    try!(notify_sock(&mut sock_tx));
     loop {
         let req = chan_rx.recv().unwrap();
         match req.load {
@@ -280,8 +291,13 @@ fn master(mut sock_ext: zmq::Socket,
     let mut stats_stats = 0;
 
     let (mut incoming_queue, mut pending_queue) = (Vec::new(), Vec::new());
-    let mut next_timeout: Option<SteadyTime> = None;
+    let mut next_timeout: Option<Option<SteadyTime>> = None;
     let mut stop_state = StopState::NotTriggered;
+
+    // sync with workers
+    let _ = try!(sock_db_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+    let _ = try!(sock_pq_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+
     loop {
         // check if it is time to quit
         match stop_state {
@@ -292,41 +308,47 @@ fn master(mut sock_ext: zmq::Socket,
             _ => (),
         }
 
-        let current_time = SteadyTime::now();
+        let before_poll_ts = SteadyTime::now();
 
         // calculate poll delay
-        let timeout = if let Some(next_trigger) = next_timeout {
-            let interval = next_trigger - current_time;
-            let timeout = interval.num_milliseconds();
-            if timeout <= 0 {
-                next_timeout = None;
-                tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &chan_pq_tx);
-                continue;
-            } else {
-                timeout
-            }
-        } else {
-            tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
-            0
+        let timeout = match next_timeout {
+            None => {
+                tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
+                MAX_POLL_TIMEOUT
+            },
+            Some(None) =>
+                MAX_POLL_TIMEOUT,
+            Some(Some(next_trigger)) => {
+                let interval = next_trigger - before_poll_ts;
+                match interval.num_milliseconds() {
+                    timeout if timeout <= 0 => {
+                        next_timeout = None;
+                        tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &chan_pq_tx);
+                        continue;
+                    },
+                    timeout if timeout > MAX_POLL_TIMEOUT =>
+                        MAX_POLL_TIMEOUT,
+                    timeout =>
+                        timeout,
+                }
+            },
         };
 
         let avail_socks = {
             let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                                  sock_db_rx.as_poll_item(zmq::POLLIN),
                                  sock_pq_rx.as_poll_item(zmq::POLLIN)];
-            if try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
-                continue
-            }
-
+            try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
             [pollitems[0].get_revents() == zmq::POLLIN,
              pollitems[1].get_revents() == zmq::POLLIN,
              pollitems[2].get_revents() == zmq::POLLIN]
         };
 
+        let after_poll_ts = SteadyTime::now();
         if avail_socks[0] {
             // sock_ext is online
             match rx_sock(&mut sock_ext) {
-                Ok((headers, Ok(req))) => pending_queue.push((headers, req)),
+                Ok((headers, Ok(req))) => incoming_queue.push((headers, req)),
                 Ok((headers, Err(e))) => try!(tx_sock(GlobalRep::Error(e), headers, &mut sock_ext)),
                 Err(e) => return Err(e),
             }
@@ -344,6 +366,11 @@ fn master(mut sock_ext: zmq::Socket,
 
         loop {
             // process messages from db
+            match stop_state {
+                StopState::Finished(..) | StopState::WaitingPq(..) => break,
+                _ => (),
+            }
+
             match chan_db_rx.try_recv() {
                 Ok(message) => match message.load {
                     DbRep::Global(rep @ GlobalRep::Kept) => {
@@ -379,6 +406,11 @@ fn master(mut sock_ext: zmq::Socket,
 
         loop {
             // process messages from pq
+            match stop_state {
+                StopState::Finished(..) | StopState::WaitingDb(..) => break,
+                _ => (),
+            }
+
             match chan_pq_rx.try_recv() {
                 Ok(message) => match message.load {
                     PqRep::Global(rep @ GlobalRep::Counted(..)) => {
@@ -387,14 +419,14 @@ fn master(mut sock_ext: zmq::Socket,
                     },
                     PqRep::Global(..) =>
                         unreachable!(),
-                    PqRep::Local(PqLocalRep::Lent(key)) =>
-                        tx_chan(DbReq::Local(DbLocalReq::LoadLent(key)), message.headers, &chan_db_tx),
+                    PqRep::Local(PqLocalRep::Lent(key)) => {
+                        tx_chan(DbReq::Local(DbLocalReq::LoadLent(key)), message.headers, &chan_db_tx);
+                        next_timeout = None;
+                    },
                     PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: t, }) =>
                         pending_queue.push((message.headers, GlobalReq::Lend { timeout: t, })),
-                    PqRep::Local(PqLocalRep::TriggerGot(Some(trigger))) =>
-                        next_timeout = Some(trigger),
-                    PqRep::Local(PqLocalRep::TriggerGot(None)) =>
-                        next_timeout = Some(current_time + Duration::milliseconds(100)),
+                    PqRep::Local(PqLocalRep::TriggerGot(trigger_at)) =>
+                        next_timeout = Some(trigger_at),
                     PqRep::Local(PqLocalRep::Stopped) =>
                         stop_state = match stop_state {
                             StopState::NotTriggered | StopState::WaitingDb(..) | StopState::Finished(..) => unreachable!(),
@@ -405,7 +437,7 @@ fn master(mut sock_ext: zmq::Socket,
                 Err(TryRecvError::Empty) =>
                     break,
                 Err(TryRecvError::Disconnected) =>
-                    panic!("db worker thread is down"),
+                    panic!("pq worker thread is down"),
             }
         }
 
@@ -417,12 +449,13 @@ fn master(mut sock_ext: zmq::Socket,
                 req @ GlobalReq::Add(..) =>
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 GlobalReq::Lend { timeout: t, } => {
-                    let trigger_at = current_time + Duration::milliseconds(t as i64);
+                    let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
                     tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at)), headers, &chan_pq_tx);
                 },
                 GlobalReq::Repay(key, value, status) => {
                     tx_chan(PqReq::Local(PqLocalReq::RepayQueue(key.clone(), status)), None, &chan_pq_tx);
                     tx_chan(DbReq::Local(DbLocalReq::RepayUpdate(key, value)), None, &chan_db_tx);
+                    next_timeout = None;
                     stats_repay += 1;
                     try!(tx_sock(GlobalRep::Repaid, headers, &mut sock_ext));
                 },
@@ -497,6 +530,7 @@ mod test {
         let (chan_slave_master_tx, chan_master_slave_rx) = channel();
 
         let worker = spawn(move || worker_fn(sock_slave_master_tx, chan_slave_master_tx, chan_slave_master_rx));
+        assert_eq!(sock_master_slave_rx.recv_bytes(0).unwrap(), &[]); // sync
         master_fn(sock_master_slave_rx, chan_master_slave_tx, chan_master_slave_rx);
         worker.join().unwrap();
     }
@@ -598,6 +632,9 @@ mod test {
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
                                   PqRep::Local(PqLocalRep::Lent(key_b.clone())));
+                tx_chan(PqReq::Local(PqLocalReq::RepayQueue(key_b.clone(), RepayStatus::Drop)), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(1)));
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::Stop), PqRep::Local(PqLocalRep::Stopped));
             });
     }
@@ -625,6 +662,23 @@ mod test {
         let mut sock_ftd = ctx.socket(zmq::REQ).unwrap();
         sock_ftd.connect(zmq_addr).unwrap();
         let sock = &mut sock_ftd;
+
+        let ((key_a, value_a), (key_b, value_b)) = (rnd_kv(), rnd_kv());
+        tx_sock(GlobalReq::Add(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
+        tx_sock(GlobalReq::Add(key_a.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Kept);
+        tx_sock(GlobalReq::Add(key_b.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
+        tx_sock(GlobalReq::Lend { timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Lent(key_a.clone(), value_a.clone()));
+        tx_sock(GlobalReq::Lend { timeout: 500, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Lent(key_b.clone(), value_b.clone()));
+        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+        tx_sock(GlobalReq::Repay(key_b.clone(), value_a.clone(), RepayStatus::Penalty), sock); assert_eq!(rx_sock(sock), GlobalRep::Repaid);
+        tx_sock(GlobalReq::Repay(key_a.clone(), value_b.clone(), RepayStatus::Penalty), sock); assert_eq!(rx_sock(sock), GlobalRep::Repaid);
+        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(2));
+        tx_sock(GlobalReq::Lend { timeout: 2000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Lent(key_b.clone(), value_a.clone()));
+        tx_sock(GlobalReq::Lend { timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Lent(key_a.clone(), value_b.clone()));
+        tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+        let timeout_check_start = SteadyTime::now();
+        tx_sock(GlobalReq::Lend { timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Lent(key_a.clone(), value_b.clone()));
+        assert_eq!((SteadyTime::now() - timeout_check_start).num_seconds(), 1);
 
         tx_sock(GlobalReq::Terminate, sock); assert_eq!(rx_sock(sock), GlobalRep::Terminated);
         master_thread.join().unwrap();
