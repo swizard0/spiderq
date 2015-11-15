@@ -152,7 +152,7 @@ mod test {
         pq.lend(time + Duration::seconds(5)); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        pq.repay(as_key(1), RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/10>
+        pq.repay(as_key(1), &RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
@@ -189,7 +189,7 @@ mod test {
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(15)); // | <0/10> <1/15>
         assert_eq!(pq.len(), 0);
-        pq.repay(as_key(1), RepayStatus::Penalty); // 1 | <0/10>
+        pq.repay(as_key(1), &RepayStatus::Penalty); // 1 | <0/10>
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(20)); // | <0/10> <1/20>
         assert_eq!(pq.len(), 0);

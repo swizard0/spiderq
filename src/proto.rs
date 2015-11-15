@@ -723,4 +723,20 @@ mod test {
     fn globalrep_error_notenoughdataforprotoerrorinvalidtag() {
         assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorInvalidTag { required: 177, given: 177, }));
     }
+
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrordbqueueoutofsynckey() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKey { required: 177, given: 177, }));
+    }
+
+    #[test]
+    fn globalrep_error_notenoughdataforprotoerrordbqueueoutofsynckeylen() {
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::NotEnoughDataForProtoErrorDbQueueOutOfSyncKeyLen { required: 177, given: 177, }));
+    }
+
+    #[test]
+    fn globalrep_error_dbqueueoutofsync () {
+        let (key, _) = dummy_key_value();
+        assert_encode_decode_rep(GlobalRep::Error(ProtoError::DbQueueOutOfSync(key)));
+    }
 }
