@@ -7,13 +7,12 @@ extern crate tempdir;
 extern crate byteorder;
 #[cfg(test)] extern crate rand;
 
-use std::{io, env, process};
+use std::{io, env, mem, process};
 use std::io::Write;
 use std::convert::From;
 use std::thread::spawn;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::num::ParseIntError;
-use std::collections::VecDeque;
 use getopts::Options;
 use time::{SteadyTime, Duration};
 
@@ -47,16 +46,6 @@ impl From<db::Error> for Error {
     fn from(err: db::Error) -> Error {
         Error::Db(err)
     }
-}
-
-pub enum Req {
-    Global(GlobalReq),
-    Local(LocalReq),
-}
-
-pub enum Rep {
-    Global(GlobalRep),
-    Local(LocalRep),
 }
 
 fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
@@ -96,8 +85,20 @@ fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
            chan_master_pq_rx)
 }
 
+pub type Headers = Vec<zmq::Message>;
+
+pub enum Req {
+    Global(GlobalReq),
+    Local(LocalReq),
+}
+
+pub enum Rep {
+    Global(GlobalRep),
+    Local(LocalRep),
+}
+
 pub struct Message<R> {
-    header: Vec<zmq::Message>,
+    headers: Option<Headers>,
     load: R,
 }
 
@@ -106,29 +107,41 @@ pub trait MessageLoad: Sized {
     fn encode_load(self) -> Result<zmq::Message, zmq::Error>;
 }
 
-impl MessageLoad for GlobalReq {
-    fn decode_load(msg: zmq::Message) -> Result<GlobalReq, ProtoError> {
-        GlobalReq::decode(&msg).map(|p| p.0)
+impl MessageLoad for Req {
+    fn decode_load(msg: zmq::Message) -> Result<Req, ProtoError> {
+        Ok(Req::Global(try!(GlobalReq::decode(&msg).map(|p| p.0))))
     }
 
     fn encode_load(self) -> Result<zmq::Message, zmq::Error> {
-        let required = self.encode_len();
-        let mut msg = try!(zmq::Message::with_capacity(required));
-        self.encode(&mut msg);
-        Ok(msg)
+        match self {
+            Req::Global(req) => {
+                let required = req.encode_len();
+                let mut msg = try!(zmq::Message::with_capacity(required));
+                req.encode(&mut msg);
+                Ok(msg)
+            },
+            Req::Local(..) =>
+                unreachable!(),
+        }
     }
 }
 
-impl MessageLoad for GlobalRep {
-    fn decode_load(msg: zmq::Message) -> Result<GlobalRep, ProtoError> {
-        GlobalRep::decode(&msg).map(|p| p.0)
+impl MessageLoad for Rep {
+    fn decode_load(msg: zmq::Message) -> Result<Rep, ProtoError> {
+        Ok(Rep::Global(try!(GlobalRep::decode(&msg).map(|p| p.0))))
     }
 
     fn encode_load(self) -> Result<zmq::Message, zmq::Error> {
-        let required = self.encode_len();
-        let mut msg = try!(zmq::Message::with_capacity(required));
-        self.encode(&mut msg);
-        Ok(msg)
+        match self {
+            Rep::Global(rep) => {
+                let required = rep.encode_len();
+                let mut msg = try!(zmq::Message::with_capacity(required));
+                rep.encode(&mut msg);
+                Ok(msg)
+            },
+            Rep::Local(..) =>
+                unreachable!(),
+        }
     }
 }
 
@@ -144,24 +157,34 @@ impl<R> Message<R> {
 
         let load_msg = frames.pop().unwrap();
         Ok(Message {
-            header: frames,
+            headers: Some(frames),
             load: try!(R::decode_load(load_msg).map_err(|e| Error::Proto(e))),
         })
     }
-
-    pub fn transmit<SR>(self, sock: &mut zmq::Socket, load: SR) -> Result<(), Error> where SR: MessageLoad {
-        let load_msg = try!(load.encode_load().map_err(|e| Error::Zmq(ZmqError::Message(e))));
-        for frame in self.header {
-            try!(sock.send_msg(frame, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-        }
-
-        sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
-    }
-
-    fn reply<SR>(self, load: SR) -> Message<SR> {
-        Message { header: self.header, load: load, }
-    }
 }
+
+pub fn tx_sock<R>(packet: R, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> where R: MessageLoad {
+    let load_msg = try!(packet.encode_load().map_err(|e| Error::Zmq(ZmqError::Message(e))));
+
+    if let Some(headers) = maybe_headers {
+        for header in headers {
+            try!(sock.send_msg(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+        }
+    }
+    sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
+fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>) {
+    chan.send(Message { headers: maybe_headers, load: packet, }).unwrap()
+}
+
+fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>, notify_sock: &mut zmq::Socket) -> Result<(), Error> {
+    tx_chan(packet, maybe_headers, chan);
+    notify_sock
+        .send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
+        .map_err(|e| Error::Zmq(ZmqError::Send(e)))
+}
+
 
 pub fn worker_db(mut sock_tx: zmq::Socket, 
                  chan_tx: Sender<Message<Rep>>,
@@ -170,38 +193,28 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
 {
     loop {
         let req = chan_rx.recv().unwrap();
-        let maybe_rep =
-            match req.load {
-                Req::Global(GlobalReq::Add(ref key, ref value)) => {
-                    if db.lookup(key).is_some() {
-                        Some(Rep::Global(GlobalRep::Kept))
-                    } else {
-                        db.insert(key.clone(), value.clone());
-                        Some(Rep::Local(LocalRep::Added(key.clone())))
-                    }
+        match req.load {
+            Req::Global(GlobalReq::Add(key, value)) =>
+                if db.lookup(&key).is_some() {
+                    try!(tx_chan_n(Rep::Global(GlobalRep::Kept), req.headers, &chan_tx, &mut sock_tx))
+                } else {
+                    db.insert(key.clone(), value);
+                    try!(tx_chan_n(Rep::Local(LocalRep::Added(key)), req.headers, &chan_tx, &mut sock_tx))
                 },
-                Req::Local(LocalReq::LoadLent(ref key)) => {
-                    if let Some(value) = db.lookup(key) {
-                        Some(Rep::Global(GlobalRep::Lent(key.clone(), value.clone())))
-                    } else {
-                        Some(Rep::Global(GlobalRep::Error(ProtoError::DbQueueOutOfSync(key.clone()))))
-                    }
+            Req::Local(LocalReq::LoadLent(key)) =>
+                if let Some(value) = db.lookup(&key) {
+                    try!(tx_chan_n(Rep::Global(GlobalRep::Lent(key, value.clone())), req.headers, &chan_tx, &mut sock_tx))
+                } else {
+                    try!(tx_chan_n(Rep::Global(GlobalRep::Error(ProtoError::DbQueueOutOfSync(key.clone()))), req.headers, &chan_tx, &mut sock_tx))
                 },
-                Req::Local(LocalReq::RepayUpdate(ref key, ref value)) => {
-                    db.insert(key.clone(), value.clone());
-                    None
-                },
-                Req::Local(LocalReq::Stop) =>
-                    return Ok(()),
-                _ =>
-                    unreachable!(),
-            };
-
-        if let Some(rep) = maybe_rep {
-            chan_tx.send(req.reply(rep)).unwrap();
-            try!(sock_tx.send_msg(
-                try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 
-                0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+            Req::Local(LocalReq::RepayUpdate(key, value)) =>
+                db.insert(key, value),
+            Req::Local(LocalReq::Stop) => {
+                try!(tx_chan_n(Rep::Local(LocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx));
+                return Ok(())
+            },
+            _ =>
+                unreachable!(),
         }
     }
 }
@@ -213,137 +226,146 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
 {
     loop {
         let req = chan_rx.recv().unwrap();
-        let (maybe_rep, maybe_lend_trigger_at, force_break) =
-            match req.load {
-                Req::Global(GlobalReq::Count) =>
-                    (Some(Rep::Global(GlobalRep::Counted(pq.len()))), None, false),
-                Req::Local(LocalReq::LendUntil(timeout, trigger_at)) =>
-                    if let Some(key) = pq.top() {
-                        (Some(Rep::Local(LocalRep::Lent(key))), Some(trigger_at), false)
-                    } else {
-                        (Some(Rep::Local(LocalRep::EmptyQueueHit { timeout: timeout })), None, false)
-                    },
-                Req::Local(LocalReq::RepayQueue(ref key, ref status)) => {
-                    pq.repay(key.clone(), status);
-                    (None, None, false)
+        match req.load {
+            Req::Global(GlobalReq::Count) =>
+                try!(tx_chan_n(Rep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)),
+            Req::Local(LocalReq::Enqueue(key)) =>
+                pq.add(key),
+            Req::Local(LocalReq::LendUntil(timeout, trigger_at)) =>
+                if let Some(key) = pq.top() {
+                    try!(tx_chan_n(Rep::Local(LocalRep::Lent(key)), req.headers, &chan_tx, &mut sock_tx));
+                    pq.lend(trigger_at)
+                } else {
+                    try!(tx_chan_n(Rep::Local(LocalRep::EmptyQueueHit { timeout: timeout }), req.headers, &chan_tx, &mut sock_tx))
                 },
-                Req::Local(LocalReq::Stop) =>
-                    (Some(Rep::Local(LocalRep::Stopped)), None, true),
-                _ =>
-                    unreachable!(),
-            };
-
-        if let Some(rep) = maybe_rep {
-            chan_tx.send(req.reply(rep)).unwrap();
-            try!(sock_tx.send_msg(
-                try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 
-                0).map_err(|e| Error::Zmq(ZmqError::Send(e))));
-        }
-
-        maybe_lend_trigger_at.map(|trigger_at| pq.lend(trigger_at));
-        if force_break {
-            return Ok(())
+            Req::Local(LocalReq::RepayQueue(key, status)) =>
+                pq.repay(key, status),
+            Req::Local(LocalReq::NextTrigger) =>
+                try!(tx_chan_n(Rep::Local(LocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)),
+            Req::Local(LocalReq::RepayTimedOut) =>
+                pq.repay_timed_out(),
+            Req::Local(LocalReq::Stop) => {
+                try!(tx_chan_n(Rep::Local(LocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx));
+                return Ok(())
+            },
+            _ =>
+                unreachable!(),
         }
     }
 }
 
-//     let mut pending_queue = VecDeque::new();
-//     loop {
-//         let timeout = if let Some(next_timeout) = pq.next_timeout() {
-//             let interval = next_timeout - SteadyTime::now();
-//             let timeout = interval.num_milliseconds();
-//             if timeout < 0 {
-//                 pq.repay_timed_out();
-//                 0
-//             } else {
-//                 timeout
-//             }
-//         } else {
-//             -1
-//         };
-
-//         if {
-//             let mut pollitems = [sock_rx.as_poll_item(zmq::POLLIN)];
-//             let avail = try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e))));
-//             (avail == 1) && (pollitems[0].get_revents() == zmq::POLLIN)
-//         } {
-//             pending_queue.push_front(try!(Frames::recv(sock_rx)));
-//         }
-
-//         let mut tmp_queue = VecDeque::new();
-//         enum Decision<'a> {
-//             JustReply(Rep<'a>),
-//             Reenqueue,
-//             ProceedLend(u32, u64),
-//             ProceedRepay(u32, RepayStatus),
-//             DoNothing,
-//             Stop,
-//         }
-
-//         while let Some(req_frames) = pending_queue.pop_front() {
-//             let decision = match Req::decode(&req_frames) {
-//                 Ok(Req::Local(LocalReq::Stop)) =>
-//                     Decision::Stop,
-//                 Ok(Req::Global(GlobalReq::Count)) =>
-//                     Decision::JustReply(Rep::GlobalOk(GlobalRep::Counted(pq.len()))),
-//                 Ok(Req::Global(GlobalReq::Lend { timeout: t, })) => {
-//                     if let Some(id) = pq.top() {
-//                         Decision::ProceedLend(id, t)
-//                     } else {
-//                         Decision::Reenqueue
-//                     }
-//                 },
-//                 Ok(Req::Global(GlobalReq::Repay(id, status))) =>
-//                     Decision::ProceedRepay(id, status),
-//                 Ok(Req::Local(LocalReq::AddEnqueue(expected_id))) => {
-//                     let new_id = pq.add();
-//                     assert_eq!(expected_id, new_id);
-//                     Decision::DoNothing
-//                 },
-//                 Ok(..) =>
-//                     Decision::JustReply(Rep::GlobalErr(ProtoError::UnexpectedWorkerPqRequest)),
-//                 Err(proto_err) =>
-//                     Decision::JustReply(Rep::GlobalErr(proto_err)),
-//             };
-
-//             match decision {
-//                 Decision::JustReply(rep) => 
-//                     try!(proto_reply(sock_tx, req_frames, rep)),
-//                 Decision::Stop => {
-//                     try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Stopped)));
-//                     return Ok(())
-//                 },
-//                 Decision::ProceedLend(id, t) => {
-//                     try!(proto_reply(sock_tx, req_frames, Rep::Local(LocalRep::Lent(id))));
-//                     let trigger_at = SteadyTime::now() + Duration::milliseconds(t as i64);
-//                     assert_eq!(pq.lend(trigger_at), Some(id));
-//                 },
-//                 Decision::ProceedRepay(id, status) => {
-//                     try!(proto_reply(sock_tx, req_frames, Rep::GlobalOk(GlobalRep::Repaid)));
-//                     pq.repay(id, status);
-//                 },
-//                 Decision::DoNothing =>
-//                     (),
-//                 Decision::Reenqueue => {
-//                     tmp_queue.push_back(req_frames);
-//                 },
-//             }
-//         }
-
-//         mem::replace(&mut pending_queue, tmp_queue);
-//     }
-//     Ok(())
-// }
-
 pub fn master(mut sock_ext: zmq::Socket,
-              mut sock_master_db_rx: zmq::Socket,
-              mut sock_master_pq_rx: zmq::Socket,
-              chan_master_db_tx: Sender<Message<Req>>,
-              chan_master_db_rx: Receiver<Message<Rep>>,
-              chan_master_pq_tx: Sender<Message<Req>>,
-              chan_master_pq_rx: Receiver<Message<Rep>>) -> Result<(), Error>
+              mut sock_db_rx: zmq::Socket,
+              mut sock_pq_rx: zmq::Socket,
+              chan_db_tx: Sender<Message<Req>>,
+              chan_db_rx: Receiver<Message<Rep>>,
+              chan_pq_tx: Sender<Message<Req>>,
+              chan_pq_rx: Receiver<Message<Rep>>) -> Result<(), Error>
 {
-    Ok(())
+    enum StopState {
+        NotTriggered,
+        WaitingPqAndDb(Headers),
+        WaitingPq(Headers),
+        WaitingDb(Headers),
+        Finished(Headers),
+    }
+
+    let mut stats_count = 0;
+    let mut stats_add = 0;
+    let mut stats_lend = 0;
+    let mut stats_repay = 0;
+    let mut stats_stats = 0;
+
+    let (mut incoming_queue, mut pending_queue) = (Vec::new(), Vec::new());
+    let mut next_timeout: Option<SteadyTime> = None;
+    let mut stop_state = StopState::NotTriggered;
+    loop {
+        // check if it is time to quit
+        match stop_state {
+            StopState::Finished(headers) => {
+                try!(tx_sock(Rep::Global(GlobalRep::Terminated), Some(headers), &mut sock_ext));
+                return Ok(())
+            },
+            _ => (),
+        }
+
+        // calculate poll delay
+        let (timeout, repay_time) = if let Some(next_trigger) = next_timeout {
+            let interval = next_trigger - SteadyTime::now();
+            let timeout = interval.num_milliseconds();
+            if timeout <= 0 {
+                (0, true)
+            } else {
+                (timeout, false)
+            }
+        } else {
+            (0, false)
+        };
+
+        let avail_socks = {
+            let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
+                                 sock_db_rx.as_poll_item(zmq::POLLIN),
+                                 sock_pq_rx.as_poll_item(zmq::POLLIN)];
+            if try!(zmq::poll(&mut pollitems, timeout).map_err(|e| Error::Zmq(ZmqError::Poll(e)))) == 0 {
+                continue
+            }
+
+            [pollitems[0].get_revents() == zmq::POLLIN,
+             pollitems[1].get_revents() == zmq::POLLIN,
+             pollitems[2].get_revents() == zmq::POLLIN]
+        };
+
+        if avail_socks[0] {
+            // sock_ext is online
+            pending_queue.push(try!(Message::<Req>::recv(&mut sock_ext)));
+        }
+
+        if avail_socks[1] {
+            // sock_db is online, skip ping msg
+            let _ = try!(sock_db_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+        }
+
+        if avail_socks[2] {
+            // sock_pq is online, skip ping msg
+            let _ = try!(sock_pq_rx.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e))));
+        }
+
+        if next_timeout.is_none() {
+            tx_chan(Req::Local(LocalReq::NextTrigger), None, &chan_pq_tx);
+        }
+
+        loop {
+            // process messages from db
+            match chan_db_rx.try_recv() {
+                Ok(message) => match message.load {
+                    rep @ Rep::Global(..) =>
+                        try!(tx_sock(rep, message.headers, &mut sock_ext)),
+                    Rep::Local(LocalRep::Added(key)) => {
+                        tx_chan(Req::Local(LocalReq::Enqueue(key)), None, &chan_pq_tx);
+                        try!(tx_sock(Rep::Global(GlobalRep::Added), message.headers, &mut sock_ext));
+                    },
+                    Rep::Local(LocalRep::Stopped) =>
+                        stop_state = match stop_state {
+                            StopState::NotTriggered | StopState::WaitingPq(..) | StopState::Finished(..) => unreachable!(),
+                            StopState::WaitingPqAndDb(headers) => StopState::WaitingPq(headers),
+                            StopState::WaitingDb(headers) => StopState::Finished(headers),
+                        },
+                    Rep::Local(..) =>
+                        unreachable!(),
+                },
+                Err(TryRecvError::Empty) =>
+                    break,
+                Err(TryRecvError::Disconnected) =>
+                    panic!("db worker thread is down"),
+            }
+        }
+
+        // process incoming messages
+        for req in incoming_queue.drain(..) {
+        }
+
+        mem::swap(&mut incoming_queue, &mut pending_queue);
+    }
 }
 
 
