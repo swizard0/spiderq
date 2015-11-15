@@ -142,8 +142,8 @@ pub enum PqRep {
 }
 
 pub struct Message<R> {
-    headers: Option<Headers>,
-    load: R,
+    pub headers: Option<Headers>,
+    pub load: R,
 }
 
 pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq, ProtoError>), Error> {
@@ -172,7 +172,7 @@ pub fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq
     sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
-fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>) {
+pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>) {
     chan.send(Message { headers: maybe_headers, load: packet, }).unwrap()
 }
 
@@ -463,227 +463,98 @@ fn main() {
 
 #[cfg(test)]
 mod test {
-//     use std::fs;
-//     use std::thread::spawn;
-//     use time::SteadyTime;
-//     use super::{db, pq, worker_db_entrypoint, worker_pq_entrypoint, master};
-//     use super::proto::{RepayStatus, Req, LocalReq, GlobalReq, Rep, LocalRep, GlobalRep};
+    use std::fs;
+    use std::sync::Arc;
+    use std::fmt::Debug;
+    use std::thread::spawn;
+    use rand::{thread_rng, sample, Rng};
+    use std::sync::mpsc::{channel, Sender, Receiver};
+    use super::proto::{Key, Value, GlobalReq, GlobalRep, ProtoError};
+    use super::{zmq, db, pq, worker_db, worker_pq, tx_chan};
+    use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
-//     fn proto_request(sock: &mut zmq::Socket, req: Req) {
-//         let bytes_required = req.encode_len();
-//         let mut msg = zmq::Message::with_capacity(bytes_required).unwrap();
-//         req.encode(&mut msg);
-//         sock.send_msg(msg, 0).unwrap();
-//     }
+    fn with_worker<WF, MF, Req, Rep>(base_addr: &str, worker_fn: WF, master_fn: MF) where
+        WF: FnOnce(zmq::Socket, Sender<Message<Rep>>, Receiver<Message<Req>>) + Send + 'static,
+        MF: FnOnce(zmq::Socket, Sender<Message<Req>>, Receiver<Message<Rep>>) + Send + 'static,
+        Req: Send + 'static, Rep: Send + 'static
+    {
+        let mut ctx = zmq::Context::new();
+        let mut sock_master_slave_rx = ctx.socket(zmq::PULL).unwrap();
+        let mut sock_slave_master_tx = ctx.socket(zmq::PUSH).unwrap();
 
-//     fn assert_request_reply(sock_tx: &mut zmq::Socket, sock_rx: &mut zmq::Socket, req: Req, rep: Rep) {
-//         proto_request(sock_tx, req);
-//         let rep_msg = sock_rx.recv_msg(0).unwrap();
-//         assert_eq!(Rep::decode(&rep_msg), Ok(rep));
-//     }
+        let rx_addr = format!("inproc://{}_rxtx", base_addr);
+        sock_master_slave_rx.bind(&rx_addr).unwrap();
+        sock_slave_master_tx.connect(&rx_addr).unwrap();
 
-//     fn with_worker<WF, MF>(base_addr: &str, worker_fn: WF, master_fn: MF)
-//         where WF: FnOnce(zmq::Socket, zmq::Socket) + Send + 'static, MF: FnOnce(&mut zmq::Socket, &mut zmq::Socket) + Send + 'static
-//     {
-//         let mut ctx = zmq::Context::new();
-//         let mut sock_master_slave_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_master_slave_rx = ctx.socket(zmq::PULL).unwrap();
-//         let mut sock_slave_master_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_slave_master_rx = ctx.socket(zmq::PULL).unwrap();
+        let (chan_master_slave_tx, chan_slave_master_rx) = channel();
+        let (chan_slave_master_tx, chan_master_slave_rx) = channel();
 
-//         let tx_addr = format!("inproc://{}_txrx", base_addr);
-//         sock_master_slave_tx.bind(&tx_addr).unwrap();
-//         sock_slave_master_rx.connect(&tx_addr).unwrap();
-//         let rx_addr = format!("inproc://{}_rxtx", base_addr);
-//         sock_master_slave_rx.bind(&rx_addr).unwrap();
-//         sock_slave_master_tx.connect(&rx_addr).unwrap();
+        let worker = spawn(move || worker_fn(sock_slave_master_tx, chan_slave_master_tx, chan_slave_master_rx));
+        master_fn(sock_master_slave_rx, chan_master_slave_tx, chan_master_slave_rx);
+        worker.join().unwrap();
+    }
 
-//         let worker = spawn(move || worker_fn(sock_slave_master_tx, sock_slave_master_rx));
-//         master_fn(&mut sock_master_slave_tx, &mut sock_master_slave_rx);
-//         assert_request_reply(&mut sock_master_slave_tx, &mut sock_master_slave_rx,
-//                              Req::Local(LocalReq::Stop),
-//                              Rep::Local(LocalRep::Stopped));
-//         worker.join().unwrap();
-//     }
+    fn assert_worker_cmd<Req, Rep>(sock: &mut zmq::Socket, tx: &Sender<Message<Req>>, rx: &Receiver<Message<Rep>>, req: Req, rep: Rep) 
+        where Rep: PartialEq + Debug
+    {
+        tx_chan(req, None, tx);
+        assert_eq!(sock.recv_bytes(0).unwrap(), &[]);
+        assert_eq!(rx.recv().unwrap().load, rep);
+    }
 
-//     #[test]
-//     fn pq_worker() {
-//         let pq = pq::PQueue::new(3);
-//         with_worker(
-//             "pq",
-//             move |sock_pq_master_tx, sock_pq_master_rx| worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq),
-//             move |sock_master_pq_tx, sock_master_pq_rx| {
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(3)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                      Rep::Local(LocalRep::Lent(0)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(2)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                      Rep::Local(LocalRep::Lent(1)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(1)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Repay(1, RepayStatus::Front)),
-//                                      Rep::GlobalOk(GlobalRep::Repaid));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(2)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                      Rep::Local(LocalRep::Lent(1)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(1)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Lend { timeout: 1000, }),
-//                                      Rep::Local(LocalRep::Lent(2)));
-//                 assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                      Req::Global(GlobalReq::Count),
-//                                      Rep::GlobalOk(GlobalRep::Counted(0)));
-//                 {
-//                     let start = SteadyTime::now();
-//                     assert_request_reply(sock_master_pq_tx, sock_master_pq_rx,
-//                                          Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                          Rep::Local(LocalRep::Lent(2)));
-//                     let interval = SteadyTime::now() - start;
-//                     assert_eq!(interval.num_seconds(), 1);
-//                 }
-//             });
-//     }
+    fn rnd_kv() -> (Key, Value) {
+        let mut rng = thread_rng();
+        let key_len = rng.gen_range(1, 64);
+        let value_len = rng.gen_range(1, 64);
+        (Arc::new(sample(&mut rng, 0 .. 255, key_len)),
+         Arc::new(sample(&mut rng, 0 .. 255, value_len)))
+    }
 
-//     #[test]
-//     fn db_worker() {
-//         let path = "/tmp/spiderq_main";
-//         let _ = fs::remove_dir_all(path);
-//         let db = db::Database::new(path, false).unwrap();
-//         with_worker(
-//             "pq",
-//             move |sock_db_master_tx, sock_db_master_rx| worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db),
-//             move |sock_master_db_tx, sock_master_db_rx| {
-//                 let user_data_0 = "some user data #0".as_bytes();
+    #[test]
+    fn db_worker() {
+        let path = "/tmp/spiderq_main";
+        let _ = fs::remove_dir_all(path);
+        let db = db::Database::new(path, 16).unwrap();
+        with_worker(
+            "db",
+            move |sock_db_master_tx, chan_tx, chan_rx| worker_db(sock_db_master_tx, chan_tx, chan_rx, db).unwrap(),
+            move |mut sock, tx, rx| {
+                let ((key_a, value_a), (key_b, value_b), (key_c, value_c)) = (rnd_kv(), rnd_kv(), rnd_kv());
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Global(GlobalReq::Add(key_a.clone(), value_a.clone())),
+                                  DbRep::Local(DbLocalRep::Added(key_a.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Global(GlobalReq::Add(key_a.clone(), value_b.clone())),
+                                  DbRep::Global(GlobalRep::Kept));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Global(GlobalReq::Add(key_b.clone(), value_b.clone())),
+                                  DbRep::Local(DbLocalRep::Added(key_b.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Local(DbLocalReq::LoadLent(key_a.clone())),
+                                  DbRep::Global(GlobalRep::Lent(key_a.clone(), value_a.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Local(DbLocalReq::LoadLent(key_b.clone())),
+                                  DbRep::Global(GlobalRep::Lent(key_b.clone(), value_b.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Local(DbLocalReq::LoadLent(key_c.clone())),
+                                  DbRep::Global(GlobalRep::Error(ProtoError::DbQueueOutOfSync(key_c.clone()))));
+                tx_chan(DbReq::Local(DbLocalReq::RepayUpdate(key_a.clone(), value_c.clone())), None, &tx);
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Local(DbLocalReq::LoadLent(key_a.clone())),
+                                  DbRep::Global(GlobalRep::Lent(key_a.clone(), value_c.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx, DbReq::Local(DbLocalReq::Stop), DbRep::Local(DbLocalRep::Stopped));
+            });
+    }
 
-//                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
-//                                      Req::Global(GlobalReq::Add(None)),
-//                                      Rep::Local(LocalRep::Added(0)));
-//                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
-//                                      Req::Global(GlobalReq::Add(Some(user_data_0))),
-//                                      Rep::Local(LocalRep::Added(1)));
-//                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
-//                                      Req::Local(LocalReq::Load(0)),
-//                                      Rep::GlobalOk(GlobalRep::Lent(0, None)));
-//                 assert_request_reply(sock_master_db_tx, sock_master_db_rx,
-//                                      Req::Local(LocalReq::Load(1)),
-//                                      Rep::GlobalOk(GlobalRep::Lent(1, Some(user_data_0))));
-//             });
-//     }
-
-//     fn assert_request_reply_ext(sock: &mut zmq::Socket, req: Req, rep: Rep) {
-//         proto_request(sock, req);
-//         let rep_msg = sock.recv_msg(0).unwrap();
-//         assert_eq!(Rep::decode(&rep_msg), Ok(rep));
-//     }
-
-//     #[test]
-//     fn full_server() {
-//         let path = "/tmp/spiderq_master";
-//         let _ = fs::remove_dir_all(path);
-//         let db = db::Database::new(path, false).unwrap();
-//         let pq = pq::PQueue::new(0);
-//         let mut ctx = zmq::Context::new();
-//         let mut sock_master_ext_peer = ctx.socket(zmq::REQ).unwrap();
-//         let mut sock_master_ext = ctx.socket(zmq::ROUTER).unwrap();
-//         let mut sock_master_db_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_master_db_rx = ctx.socket(zmq::PULL).unwrap();
-//         let mut sock_master_pq_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_master_pq_rx = ctx.socket(zmq::PULL).unwrap();
-//         let mut sock_db_master_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_db_master_rx = ctx.socket(zmq::PULL).unwrap();
-//         let mut sock_pq_master_tx = ctx.socket(zmq::PUSH).unwrap();
-//         let mut sock_pq_master_rx = ctx.socket(zmq::PULL).unwrap();
-
-//         sock_master_ext_peer.bind("inproc://test_master_ext_txrx").unwrap();
-//         sock_master_ext.connect("inproc://test_master_ext_txrx").unwrap();
-
-//         sock_master_db_tx.bind("inproc://test_master_db_txrx").unwrap();
-//         sock_db_master_rx.connect("inproc://test_master_db_txrx").unwrap();
-//         sock_master_db_rx.bind("inproc://test_master_db_rxtx").unwrap();
-//         sock_db_master_tx.connect("inproc://test_master_db_rxtx").unwrap();
-
-//         sock_master_pq_tx.bind("inproc://test_master_pq_txrx").unwrap();
-//         sock_pq_master_rx.connect("inproc://test_master_pq_txrx").unwrap();
-//         sock_master_pq_rx.bind("inproc://test_master_pq_rxtx").unwrap();
-//         sock_pq_master_tx.connect("inproc://test_master_pq_rxtx").unwrap();
-
-//         let worker_db = spawn(move || worker_db_entrypoint(sock_db_master_tx, sock_db_master_rx, db));
-//         let worker_pq = spawn(move || worker_pq_entrypoint(sock_pq_master_tx, sock_pq_master_rx, pq));
-//         let master_thread = spawn(move || master(&mut sock_master_ext,
-//                                                  &mut sock_master_db_tx,
-//                                                  &mut sock_master_db_rx,
-//                                                  &mut sock_master_pq_tx,
-//                                                  &mut sock_master_pq_rx).unwrap());
-
-//         let entry_a = "Entry A".as_bytes();
-//         let entry_b = "Entry B".as_bytes();
-//         let entry_c = "Entry C".as_bytes();
-
-//         // first fill
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_a))), Rep::GlobalOk(GlobalRep::Added(0)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(1)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_b))), Rep::GlobalOk(GlobalRep::Added(1)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(2)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Add(Some(entry_c))), Rep::GlobalOk(GlobalRep::Added(2)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(3)));
-//         // lend one and repay it back
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                  Rep::GlobalOk(GlobalRep::Lent(0, Some(entry_a))));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(2)));
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Repay(0, RepayStatus::Front)),
-//                                  Rep::GlobalOk(GlobalRep::Repaid));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(3)));
-//         // lend all entries
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                  Rep::GlobalOk(GlobalRep::Lent(0, Some(entry_a))));
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Lend { timeout: 1000, }),
-//                                  Rep::GlobalOk(GlobalRep::Lent(1, Some(entry_b))));
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                  Rep::GlobalOk(GlobalRep::Lent(2, Some(entry_c))));
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Global(GlobalReq::Count), Rep::GlobalOk(GlobalRep::Counted(0)));
-//         // check blocking
-//         {
-//             let start = SteadyTime::now();
-//             assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                      Req::Global(GlobalReq::Lend { timeout: 10000, }),
-//                                      Rep::GlobalOk(GlobalRep::Lent(1, Some(entry_b))));
-//             let interval = SteadyTime::now() - start;
-//             assert_eq!(interval.num_seconds(), 1);
-//         }
-
-//         assert_request_reply_ext(&mut sock_master_ext_peer,
-//                                  Req::Global(GlobalReq::Stats),
-//                                  Rep::GlobalOk(GlobalRep::StatsGot { 
-//                                      count: 7,
-//                                      add: 3,
-//                                      lend: 5,
-//                                      repay: 1,
-//                                      stats: 1,
-//                                  }));
-
-//         assert_request_reply_ext(&mut sock_master_ext_peer, Req::Local(LocalReq::Stop), Rep::Local(LocalRep::Stopped));
-//         master_thread.join().unwrap();
-//         worker_pq.join().unwrap();
-//         worker_db.join().unwrap();
-//     }
+    #[test]
+    fn pq_worker() {
+        let pq = pq::PQueue::new();
+        with_worker(
+            "pq",
+            move |sock_pq_master_tx, chan_tx, chan_rx| worker_pq(sock_pq_master_tx, chan_tx, chan_rx, pq).unwrap(),
+            move |mut sock, tx, rx| {
+                assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::Stop), PqRep::Local(PqLocalRep::Stopped));
+            });
+    }
 }
 
