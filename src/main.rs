@@ -26,7 +26,6 @@ pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
     Zmq(ZmqError),
-    Proto(ProtoError),
     InvalidFlushLimit(ParseIntError),
 }
 
@@ -147,7 +146,7 @@ pub struct Message<R> {
     load: R,
 }
 
-pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, GlobalReq), Error> {
+pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq, ProtoError>), Error> {
     let mut frames = Vec::new();
     loop {
         frames.push(try!(sock.recv_msg(0).map_err(|e| Error::Zmq(ZmqError::Recv(e)))));
@@ -157,7 +156,7 @@ pub fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, GlobalReq), E
     }
 
     let load_msg = frames.pop().unwrap();
-    Ok((Some(frames), try!(GlobalReq::decode(&load_msg).map(|p| p.0).map_err(|e| Error::Proto(e)))))
+    Ok((Some(frames), GlobalReq::decode(&load_msg).map(|p| p.0)))
 }
 
 pub fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
@@ -321,7 +320,11 @@ pub fn master(mut sock_ext: zmq::Socket,
 
         if avail_socks[0] {
             // sock_ext is online
-            pending_queue.push(try!(rx_sock(&mut sock_ext)));
+            match rx_sock(&mut sock_ext) {
+                Ok((headers, Ok(req))) => pending_queue.push((headers, req)),
+                Ok((headers, Err(e))) => try!(tx_sock(GlobalRep::Error(e), headers, &mut sock_ext)),
+                Err(e) => return Err(e),
+            }
         }
 
         if avail_socks[1] {
