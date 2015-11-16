@@ -108,12 +108,14 @@ pub enum PqLocalReq {
     LendUntil(u64, SteadyTime),
     RepayTimedOut,
     RepayQueue(Key, RepayStatus),
+    Heartbeat(Key, SteadyTime),
     Stop,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum DbLocalRep {
     Added(Key),
+    Updated(Key),
     Stopped,
 }
 
@@ -214,6 +216,10 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                     try!(tx_chan_n(DbRep::Local(DbLocalRep::Added(key)), req.headers, &chan_tx, &mut sock_tx))
                 }
             },
+            DbReq::Global(GlobalReq::Update(key, value)) => {
+                db.insert(key.clone(), value);
+                try!(tx_chan_n(DbRep::Local(DbLocalRep::Updated(key)), req.headers, &chan_tx, &mut sock_tx));
+            },
             DbReq::Global(..) =>
                 unreachable!(),
             DbReq::Local(DbLocalReq::LoadLent(key)) =>
@@ -256,6 +262,10 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                 },
             PqReq::Local(PqLocalReq::RepayQueue(key, status)) =>
                 pq.repay(key, status),
+            PqReq::Local(PqLocalReq::Heartbeat(ref key, trigger_at)) => {
+                pq.heartbeat(key, trigger_at);
+                try!(tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx));
+            },
             PqReq::Local(PqLocalReq::NextTrigger) =>
                 try!(tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)),
             PqReq::Local(PqLocalReq::RepayTimedOut) =>
@@ -286,8 +296,10 @@ fn master(mut sock_ext: zmq::Socket,
 
     let mut stats_count = 0;
     let mut stats_add = 0;
+    let mut stats_update = 0;
     let mut stats_lend = 0;
     let mut stats_repay = 0;
+    let mut stats_heartbeat = 0;
     let mut stats_stats = 0;
 
     let (mut incoming_queue, mut pending_queue) = (Vec::new(), Vec::new());
@@ -390,6 +402,11 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_add += 1;
                         try!(tx_sock(GlobalRep::Added, message.headers, &mut sock_ext));
                     },
+                    DbRep::Local(DbLocalRep::Updated(key)) => {
+                        tx_chan(PqReq::Local(PqLocalReq::Enqueue(key)), None, &chan_pq_tx);
+                        stats_update += 1;
+                        try!(tx_sock(GlobalRep::Updated, message.headers, &mut sock_ext));
+                    },
                     DbRep::Local(DbLocalRep::Stopped) =>
                         stop_state = match stop_state {
                             StopState::NotTriggered | StopState::WaitingPq(..) | StopState::Finished(..) => unreachable!(),
@@ -415,6 +432,10 @@ fn master(mut sock_ext: zmq::Socket,
                 Ok(message) => match message.load {
                     PqRep::Global(rep @ GlobalRep::Counted(..)) => {
                         stats_count += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
+                    PqRep::Global(rep @ GlobalRep::Heartbeaten) => {
+                        stats_heartbeat += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
                     PqRep::Global(..) =>
@@ -448,6 +469,8 @@ fn master(mut sock_ext: zmq::Socket,
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
                 req @ GlobalReq::Add(..) =>
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
+                req @ GlobalReq::Update(..) =>
+                    tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 GlobalReq::Lend { timeout: t, } => {
                     let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
                     tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at)), headers, &chan_pq_tx);
@@ -459,12 +482,18 @@ fn master(mut sock_ext: zmq::Socket,
                     stats_repay += 1;
                     try!(tx_sock(GlobalRep::Repaid, headers, &mut sock_ext));
                 },
+                GlobalReq::Heartbeat { key: k, timeout: t, } => {
+                    let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
+                    tx_chan(PqReq::Local(PqLocalReq::Heartbeat(k, trigger_at)), headers, &chan_pq_tx);
+                },
                 GlobalReq::Stats => {
                     stats_stats += 1;
                     try!(tx_sock(GlobalRep::StatsGot { count: stats_count,
                                                        add: stats_add,
+                                                       update: stats_update,
                                                        lend: stats_lend,
                                                        repay: stats_repay,
+                                                       heartbeat: stats_heartbeat,
                                                        stats: stats_stats, }, headers, &mut sock_ext));
                 },
                 GlobalReq::Terminate => {
