@@ -32,6 +32,7 @@ pub enum GlobalRep {
     Added,
     Kept,
     Updated,
+    NotFound,
     Lent(Key, Value),
     Repaid,
     Heartbeaten,
@@ -255,16 +256,18 @@ impl GlobalRep {
                 Ok((GlobalRep::Kept, buf)),
             (4, buf) =>
                 Ok((GlobalRep::Updated, buf)),
-            (5, buf) => {
+            (5, buf) =>
+                Ok((GlobalRep::NotFound, buf)),
+            (6, buf) => {
                 let (key, buf) = try_get_vec!(buf, NotEnoughDataForGlobalRepLentKeyLen, NotEnoughDataForGlobalRepLentKey);
                 let (value, buf) = try_get_vec!(buf, NotEnoughDataForGlobalRepLentValueLen, NotEnoughDataForGlobalRepLentValue);
                 Ok((GlobalRep::Lent(key, value), buf))
             },
-            (6, buf) =>
-                Ok((GlobalRep::Repaid, buf)),
             (7, buf) =>
+                Ok((GlobalRep::Repaid, buf)),
+            (8, buf) =>
                 Ok((GlobalRep::Heartbeaten, buf)),
-            (8, buf) => {
+            (9, buf) => {
                 let (stats_count, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsCount);
                 let (stats_add, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsAdd);
                 let (stats_update, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsUpdate);
@@ -280,11 +283,11 @@ impl GlobalRep {
                                           heartbeat: stats_heartbeat as usize,
                                           stats: stats_stats as usize, }, buf))
             },
-            (9, buf) => {
+            (10, buf) => {
                 let (err, buf) = try!(ProtoError::decode(buf));
                 Ok((GlobalRep::Error(err), buf))
             },
-            (10, buf) =>
+            (11, buf) =>
                 Ok((GlobalRep::Terminated, buf)),
             (tag, _) =>
                 return Err(ProtoError::InvalidGlobalRepTag(tag)),
@@ -297,6 +300,7 @@ impl GlobalRep {
             &GlobalRep::Added |
             &GlobalRep::Kept |
             &GlobalRep::Updated |
+            &GlobalRep::NotFound |
             &GlobalRep::Repaid |
             &GlobalRep::Heartbeaten |
             &GlobalRep::Terminated => 0,
@@ -318,16 +322,18 @@ impl GlobalRep {
                 put_adv!(area, u8, write_u8, 3),
             &GlobalRep::Updated =>
                 put_adv!(area, u8, write_u8, 4),
+            &GlobalRep::NotFound =>
+                put_adv!(area, u8, write_u8, 5),
             &GlobalRep::Lent(ref key, ref value) => {
-                let area = put_adv!(area, u8, write_u8, 5);
+                let area = put_adv!(area, u8, write_u8, 6);
                 let area = put_vec_adv!(area, key);
                 let area = put_vec_adv!(area, value);
                 area
             },
             &GlobalRep::Repaid =>
-                put_adv!(area, u8, write_u8, 6),
-            &GlobalRep::Heartbeaten =>
                 put_adv!(area, u8, write_u8, 7),
+            &GlobalRep::Heartbeaten =>
+                put_adv!(area, u8, write_u8, 8),
             &GlobalRep::StatsGot { count: stats_count,
                                    add: stats_add,
                                    update: stats_update,
@@ -335,7 +341,7 @@ impl GlobalRep {
                                    repay: stats_repay,
                                    heartbeat: stats_heartbeat,
                                    stats: stats_stats, } => {
-                let area = put_adv!(area, u8, write_u8, 8);
+                let area = put_adv!(area, u8, write_u8, 9);
                 let area = put_adv!(area, u64, write_u64, stats_count as u64);
                 let area = put_adv!(area, u64, write_u64, stats_add as u64);
                 let area = put_adv!(area, u64, write_u64, stats_update as u64);
@@ -346,11 +352,11 @@ impl GlobalRep {
                 area
             },
             &GlobalRep::Error(ref err) => {
-                let area = put_adv!(area, u8, write_u8, 9);
+                let area = put_adv!(area, u8, write_u8, 10);
                 err.encode(area)
             },
             &GlobalRep::Terminated =>
-                put_adv!(area, u8, write_u8, 10),
+                put_adv!(area, u8, write_u8, 11),
         }
     }
 }
@@ -644,6 +650,11 @@ mod test {
     #[test]
     fn globalrep_updated() {
         assert_encode_decode_rep(GlobalRep::Updated);
+    }
+
+    #[test]
+    fn globalrep_notfound() {
+        assert_encode_decode_rep(GlobalRep::NotFound);
     }
 
     #[test]

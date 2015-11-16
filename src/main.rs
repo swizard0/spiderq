@@ -216,8 +216,12 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                 }
             },
             DbReq::Global(GlobalReq::Update(key, value)) => {
-                db.insert(key.clone(), value);
-                try!(tx_chan_n(DbRep::Global(GlobalRep::Updated), req.headers, &chan_tx, &mut sock_tx));
+                if db.lookup(&key).is_some() {
+                    db.insert(key.clone(), value);
+                    try!(tx_chan_n(DbRep::Global(GlobalRep::Updated), req.headers, &chan_tx, &mut sock_tx))
+                } else {
+                    try!(tx_chan_n(DbRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx))
+                }
             },
             DbReq::Global(..) =>
                 unreachable!(),
@@ -617,6 +621,9 @@ mod test {
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   DbReq::Local(DbLocalReq::LoadLent(key_b.clone())),
                                   DbRep::Global(GlobalRep::Lent(key_b.clone(), value_c.clone())));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  DbReq::Global(GlobalReq::Update(key_c.clone(), value_c.clone())),
+                                  DbRep::Global(GlobalRep::NotFound));
                 assert_worker_cmd(&mut sock, &tx, &rx, DbReq::Local(DbLocalReq::Stop), DbRep::Local(DbLocalRep::Stopped));
             });
     }
