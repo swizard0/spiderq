@@ -109,11 +109,11 @@ impl PQueue {
     
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { key: k, .. }) = self.lentq.pop() {
-            self.repay(k, RepayStatus::Front)
+            self.repay(k, RepayStatus::Front);
         }
     }
 
-    pub fn repay(&mut self, key: Key, status: RepayStatus) {
+    pub fn repay(&mut self, key: Key, status: RepayStatus) -> bool {
         if let Some(LendSnapshot { mut entry, .. }) = self.lentm.remove(&key) {
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
@@ -123,14 +123,17 @@ impl PQueue {
                 RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
                 RepayStatus::Reward => { entry.boost += 1; entry.boost },
                 RepayStatus::Front => 0,
-                RepayStatus::Drop => return,
+                RepayStatus::Drop => return true,
             };
             self.serial += 1;
             entry.priority = match status {
                 RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
             };
-            self.queue.push(entry)
+            self.queue.push(entry);
+            true
+        } else {
+            false
         }
     }
 
@@ -174,7 +177,7 @@ mod test {
         pq.heartbeat(&as_key(0), time + Duration::seconds(13)); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
         pq.heartbeat(&as_key(1), time + Duration::seconds(7)); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(7)));
-        pq.repay(as_key(1), RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
+        assert!(pq.repay(as_key(1), RepayStatus::Reward)); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(13)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
@@ -211,7 +214,7 @@ mod test {
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(15)); // | <0/10> <1/15>
         assert_eq!(pq.len(), 0);
-        pq.repay(as_key(1), RepayStatus::Penalty); // 1 | <0/10>
+        assert!(pq.repay(as_key(1), RepayStatus::Penalty)); // 1 | <0/10>
         assert_eq!(pq.top(), Some(as_key(1)));
         pq.lend(time + Duration::seconds(20)); // | <0/10> <1/20>
         assert_eq!(pq.len(), 0);
