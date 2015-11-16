@@ -29,6 +29,12 @@ struct LentEntry {
     snapshot: u64,
 }
 
+struct LendSnapshot {
+    entry: PQueueEntry,
+    serial: u64,
+    recycle: Option<SteadyTime>,
+}
+
 impl Ord for LentEntry {
     fn cmp(&self, other: &LentEntry) -> Ordering {
         other.trigger_at.cmp(&self.trigger_at)
@@ -44,7 +50,7 @@ impl PartialOrd for LentEntry {
 pub struct PQueue {
     serial: u64,
     queue: BinaryHeap<PQueueEntry>,
-    lentm: HashMap<Key, (u64, PQueueEntry)>,
+    lentm: HashMap<Key, LendSnapshot>,
     lentq: BinaryHeap<LentEntry>,
 }
 
@@ -74,22 +80,29 @@ impl PQueue {
     pub fn lend(&mut self, trigger_at: SteadyTime)  {
         if let Some(entry) = self.queue.pop() {
             self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
-            self.lentm.insert(entry.key.clone(), (self.serial, entry));
+            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
         }
     }
 
     pub fn next_timeout(&mut self) -> Option<SteadyTime> {
         loop {
-            if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
-                match self.lentm.get(k) {
-                    Some(&(mshot, _)) if mshot == qshot => return Some(trigger),
-                    _ => (),
+            let do_recycle = if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
+                match self.lentm.get_mut(k) {
+                    Some(ref mut snapshot) if snapshot.recycle.is_some() =>
+                        snapshot.recycle.take(),
+                    Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
+                        return Some(trigger),
+                    _ =>
+                        None,
                 }
             } else {
                 break
-            }
+            };
 
-            self.lentq.pop();
+            self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
+                entry.trigger_at = reschedule;
+                self.lentq.push(entry);
+            });
         }
         None
     }
@@ -101,7 +114,7 @@ impl PQueue {
     }
 
     pub fn repay(&mut self, key: Key, status: RepayStatus) {
-        if let Some((_, mut entry)) = self.lentm.remove(&key) {
+        if let Some(LendSnapshot { mut entry, .. }) = self.lentm.remove(&key) {
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
@@ -118,6 +131,12 @@ impl PQueue {
                 _ => self.serial - (region - (region >> current_boost)),
             };
             self.queue.push(entry)
+        }
+    }
+
+    pub fn heartbeat(&mut self, key: &Key, trigger_at: SteadyTime) {
+        if let Some(snapshot) = self.lentm.get_mut(key) {
+            snapshot.recycle = Some(trigger_at);
         }
     }
 }
@@ -152,9 +171,12 @@ mod test {
         pq.lend(time + Duration::seconds(5)); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        pq.repay(as_key(1), RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/10>
+        pq.heartbeat(&as_key(0), time + Duration::seconds(13)); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
+        pq.heartbeat(&as_key(1), time + Duration::seconds(7)); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(7)));
+        pq.repay(as_key(1), RepayStatus::Reward); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
         assert_eq!(pq.top(), Some(as_key(2)));
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(13)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
         assert_eq!(pq.next_timeout(), None);
         assert_eq!(pq.top(), Some(as_key(0)));
@@ -198,5 +220,34 @@ mod test {
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
         assert_eq!(pq.top(), Some(as_key(0)));
     }
-}
 
+    #[test]
+    fn several_heartbeats() {
+        let time = SteadyTime::now();
+        let mut pq = make_pq(3); // 0 1 2 |
+        assert_eq!(pq.top(), Some(as_key(0)));
+        pq.lend(time + Duration::seconds(10)); // 1 2 | <0/10>
+        assert_eq!(pq.top(), Some(as_key(1)));
+        pq.lend(time + Duration::seconds(15)); // 2 | <0/10> <1/15>
+        assert_eq!(pq.top(), Some(as_key(2)));
+        pq.lend(time + Duration::seconds(20)); // | <0/10> <1/15> <2/20>
+        assert_eq!(pq.len(), 0);
+        pq.heartbeat(&as_key(1), time + Duration::seconds(17)); // | <0/10> <1/17> <2/20>
+        pq.heartbeat(&as_key(1), time + Duration::seconds(18)); // | <0/10> <1/18> <2/20>
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
+        pq.heartbeat(&as_key(0), time + Duration::seconds(19)); // | <1/18> <0/19> <2/20>
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(18)));
+        pq.heartbeat(&as_key(1), time + Duration::seconds(21)); // | <0/19> <2/20> <1/21>
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(19)));
+        pq.heartbeat(&as_key(0), time + Duration::seconds(22)); // | <2/20> <1/21> <0/22>
+        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
+        pq.repay_timed_out(); // 2 | <1/21> <0/22>
+        assert_eq!(pq.top(), Some(as_key(2)));
+        pq.lend(time + Duration::seconds(100)); // | <1/21> <0/22> <2/100>
+        pq.repay_timed_out(); // 1 | <0/22> <2/100>
+        assert_eq!(pq.top(), Some(as_key(1)));
+        pq.lend(time + Duration::seconds(101)); // | <0/22> <2/100> <1/101>
+        pq.repay_timed_out(); // 0 | <2/100> <1/101>
+        assert_eq!(pq.top(), Some(as_key(0)));
+    }
+}
