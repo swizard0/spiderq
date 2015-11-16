@@ -396,13 +396,22 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_update += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    DbRep::Global(rep @ GlobalRep::NotFound) => {
+                        stats_update += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
                     DbRep::Global(rep @ GlobalRep::Lent(..)) => {
                         stats_lend += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
                     DbRep::Global(rep @ GlobalRep::Error(..)) =>
                         try!(tx_sock(rep, message.headers, &mut sock_ext)),
-                    DbRep::Global(..) =>
+                    DbRep::Global(GlobalRep::Counted(..)) |
+                    DbRep::Global(GlobalRep::Added) |
+                    DbRep::Global(GlobalRep::Repaid) |
+                    DbRep::Global(GlobalRep::Heartbeaten) |
+                    DbRep::Global(GlobalRep::StatsGot { .. }) |
+                    DbRep::Global(GlobalRep::Terminated) =>
                         unreachable!(),
                     DbRep::Local(DbLocalRep::Added(key)) => {
                         tx_chan(PqReq::Local(PqLocalReq::Enqueue(key)), None, &chan_pq_tx);
@@ -440,7 +449,15 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_heartbeat += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
-                    PqRep::Global(..) =>
+                    PqRep::Global(GlobalRep::Added) |
+                    PqRep::Global(GlobalRep::Kept) |
+                    PqRep::Global(GlobalRep::Updated) |
+                    PqRep::Global(GlobalRep::NotFound) |
+                    PqRep::Global(GlobalRep::Lent(..)) |
+                    PqRep::Global(GlobalRep::Repaid) |
+                    PqRep::Global(GlobalRep::StatsGot { .. }) |
+                    PqRep::Global(GlobalRep::Terminated) |
+                    PqRep::Global(GlobalRep::Error(..)) =>
                         unreachable!(),
                     PqRep::Local(PqLocalRep::Lent(key)) => {
                         tx_chan(DbReq::Local(DbLocalReq::LoadLent(key)), message.headers, &chan_db_tx);
