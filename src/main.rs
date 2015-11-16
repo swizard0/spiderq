@@ -274,8 +274,11 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                 }
             },
             PqReq::Local(PqLocalReq::Heartbeat(ref key, trigger_at)) => {
-                pq.heartbeat(key, trigger_at);
-                try!(tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx));
+                if pq.heartbeat(key, trigger_at) {
+                    try!(tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx))
+                } else {
+                    try!(tx_chan_n(PqRep::Global(GlobalRep::Skipped), req.headers, &chan_tx, &mut sock_tx))
+                }
             },
             PqReq::Local(PqLocalReq::NextTrigger) =>
                 try!(tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)),
@@ -421,6 +424,7 @@ fn master(mut sock_ext: zmq::Socket,
                     DbRep::Global(GlobalRep::Counted(..)) |
                     DbRep::Global(GlobalRep::Added) |
                     DbRep::Global(GlobalRep::Heartbeaten) |
+                    DbRep::Global(GlobalRep::Skipped) |
                     DbRep::Global(GlobalRep::StatsGot { .. }) |
                     DbRep::Global(GlobalRep::Terminated) =>
                         unreachable!(),
@@ -460,6 +464,10 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_heartbeat += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                         next_timeout = None;
+                    },
+                    PqRep::Global(rep @ GlobalRep::Skipped) => {
+                        stats_heartbeat += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
                     PqRep::Global(rep @ GlobalRep::NotFound) => {
                         stats_repay += 1;
@@ -724,6 +732,9 @@ mod test {
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::Heartbeat(key_a.clone(), now + Duration::milliseconds(1000))),
                                   PqRep::Global(GlobalRep::Heartbeaten));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::Heartbeat(key_b.clone(), now + Duration::milliseconds(1000))),
+                                  PqRep::Global(GlobalRep::Skipped));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::NextTrigger),
                                   PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(1000)))));

@@ -137,9 +137,12 @@ impl PQueue {
         }
     }
 
-    pub fn heartbeat(&mut self, key: &Key, trigger_at: SteadyTime) {
+    pub fn heartbeat(&mut self, key: &Key, trigger_at: SteadyTime) -> bool {
         if let Some(snapshot) = self.lentm.get_mut(key) {
             snapshot.recycle = Some(trigger_at);
+            true
+        } else {
+            false
         }
     }
 }
@@ -174,8 +177,8 @@ mod test {
         pq.lend(time + Duration::seconds(5)); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_eq!(pq.top(), Some(as_key(2)));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        pq.heartbeat(&as_key(0), time + Duration::seconds(13)); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
-        pq.heartbeat(&as_key(1), time + Duration::seconds(7)); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
+        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(13))); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
+        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(7))); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(7)));
         assert!(pq.repay(as_key(1), RepayStatus::Reward)); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
         assert_eq!(pq.top(), Some(as_key(2)));
@@ -235,14 +238,14 @@ mod test {
         assert_eq!(pq.top(), Some(as_key(2)));
         pq.lend(time + Duration::seconds(20)); // | <0/10> <1/15> <2/20>
         assert_eq!(pq.len(), 0);
-        pq.heartbeat(&as_key(1), time + Duration::seconds(17)); // | <0/10> <1/17> <2/20>
-        pq.heartbeat(&as_key(1), time + Duration::seconds(18)); // | <0/10> <1/18> <2/20>
+        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(17))); // | <0/10> <1/17> <2/20>
+        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(18))); // | <0/10> <1/18> <2/20>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
-        pq.heartbeat(&as_key(0), time + Duration::seconds(19)); // | <1/18> <0/19> <2/20>
+        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(19))); // | <1/18> <0/19> <2/20>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(18)));
-        pq.heartbeat(&as_key(1), time + Duration::seconds(21)); // | <0/19> <2/20> <1/21>
+        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(21))); // | <0/19> <2/20> <1/21>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(19)));
-        pq.heartbeat(&as_key(0), time + Duration::seconds(22)); // | <2/20> <1/21> <0/22>
+        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(22))); // | <2/20> <1/21> <0/22>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
         pq.repay_timed_out(); // 2 | <1/21> <0/22>
         assert_eq!(pq.top(), Some(as_key(2)));

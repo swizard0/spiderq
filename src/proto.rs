@@ -36,6 +36,7 @@ pub enum GlobalRep {
     Lent(Key, Value),
     Repaid,
     Heartbeaten,
+    Skipped,
     StatsGot { count: usize, add: usize, update: usize, lend: usize, repay: usize, heartbeat: usize, stats: usize, },
     Terminated,
     Error(ProtoError),
@@ -267,7 +268,9 @@ impl GlobalRep {
                 Ok((GlobalRep::Repaid, buf)),
             (8, buf) =>
                 Ok((GlobalRep::Heartbeaten, buf)),
-            (9, buf) => {
+            (9, buf) =>
+                Ok((GlobalRep::Skipped, buf)),
+            (10, buf) => {
                 let (stats_count, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsCount);
                 let (stats_add, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsAdd);
                 let (stats_update, buf) = try_get!(buf, u64, read_u64, NotEnoughDataForGlobalRepStatsUpdate);
@@ -283,11 +286,11 @@ impl GlobalRep {
                                           heartbeat: stats_heartbeat as usize,
                                           stats: stats_stats as usize, }, buf))
             },
-            (10, buf) => {
+            (11, buf) => {
                 let (err, buf) = try!(ProtoError::decode(buf));
                 Ok((GlobalRep::Error(err), buf))
             },
-            (11, buf) =>
+            (12, buf) =>
                 Ok((GlobalRep::Terminated, buf)),
             (tag, _) =>
                 return Err(ProtoError::InvalidGlobalRepTag(tag)),
@@ -303,6 +306,7 @@ impl GlobalRep {
             &GlobalRep::NotFound |
             &GlobalRep::Repaid |
             &GlobalRep::Heartbeaten |
+            &GlobalRep::Skipped |
             &GlobalRep::Terminated => 0,
             &GlobalRep::Lent(ref key, ref value) => size_of::<u32>() * 2 + key.len() + value.len(),
             &GlobalRep::StatsGot { .. } => size_of::<u64>() * 7,
@@ -334,6 +338,8 @@ impl GlobalRep {
                 put_adv!(area, u8, write_u8, 7),
             &GlobalRep::Heartbeaten =>
                 put_adv!(area, u8, write_u8, 8),
+            &GlobalRep::Skipped =>
+                put_adv!(area, u8, write_u8, 9),
             &GlobalRep::StatsGot { count: stats_count,
                                    add: stats_add,
                                    update: stats_update,
@@ -341,7 +347,7 @@ impl GlobalRep {
                                    repay: stats_repay,
                                    heartbeat: stats_heartbeat,
                                    stats: stats_stats, } => {
-                let area = put_adv!(area, u8, write_u8, 9);
+                let area = put_adv!(area, u8, write_u8, 10);
                 let area = put_adv!(area, u64, write_u64, stats_count as u64);
                 let area = put_adv!(area, u64, write_u64, stats_add as u64);
                 let area = put_adv!(area, u64, write_u64, stats_update as u64);
@@ -352,11 +358,11 @@ impl GlobalRep {
                 area
             },
             &GlobalRep::Error(ref err) => {
-                let area = put_adv!(area, u8, write_u8, 10);
+                let area = put_adv!(area, u8, write_u8, 11);
                 err.encode(area)
             },
             &GlobalRep::Terminated =>
-                put_adv!(area, u8, write_u8, 11),
+                put_adv!(area, u8, write_u8, 12),
         }
     }
 }
@@ -671,6 +677,11 @@ mod test {
     #[test]
     fn globalrep_heartbeaten() {
         assert_encode_decode_rep(GlobalRep::Heartbeaten);
+    }
+
+    #[test]
+    fn globalrep_skipped() {
+        assert_encode_decode_rep(GlobalRep::Skipped);
     }
 
     #[test]
