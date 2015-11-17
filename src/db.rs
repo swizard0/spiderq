@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::thread::{spawn, JoinHandle};
 use std::collections::HashMap;
+use std::collections::hash_map;
+use std::iter::Iterator;
 use tempdir::TempDir;
 use byteorder::{ReadBytesExt, WriteBytesExt, ByteOrder, NativeEndian};
 use super::proto::{Key, Value};
@@ -61,6 +63,20 @@ impl Snapshot {
                 }
 
                 None
+            }
+        }
+    }
+
+    fn indices_refs<'a, 'b>(&'a self, refs: &'b mut Vec<&'a Index>) {
+        match self {
+            &Snapshot::Memory(ref idx) => refs.push(&*idx),
+            &Snapshot::Frozen(ref idx) => refs.push(&*idx),
+            &Snapshot::Persisting { index: ref idx, .. } => refs.push(&*idx),
+            &Snapshot::Persisted(ref idx) => refs.push(&*idx),
+            &Snapshot::Merging { indices: ref idxs, .. } => {
+                for idx in idxs.iter() {
+                    refs.push(&*idx)
+                }
             }
         }
     }
@@ -252,6 +268,19 @@ impl Database {
             break;
         }
     }
+
+    pub fn iter<'a>(&'a self) -> Iter<'a> {
+        let mut indices = Vec::new();
+        for snapshot in self.snapshots.iter() {
+            snapshot.indices_refs(&mut indices);
+        }
+
+        Iter {
+            indices: indices,
+            index: 0,
+            iter: None,
+        }
+    }
 }
 
 impl Drop for Database {
@@ -259,6 +288,42 @@ impl Drop for Database {
         self.update_snapshots(true);
     }
 }
+
+pub struct Iter<'a> {
+    indices: Vec<&'a Index>,
+    index: usize,
+    iter: Option<hash_map::Iter<'a, Key, Value>>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a Key, &'a Value);
+
+    fn next(&mut self) -> Option<(&'a Key, &'a Value)> {
+        while self.index < self.indices.len() {
+            if let Some(ref mut map_iter) = self.iter {
+                while let Some((key, value)) = map_iter.next() {
+                    if self.indices[0 .. self.index]
+                        .iter()
+                        .rev()
+                        .any(|older_index| older_index.contains_key(key)) {
+                            continue
+                        }
+
+                    return Some((key, value));
+                }
+            } else {
+                self.iter = Some(self.indices[self.index].iter());
+                continue;
+            }
+
+            self.iter = None;
+            self.index += 1;
+        }
+
+        None
+    }
+}
+
 
 fn filename_as_string(filename: &PathBuf) -> String {
     filename.to_string_lossy().into_owned()
@@ -424,6 +489,24 @@ mod test {
             let db = Database::new("/tmp/spiderq_d", 160).unwrap();
             assert!(db.approx_count() <= 2560);
             check_against(&db, &check_table);
+        }
+    }
+
+    #[test]
+    fn iter() {
+        let mut check_table = HashMap::new();
+        {
+            let mut db = mkdb("/tmp/spiderq_e", 64);
+            rnd_fill_check(&mut db, &mut check_table, 1024);
+            for (k, v) in db.iter() {
+                assert_eq!(check_table.get(k), Some(v));
+            }
+        }
+        {
+            let db = Database::new("/tmp/spiderq_e", 64).unwrap();
+            for (k, v) in db.iter() {
+                assert_eq!(check_table.get(k), Some(v));
+            }
         }
     }
 }
