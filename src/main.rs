@@ -1,10 +1,11 @@
-#![feature(drain, slice_bytes)]
+#![feature(drain)]
 
 extern crate zmq;
 extern crate time;
 extern crate getopts;
 extern crate tempdir;
 extern crate byteorder;
+extern crate spiderq_proto as proto;
 #[cfg(test)] extern crate rand;
 
 use std::{io, env, mem, process};
@@ -18,7 +19,6 @@ use time::{SteadyTime, Duration};
 
 pub mod db;
 pub mod pq;
-pub mod proto;
 use proto::{Key, Value, RepayStatus, ProtoError, GlobalReq, GlobalRep};
 
 const MAX_POLL_TIMEOUT: i64 = 100;
