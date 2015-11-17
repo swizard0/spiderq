@@ -59,7 +59,12 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
 
 pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Result<(zmq::Context, JoinHandle<()>), Error> {
     let db = try!(db::Database::new(database_dir, flush_limit).map_err(|e| Error::Db(e)));
-    let pq = pq::PQueue::new();
+    let mut pq = pq::PQueue::new();
+    // initially fill pq
+    for (k, _) in db.iter() {
+        pq.add(k.clone())
+    }
+
     let mut ctx = zmq::Context::new();
     let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
     let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
