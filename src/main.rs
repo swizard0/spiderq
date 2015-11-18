@@ -265,7 +265,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Local(PqLocalReq::Enqueue(key)) =>
                 pq.add(key),
             PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at)) =>
-                if let Some(key) = pq.top() {
+                if let Some((key, _serial)) = pq.top() {
                     try!(tx_chan_n(PqRep::Local(PqLocalRep::Lent(key)), req.headers, &chan_tx, &mut sock_tx));
                     pq.lend(trigger_at)
                 } else {
