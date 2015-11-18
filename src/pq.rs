@@ -78,10 +78,13 @@ impl PQueue {
         self.queue.peek().map(|e| (e.key.clone(), self.serial))
     }
 
-    pub fn lend(&mut self, trigger_at: SteadyTime)  {
+    pub fn lend(&mut self, trigger_at: SteadyTime) -> Option<u64> {
         if let Some(entry) = self.queue.pop() {
             self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
             self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
+            Some(self.serial)
+        } else {
+            None
         }
     }
 
@@ -109,13 +112,16 @@ impl PQueue {
     }
     
     pub fn repay_timed_out(&mut self) {
-        if let Some(LentEntry { key: k, .. }) = self.lentq.pop() {
-            self.repay(k, RepayStatus::Front);
+        if let Some(LentEntry { key: k, snapshot: s, .. }) = self.lentq.pop() {
+            self.repay(s, k, RepayStatus::Front);
         }
     }
 
-    pub fn repay(&mut self, key: Key, status: RepayStatus) -> bool {
+    pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> bool {
         if let Entry::Occupied(map_entry) = self.lentm.entry(key) {
+            if lend_key != map_entry.get().serial {
+                return false
+            }
             let LendSnapshot { mut entry, .. } = map_entry.remove();
             let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
@@ -139,10 +145,14 @@ impl PQueue {
         }
     }
 
-    pub fn heartbeat(&mut self, key: &Key, trigger_at: SteadyTime) -> bool {
+    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: SteadyTime) -> bool {
         if let Some(snapshot) = self.lentm.get_mut(key) {
-            snapshot.recycle = Some(trigger_at);
-            true
+            if lend_key == snapshot.serial {
+                snapshot.recycle = Some(trigger_at);
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -178,40 +188,40 @@ mod test {
         let time = SteadyTime::now();
         let mut pq = make_pq(10); // 0 1 2 3 4 5 6 7 8 9 |
         assert_top(&pq, as_key(0));
-        pq.lend(time + Duration::seconds(10)); // 1 2 3 4 5 6 7 8 9 | 0
+        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 3 4 5 6 7 8 9 | 0
         assert_top(&pq, as_key(1));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
-        pq.lend(time + Duration::seconds(5)); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
+        let lend_key_1 = pq.lend(time + Duration::seconds(5)).unwrap(); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_top(&pq, as_key(2));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(13))); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
-        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(7))); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(13))); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(7))); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(7)));
-        assert!(pq.repay(as_key(1), RepayStatus::Reward)); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
+        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Reward)); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
         assert_top(&pq, as_key(2));
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(13)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
         assert_eq!(pq.next_timeout(), None);
         assert_top(&pq, as_key(0));
-        pq.lend(time + Duration::seconds(5)); // 2 3 4 5 (1 6) 7 8 9 | <0/5>
+        pq.lend(time + Duration::seconds(5)).unwrap(); // 2 3 4 5 (1 6) 7 8 9 | <0/5>
         assert_top(&pq, as_key(2));
-        pq.lend(time + Duration::seconds(6)); // 3 4 5 (1 6) 7 8 9 | <0/10> <2/6>
+        pq.lend(time + Duration::seconds(6)).unwrap(); // 3 4 5 (1 6) 7 8 9 | <0/10> <2/6>
         assert_top(&pq, as_key(3));
-        pq.lend(time + Duration::seconds(7)); // 4 5 (1 6) 7 8 9 | <0/10> <2/6> <3/7>
+        pq.lend(time + Duration::seconds(7)).unwrap(); // 4 5 (1 6) 7 8 9 | <0/10> <2/6> <3/7>
         assert_top(&pq, as_key(4));
-        pq.lend(time + Duration::seconds(8)); // 5 (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8>
+        pq.lend(time + Duration::seconds(8)).unwrap(); // 5 (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8>
         assert_top(&pq, as_key(5));
-        pq.lend(time + Duration::seconds(9)); // (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9>
+        pq.lend(time + Duration::seconds(9)).unwrap(); // (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9>
         assert_top(&pq, as_key(6));
-        pq.lend(time + Duration::seconds(10)); // 1 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10>
+        pq.lend(time + Duration::seconds(10)).unwrap(); // 1 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10>
         assert_top(&pq, as_key(1));
-        pq.lend(time + Duration::seconds(11)); // 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11>
+        pq.lend(time + Duration::seconds(11)).unwrap(); // 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11>
         assert_top(&pq, as_key(7));
-        pq.lend(time + Duration::seconds(12)); // 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12>
+        pq.lend(time + Duration::seconds(12)).unwrap(); // 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12>
         assert_top(&pq, as_key(8));
-        pq.lend(time + Duration::seconds(13)); // 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12> <8/13>
+        pq.lend(time + Duration::seconds(13)).unwrap(); // 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12> <8/13>
         assert_top(&pq, as_key(9));
-        pq.lend(time + Duration::seconds(14)); // | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12> <8/13> <9/13>
+        pq.lend(time + Duration::seconds(14)).unwrap(); // | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12> <8/13> <9/13>
         assert_eq!(pq.len(), 0);
     }
 
@@ -220,13 +230,13 @@ mod test {
         let time = SteadyTime::now();
         let mut pq = make_pq(2); // 0 1 |
         assert_top(&pq, as_key(0));
-        pq.lend(time + Duration::seconds(10)); // 1 | <0/10>
+        pq.lend(time + Duration::seconds(10)).unwrap(); // 1 | <0/10>
         assert_top(&pq, as_key(1));
-        pq.lend(time + Duration::seconds(15)); // | <0/10> <1/15>
+        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap(); // | <0/10> <1/15>
         assert_eq!(pq.len(), 0);
-        assert!(pq.repay(as_key(1), RepayStatus::Penalty)); // 1 | <0/10>
+        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Penalty)); // 1 | <0/10>
         assert_top(&pq, as_key(1));
-        pq.lend(time + Duration::seconds(20)); // | <0/10> <1/20>
+        pq.lend(time + Duration::seconds(20)).unwrap(); // | <0/10> <1/20>
         assert_eq!(pq.len(), 0);
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
         pq.repay_timed_out(); // 0 | <1/20>
@@ -239,27 +249,27 @@ mod test {
         let time = SteadyTime::now();
         let mut pq = make_pq(3); // 0 1 2 |
         assert_top(&pq, as_key(0));
-        pq.lend(time + Duration::seconds(10)); // 1 2 | <0/10>
+        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 | <0/10>
         assert_top(&pq, as_key(1));
-        pq.lend(time + Duration::seconds(15)); // 2 | <0/10> <1/15>
+        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap(); // 2 | <0/10> <1/15>
         assert_top(&pq, as_key(2));
-        pq.lend(time + Duration::seconds(20)); // | <0/10> <1/15> <2/20>
+        pq.lend(time + Duration::seconds(20)).unwrap(); // | <0/10> <1/15> <2/20>
         assert_eq!(pq.len(), 0);
-        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(17))); // | <0/10> <1/17> <2/20>
-        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(18))); // | <0/10> <1/18> <2/20>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(17))); // | <0/10> <1/17> <2/20>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(18))); // | <0/10> <1/18> <2/20>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
-        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(19))); // | <1/18> <0/19> <2/20>
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(19))); // | <1/18> <0/19> <2/20>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(18)));
-        assert!(pq.heartbeat(&as_key(1), time + Duration::seconds(21))); // | <0/19> <2/20> <1/21>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(21))); // | <0/19> <2/20> <1/21>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(19)));
-        assert!(pq.heartbeat(&as_key(0), time + Duration::seconds(22))); // | <2/20> <1/21> <0/22>
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(22))); // | <2/20> <1/21> <0/22>
         assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
         pq.repay_timed_out(); // 2 | <1/21> <0/22>
         assert_top(&pq, as_key(2));
-        pq.lend(time + Duration::seconds(100)); // | <1/21> <0/22> <2/100>
+        pq.lend(time + Duration::seconds(100)).unwrap(); // | <1/21> <0/22> <2/100>
         pq.repay_timed_out(); // 1 | <0/22> <2/100>
         assert_top(&pq, as_key(1));
-        pq.lend(time + Duration::seconds(101)); // | <0/22> <2/100> <1/101>
+        pq.lend(time + Duration::seconds(101)).unwrap(); // | <0/22> <2/100> <1/101>
         pq.repay_timed_out(); // 0 | <2/100> <1/101>
         assert_top(&pq, as_key(0));
     }
