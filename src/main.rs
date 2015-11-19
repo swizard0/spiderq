@@ -812,8 +812,11 @@ mod test {
 
         let ((key_a, value_a), (key_b, value_b)) = (rnd_kv(), rnd_kv());
         tx_sock(GlobalReq::Add(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
+        tx_sock(GlobalReq::Lookup(key_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_a.clone()));
+        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueNotFound);
         tx_sock(GlobalReq::Add(key_a.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Kept);
         tx_sock(GlobalReq::Add(key_b.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
+        tx_sock(GlobalReq::Lookup(key_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_b.clone()));
         tx_sock(GlobalReq::Lend { timeout: 1000, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 3, key: key_a.clone(), value: value_a.clone(), });
         tx_sock(GlobalReq::Lend { timeout: 500, }, sock);
@@ -855,7 +858,7 @@ mod test {
                        count: 4,
                        add: 3,
                        update: 1,
-                       lookup: 0,
+                       lookup: 3,
                        lend: 6,
                        repay: 4,
                        heartbeat: 1,
