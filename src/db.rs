@@ -134,6 +134,10 @@ impl Database {
         self.update_snapshots(false);
     }
 
+    fn flush(&mut self) {
+        self.update_snapshots(true);
+    }
+
     fn update_snapshots(&mut self, flush_mode: bool) {
         loop {
             // Check if memory part overflowed
@@ -285,7 +289,7 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        self.update_snapshots(true);
+        self.flush();
     }
 }
 
