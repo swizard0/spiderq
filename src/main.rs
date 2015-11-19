@@ -228,6 +228,17 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                     try!(tx_chan_n(DbRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx))
                 }
             },
+            DbReq::Global(GlobalReq::Lookup(key)) => {
+                if let Some(value) = db.lookup(&key) {
+                    try!(tx_chan_n(DbRep::Global(GlobalRep::ValueFound(value.clone())), req.headers, &chan_tx, &mut sock_tx))
+                } else {
+                    try!(tx_chan_n(DbRep::Global(GlobalRep::ValueNotFound), req.headers, &chan_tx, &mut sock_tx))
+                }
+            },
+            DbReq::Global(GlobalReq::Flush) => {
+                db.flush();
+                try!(tx_chan_n(DbRep::Global(GlobalRep::Flushed), req.headers, &chan_tx, &mut sock_tx));
+            },
             DbReq::Global(..) =>
                 unreachable!(),
             DbReq::Local(DbLocalReq::LoadLent(lend_key, key)) =>
@@ -315,6 +326,7 @@ fn master(mut sock_ext: zmq::Socket,
     let mut stats_count = 0;
     let mut stats_add = 0;
     let mut stats_update = 0;
+    let mut stats_lookup = 0;
     let mut stats_lend = 0;
     let mut stats_repay = 0;
     let mut stats_heartbeat = 0;
@@ -415,6 +427,14 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_update += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    DbRep::Global(rep @ GlobalRep::ValueFound(..)) => {
+                        stats_lookup += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
+                    DbRep::Global(rep @ GlobalRep::ValueNotFound) => {
+                        stats_lookup += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
                     DbRep::Global(rep @ GlobalRep::Lent { .. }) => {
                         stats_lend += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
@@ -423,6 +443,8 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_repay += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    DbRep::Global(rep @ GlobalRep::Flushed) =>
+                        try!(tx_sock(rep, message.headers, &mut sock_ext)),
                     DbRep::Global(rep @ GlobalRep::Error(..)) =>
                         try!(tx_sock(rep, message.headers, &mut sock_ext)),
                     DbRep::Global(GlobalRep::Counted(..)) |
@@ -480,9 +502,12 @@ fn master(mut sock_ext: zmq::Socket,
                     PqRep::Global(GlobalRep::Added) |
                     PqRep::Global(GlobalRep::Kept) |
                     PqRep::Global(GlobalRep::Updated) |
+                    PqRep::Global(GlobalRep::ValueFound(..)) |
+                    PqRep::Global(GlobalRep::ValueNotFound) |
                     PqRep::Global(GlobalRep::Lent { .. }) |
                     PqRep::Global(GlobalRep::Repaid) |
                     PqRep::Global(GlobalRep::StatsGot { .. }) |
+                    PqRep::Global(GlobalRep::Flushed) |
                     PqRep::Global(GlobalRep::Terminated) |
                     PqRep::Global(GlobalRep::Error(..)) =>
                         unreachable!(),
@@ -521,8 +546,12 @@ fn master(mut sock_ext: zmq::Socket,
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 req @ GlobalReq::Update(..) =>
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
+                req @ GlobalReq::Lookup(..) =>
+                    tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 req @ GlobalReq::Repay { .. } =>
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
+                req @ GlobalReq::Flush =>
+                    tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 GlobalReq::Lend { timeout: t, } => {
                     let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
                     tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at)), headers, &chan_pq_tx);
@@ -536,6 +565,7 @@ fn master(mut sock_ext: zmq::Socket,
                     try!(tx_sock(GlobalRep::StatsGot { count: stats_count,
                                                        add: stats_add,
                                                        update: stats_update,
+                                                       lookup: stats_lookup,
                                                        lend: stats_lend,
                                                        repay: stats_repay,
                                                        heartbeat: stats_heartbeat,
@@ -825,6 +855,7 @@ mod test {
                        count: 4,
                        add: 3,
                        update: 1,
+                       lookup: 0,
                        lend: 6,
                        repay: 4,
                        heartbeat: 1,

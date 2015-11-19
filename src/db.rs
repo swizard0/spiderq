@@ -134,7 +134,7 @@ impl Database {
         self.update_snapshots(false);
     }
 
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         self.update_snapshots(true);
     }
 
