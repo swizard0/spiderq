@@ -1,0 +1,3 @@
+[submodule "spiderq-proto"]
+	path = spiderq-proto
+	url = git://dev.swizard.info/spiderq-proto

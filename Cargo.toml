@@ -1,6 +1,6 @@
 [package]
 name = "spiderq"
-version = "1.1.0"
+version = "1.1.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
@@ -9,7 +9,7 @@ byteorder = "*"
 time = "*"
 tempdir = "*"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
-spiderq_proto = { git = "git://dev.swizard.info/spiderq-proto" }
+spiderq_proto = { path = "spiderq-proto" }
 
 [dev-dependencies]
 rand = "*"
