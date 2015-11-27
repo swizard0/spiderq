@@ -19,7 +19,7 @@ use time::{SteadyTime, Duration};
 
 pub mod db;
 pub mod pq;
-use proto::{Key, Value, ProtoError, GlobalReq, GlobalRep};
+use proto::{Key, Value, LendMode, ProtoError, GlobalReq, GlobalRep};
 
 const MAX_POLL_TIMEOUT: i64 = 100;
 
@@ -110,7 +110,7 @@ pub enum DbLocalReq {
 pub enum PqLocalReq {
     NextTrigger,
     Enqueue(Key),
-    LendUntil(u64, SteadyTime),
+    LendUntil(u64, SteadyTime, LendMode),
     RepayTimedOut,
     Heartbeat(u64, Key, SteadyTime),
     Stop,
@@ -203,7 +203,7 @@ fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message
 }
 
 
-pub fn worker_db(mut sock_tx: zmq::Socket, 
+pub fn worker_db(mut sock_tx: zmq::Socket,
                  chan_tx: Sender<Message<DbRep>>,
                  chan_rx: Receiver<Message<DbReq>>,
                  mut db: db::Database) -> Result<(), Error>
@@ -260,10 +260,10 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
     }
 }
 
-pub fn worker_pq(mut sock_tx: zmq::Socket, 
+pub fn worker_pq(mut sock_tx: zmq::Socket,
                  chan_tx: Sender<Message<PqRep>>,
                  chan_rx: Receiver<Message<PqReq>>,
-                 mut pq: pq::PQueue) -> Result<(), Error> 
+                 mut pq: pq::PQueue) -> Result<(), Error>
 {
     try!(notify_sock(&mut sock_tx));
     loop {
@@ -281,12 +281,17 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                 unreachable!(),
             PqReq::Local(PqLocalReq::Enqueue(key)) =>
                 pq.add(key),
-            PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at)) =>
+            PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) =>
                 if let Some((key, serial)) = pq.top() {
                     try!(tx_chan_n(PqRep::Local(PqLocalRep::Lent(serial, key)), req.headers, &chan_tx, &mut sock_tx));
                     pq.lend(trigger_at);
                 } else {
-                    try!(tx_chan_n(PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: timeout }), req.headers, &chan_tx, &mut sock_tx))
+                    match mode {
+                        LendMode::Block =>
+                            try!(tx_chan_n(PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: timeout }), req.headers, &chan_tx, &mut sock_tx)),
+                        LendMode::Poll =>
+                            try!(tx_chan_n(PqRep::Global(GlobalRep::QueueEmpty), req.headers, &chan_tx, &mut sock_tx)),
+                    }
                 },
             PqReq::Local(PqLocalReq::Heartbeat(lend_key, ref key, trigger_at)) => {
                 if pq.heartbeat(lend_key, key, trigger_at) {
@@ -449,6 +454,7 @@ fn master(mut sock_ext: zmq::Socket,
                         try!(tx_sock(rep, message.headers, &mut sock_ext)),
                     DbRep::Global(GlobalRep::Counted(..)) |
                     DbRep::Global(GlobalRep::Added) |
+                    DbRep::Global(GlobalRep::QueueEmpty) |
                     DbRep::Global(GlobalRep::Heartbeaten) |
                     DbRep::Global(GlobalRep::Skipped) |
                     DbRep::Global(GlobalRep::StatsGot { .. }) |
@@ -499,6 +505,10 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_repay += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    PqRep::Global(rep @ GlobalRep::QueueEmpty) => {
+                        stats_lend += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
                     PqRep::Global(GlobalRep::Added) |
                     PqRep::Global(GlobalRep::Kept) |
                     PqRep::Global(GlobalRep::Updated) |
@@ -516,7 +526,7 @@ fn master(mut sock_ext: zmq::Socket,
                         next_timeout = None;
                     },
                     PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: t, }) =>
-                        pending_queue.push((message.headers, GlobalReq::Lend { timeout: t, })),
+                        pending_queue.push((message.headers, GlobalReq::Lend { timeout: t, mode: LendMode::Block, })),
                     PqRep::Local(PqLocalRep::Repaid(key, value)) => {
                         tx_chan(DbReq::Local(DbLocalReq::RepayUpdate(key, value)), message.headers, &chan_db_tx);
                         next_timeout = None;
@@ -552,9 +562,9 @@ fn master(mut sock_ext: zmq::Socket,
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
                 req @ GlobalReq::Flush =>
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
-                GlobalReq::Lend { timeout: t, } => {
+                GlobalReq::Lend { timeout: t, mode: m, } => {
                     let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
-                    tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at)), headers, &chan_pq_tx);
+                    tx_chan(PqReq::Local(PqLocalReq::LendUntil(t, trigger_at, m)), headers, &chan_pq_tx);
                 },
                 GlobalReq::Heartbeat { lend_key: l, key: k, timeout: t, } => {
                     let trigger_at = after_poll_ts + Duration::milliseconds(t as i64);
@@ -613,7 +623,7 @@ mod test {
     use time::{SteadyTime, Duration};
     use rand::{thread_rng, sample, Rng};
     use std::sync::mpsc::{channel, Sender, Receiver};
-    use super::proto::{Key, Value, RepayStatus, GlobalReq, GlobalRep, ProtoError};
+    use super::proto::{Key, Value, LendMode, RepayStatus, GlobalReq, GlobalRep, ProtoError};
     use super::{zmq, db, pq, worker_db, worker_pq, tx_chan, entrypoint};
     use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
@@ -639,7 +649,7 @@ mod test {
         worker.join().unwrap();
     }
 
-    fn assert_worker_cmd<Req, Rep>(sock: &mut zmq::Socket, tx: &Sender<Message<Req>>, rx: &Receiver<Message<Rep>>, req: Req, rep: Rep) 
+    fn assert_worker_cmd<Req, Rep>(sock: &mut zmq::Socket, tx: &Sender<Message<Req>>, rx: &Receiver<Message<Rep>>, req: Req, rep: Rep)
         where Rep: PartialEq + Debug
     {
         tx_chan(req, None, tx);
@@ -712,30 +722,33 @@ mod test {
                 let ((key_a, value_a), (key_b, value_b)) = (rnd_kv(), rnd_kv());
                 let now = SteadyTime::now();
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(0)));
+                assert_worker_cmd(&mut sock, &tx, &rx,
+                                  PqReq::Local(PqLocalReq::LendUntil(1000, now + Duration::milliseconds(1000), LendMode::Poll)),
+                                  PqRep::Global(GlobalRep::QueueEmpty));
                 tx_chan(PqReq::Local(PqLocalReq::Enqueue(key_a.clone())), None, &tx);
                 tx_chan(PqReq::Local(PqLocalReq::Enqueue(key_b.clone())), None, &tx);
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(1000, now + Duration::milliseconds(1000))),
+                                  PqReq::Local(PqLocalReq::LendUntil(1000, now + Duration::milliseconds(1000), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::Lent(3, key_a.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::NextTrigger),
                                   PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(1000)))));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::Lent(3, key_b.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::NextTrigger),
                                   PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(500)))));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(250, SteadyTime::now() + Duration::milliseconds(250))),
+                                  PqReq::Local(PqLocalReq::LendUntil(250, SteadyTime::now() + Duration::milliseconds(250), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: 250 }));
                 tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &tx);
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::NextTrigger),
                                   PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(1000)))));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::Lent(4, key_b.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Global(GlobalReq::Repay { lend_key: 3,
@@ -750,7 +763,7 @@ mod test {
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(2)));
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::Lent(6, key_b.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Global(GlobalReq::Repay { lend_key: 6,
@@ -767,7 +780,7 @@ mod test {
                                   PqRep::Global(GlobalRep::NotFound));
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Local(PqLocalReq::NextTrigger), PqRep::Local(PqLocalRep::TriggerGot(None)));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500))),
+                                  PqReq::Local(PqLocalReq::LendUntil(500, now + Duration::milliseconds(500), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::Lent(6, key_a.clone())));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::NextTrigger),
@@ -817,19 +830,21 @@ mod test {
         tx_sock(GlobalReq::Add(key_a.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Kept);
         tx_sock(GlobalReq::Add(key_b.clone(), value_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
         tx_sock(GlobalReq::Lookup(key_b.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_b.clone()));
-        tx_sock(GlobalReq::Lend { timeout: 1000, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 1000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 3, key: key_a.clone(), value: value_a.clone(), });
-        tx_sock(GlobalReq::Lend { timeout: 500, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 3, key: key_b.clone(), value: value_b.clone(), });
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
+        tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Poll, }, sock);
+        assert_eq!(rx_sock(sock), GlobalRep::QueueEmpty);
         tx_sock(GlobalReq::Repay { lend_key: 3, key: key_b.clone(), value: value_a.clone(), status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Repaid);
         tx_sock(GlobalReq::Repay { lend_key: 3, key: key_a.clone(), value: value_b.clone(), status: RepayStatus::Penalty, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Repaid);
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(2));
-        tx_sock(GlobalReq::Lend { timeout: 10000, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 10000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 5, key: key_b.clone(), value: value_a.clone(), });
-        tx_sock(GlobalReq::Lend { timeout: 1000, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 1000, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 5, key: key_a.clone(), value: value_b.clone(), });
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
 
@@ -838,14 +853,14 @@ mod test {
             ((value + variance) / expected) * expected
         }
         let t_start_a = SteadyTime::now();
-        tx_sock(GlobalReq::Lend { timeout: 500, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 6, key: key_a.clone(), value: value_b.clone(), });
         assert_eq!(round_ms(t_start_a, 1000, 100), 1000);
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
         tx_sock(GlobalReq::Update(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Updated);
         tx_sock(GlobalReq::Heartbeat { lend_key: 6, key: key_a.clone(), timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Heartbeaten);
         let t_start_b = SteadyTime::now();
-        tx_sock(GlobalReq::Lend { timeout: 500, }, sock);
+        tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 7, key: key_a.clone(), value: value_a.clone(), });
         assert_eq!(round_ms(t_start_b, 1000, 100), 1000);
         tx_sock(GlobalReq::Repay { lend_key: 7, key: key_a.clone(), value: value_a.clone(), status: RepayStatus::Penalty, }, sock);
@@ -859,7 +874,7 @@ mod test {
                        add: 3,
                        update: 1,
                        lookup: 3,
-                       lend: 6,
+                       lend: 7,
                        repay: 4,
                        heartbeat: 1,
                        stats: 1, });
@@ -867,4 +882,3 @@ mod test {
         master_thread.join().unwrap();
     }
 }
-
