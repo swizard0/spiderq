@@ -56,7 +56,7 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
     let flush_limit: usize = try!(matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(|e| Error::InvalidFlushLimit(e)));
-    let zmq_addr_cloned = zmq_addr.clone();
+    let zmq_addr_cloned = zmq_addr.replace("//*:", "//127.0.0.1:");
     Signals::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
         let mut zmq_ctx = zmq::Context::new();
         let mut sock = zmq_ctx.socket(zmq::REQ).map_err(|e| ZmqError::Socket(e)).unwrap();
