@@ -452,6 +452,7 @@ fn master(mut sock_ext: zmq::Socket,
                         try!(tx_sock(rep, message.headers, &mut sock_ext)),
                     DbRep::Global(rep @ GlobalRep::Error(..)) =>
                         try!(tx_sock(rep, message.headers, &mut sock_ext)),
+                    DbRep::Global(GlobalRep::Pong) |
                     DbRep::Global(GlobalRep::Counted(..)) |
                     DbRep::Global(GlobalRep::Added) |
                     DbRep::Global(GlobalRep::QueueEmpty) |
@@ -509,6 +510,7 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_lend += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    PqRep::Global(GlobalRep::Pong) |
                     PqRep::Global(GlobalRep::Added) |
                     PqRep::Global(GlobalRep::Kept) |
                     PqRep::Global(GlobalRep::Updated) |
@@ -550,6 +552,8 @@ fn master(mut sock_ext: zmq::Socket,
         // process incoming messages
         for (headers, global_req) in incoming_queue.drain(..) {
             match global_req {
+                GlobalReq::Ping =>
+                    try!(tx_sock(GlobalRep::Pong, headers, &mut sock_ext)),
                 req @ GlobalReq::Count =>
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
                 req @ GlobalReq::Add(..) =>
@@ -823,6 +827,7 @@ mod test {
         sock_ftd.connect(zmq_addr).unwrap();
         let sock = &mut sock_ftd;
 
+        tx_sock(GlobalReq::Ping, sock); assert_eq!(rx_sock(sock), GlobalRep::Pong);
         let ((key_a, value_a), (key_b, value_b)) = (rnd_kv(), rnd_kv());
         tx_sock(GlobalReq::Add(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Added);
         tx_sock(GlobalReq::Lookup(key_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::ValueFound(value_a.clone()));
