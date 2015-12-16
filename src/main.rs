@@ -5,6 +5,7 @@ extern crate time;
 extern crate getopts;
 extern crate tempdir;
 extern crate byteorder;
+extern crate simple_signal;
 extern crate spiderq_proto as proto;
 #[cfg(test)] extern crate rand;
 
@@ -16,6 +17,7 @@ use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::num::ParseIntError;
 use getopts::Options;
 use time::{SteadyTime, Duration};
+use simple_signal::{Signals, Signal};
 
 pub mod db;
 pub mod pq;
@@ -54,6 +56,24 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
     let flush_limit: usize = try!(matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(|e| Error::InvalidFlushLimit(e)));
+    let zmq_addr_cloned = zmq_addr.clone();
+    Signals::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
+        let mut zmq_ctx = zmq::Context::new();
+        let mut sock = zmq_ctx.socket(zmq::REQ).map_err(|e| ZmqError::Socket(e)).unwrap();
+        sock.connect(&zmq_addr_cloned).map_err(|e| ZmqError::Connect(e)).unwrap();
+        println!(" ;; {:?} received, terminating server...", signals);
+        let packet = GlobalReq::Terminate;
+        let required = packet.encode_len();
+        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        packet.encode(&mut msg);
+        sock.send_msg(msg, 0).unwrap();
+        let reply_msg = sock.recv_msg(0).map_err(|e| ZmqError::Recv(e)).unwrap();
+        let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
+        match rep {
+            GlobalRep::Terminated => (),
+            other => panic!("unexpected reply for terminate: {:?}", other),
+        }
+    });
     entrypoint(&zmq_addr, &database_dir, flush_limit)
 }
 

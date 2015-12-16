@@ -1,15 +1,16 @@
 [package]
 name = "spiderq"
-version = "1.2.1"
+version = "1.2.2"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 
 [dependencies]
-getopts = "*"
-byteorder = "*"
-time = "*"
-tempdir = "*"
+getopts = "0.2"
+byteorder = "0.4"
+time = "0.1"
+tempdir = "0.3"
 zmq = { git = "https://github.com/erickt/rust-zmq.git" }
+simple-signal = "1.0"
 spiderq_proto = { path = "spiderq-proto" }
 
 [dev-dependencies]
-rand = "*"
+rand = "0.3"
