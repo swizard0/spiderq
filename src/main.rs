@@ -1,5 +1,3 @@
-#![feature(drain)]
-
 extern crate zmq;
 extern crate time;
 extern crate getopts;
