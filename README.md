@@ -2,7 +2,11 @@
 
 ## Summary
 
-Standalone priority queue with simple zeromq-based [binary protocol](https://github.com/swizard0/spiderq-proto).
+Fast standalone priority queue / KV database with simple zeromq-based [binary protocol](https://github.com/swizard0/spiderq-proto).
+
+It is supposed to be a part of some schedule related software (web crawlers, monitoring, pollers, status checkers, etc).
+
+Initially has been develloped for [Kribrum](http://www.kribrum.ru) project.
 
 ## Building spiderq
 
