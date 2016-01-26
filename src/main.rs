@@ -346,10 +346,12 @@ fn master(mut sock_ext: zmq::Socket,
         Finished(Option<Headers>),
     }
 
+    let mut stats_ping = 0;
     let mut stats_count = 0;
     let mut stats_add = 0;
     let mut stats_update = 0;
     let mut stats_lookup = 0;
+    let mut stats_remove = 0;
     let mut stats_lend = 0;
     let mut stats_repay = 0;
     let mut stats_heartbeat = 0;
@@ -458,6 +460,14 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_lookup += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
                     },
+                    DbRep::Global(rep @ GlobalRep::Removed) => {
+                        stats_remove += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
+                    DbRep::Global(rep @ GlobalRep::NotRemoved) => {
+                        stats_remove += 1;
+                        try!(tx_sock(rep, message.headers, &mut sock_ext));
+                    },
                     DbRep::Global(rep @ GlobalRep::Lent { .. }) => {
                         stats_lend += 1;
                         try!(tx_sock(rep, message.headers, &mut sock_ext));
@@ -534,6 +544,8 @@ fn master(mut sock_ext: zmq::Socket,
                     PqRep::Global(GlobalRep::Updated) |
                     PqRep::Global(GlobalRep::ValueFound(..)) |
                     PqRep::Global(GlobalRep::ValueNotFound) |
+                    PqRep::Global(GlobalRep::Removed) |
+                    PqRep::Global(GlobalRep::NotRemoved) |
                     PqRep::Global(GlobalRep::Lent { .. }) |
                     PqRep::Global(GlobalRep::Repaid) |
                     PqRep::Global(GlobalRep::StatsGot { .. }) |
@@ -570,8 +582,10 @@ fn master(mut sock_ext: zmq::Socket,
         // process incoming messages
         for (headers, global_req) in incoming_queue.drain(..) {
             match global_req {
-                GlobalReq::Ping =>
-                    try!(tx_sock(GlobalRep::Pong, headers, &mut sock_ext)),
+                GlobalReq::Ping => {
+                    stats_ping += 1;
+                    try!(tx_sock(GlobalRep::Pong, headers, &mut sock_ext))
+                },
                 req @ GlobalReq::Count =>
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
                 req @ GlobalReq::Add { .. } =>
@@ -580,6 +594,8 @@ fn master(mut sock_ext: zmq::Socket,
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
                 req @ GlobalReq::Lookup(..) =>
                     tx_chan(DbReq::Global(req), headers, &chan_db_tx),
+                req @ GlobalReq::Remove(..) =>
+                    unreachable!(),
                 req @ GlobalReq::Repay { .. } =>
                     tx_chan(PqReq::Global(req), headers, &chan_pq_tx),
                 req @ GlobalReq::Flush =>
@@ -594,14 +610,18 @@ fn master(mut sock_ext: zmq::Socket,
                 },
                 GlobalReq::Stats => {
                     stats_stats += 1;
-                    try!(tx_sock(GlobalRep::StatsGot { count: stats_count,
-                                                       add: stats_add,
-                                                       update: stats_update,
-                                                       lookup: stats_lookup,
-                                                       lend: stats_lend,
-                                                       repay: stats_repay,
-                                                       heartbeat: stats_heartbeat,
-                                                       stats: stats_stats, }, headers, &mut sock_ext));
+                    try!(tx_sock(GlobalRep::StatsGot {
+                        ping: stats_ping,
+                        count: stats_count,
+                        add: stats_add,
+                        update: stats_update,
+                        lookup: stats_lookup,
+                        remove: stats_remove,
+                        lend: stats_lend,
+                        repay: stats_repay,
+                        heartbeat: stats_heartbeat,
+                        stats: stats_stats,
+                    }, headers, &mut sock_ext));
                 },
                 GlobalReq::Terminate => {
                     tx_chan(PqReq::Local(PqLocalReq::Stop), None, &chan_pq_tx);
@@ -896,10 +916,12 @@ mod test {
         tx_sock(GlobalReq::Stats, sock);
         assert_eq!(rx_sock(sock),
                    GlobalRep::StatsGot {
+                       ping: 1,
                        count: 4,
                        add: 3,
                        update: 1,
                        lookup: 3,
+                       remove: 0,
                        lend: 7,
                        repay: 4,
                        heartbeat: 1,
