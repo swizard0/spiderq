@@ -52,6 +52,7 @@ Options:
 
 * [spiderq-proto](https://github.com/swizard0/spiderq-proto): Rust crate
 * [espiderq](https://github.com/swizard0/espiderq): Erlang module
+* [spiderq-perl](https://github.com/temoon/spiderq-perl): Perl module
 
 ## Design.
 
