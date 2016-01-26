@@ -161,6 +161,10 @@ impl PQueue {
             false
         }
     }
+
+    pub fn remove(&mut self, key: Key) {
+        self.lentm.remove(&key);
+    }
 }
 
 #[cfg(test)]
