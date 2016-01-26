@@ -11,7 +11,13 @@ use tempdir::TempDir;
 use byteorder::{ReadBytesExt, WriteBytesExt, ByteOrder, NativeEndian};
 use super::proto::{Key, Value};
 
-type Index = HashMap<Key, Value>;
+#[derive(Clone)]
+enum ValueSlot {
+    Value(Value),
+    Tombstone,
+}
+
+type Index = HashMap<Key, ValueSlot>;
 
 #[derive(Debug)]
 pub enum Error {
@@ -49,7 +55,7 @@ impl Snapshot {
         }
     }
 
-    fn lookup(&self, key: &Key) -> Option<&Value> {
+    fn lookup(&self, key: &Key) -> Option<&ValueSlot> {
         match self {
             &Snapshot::Memory(ref idx) => idx.get(key),
             &Snapshot::Frozen(ref idx) => idx.get(key),
@@ -116,8 +122,13 @@ impl Database {
 
     pub fn lookup(&self, key: &Key) -> Option<&Value> {
         for snapshot in self.snapshots.iter() {
-            if let Some(value) = snapshot.lookup(key) {
-                return Some(value)
+            match snapshot.lookup(key) {
+                Some(&ValueSlot::Value(ref value)) =>
+                    return Some(value),
+                Some(&ValueSlot::Tombstone) =>
+                    return None,
+                None =>
+                    (),
             }
         }
 
@@ -125,8 +136,16 @@ impl Database {
     }
 
     pub fn insert(&mut self, key: Key, value: Value) {
+        self.insert_slot(key, ValueSlot::Value(value))
+    }
+
+    pub fn remove(&mut self, key: Key) {
+        self.insert_slot(key, ValueSlot::Tombstone)
+    }
+
+    fn insert_slot(&mut self, key: Key, slot: ValueSlot) {
         if let Some(&mut Snapshot::Memory(ref mut idx)) = self.snapshots.first_mut() {
-            idx.insert(key, value);
+            idx.insert(key, slot);
         } else {
             panic!("unexpected snapshots layout");
         }
@@ -161,7 +180,7 @@ impl Database {
                     let slave_dir = self.database_dir.clone();
                     let slave_index = index_to_persist.clone();
                     let slave = spawn(move || tx.send(persist(slave_dir, slave_index)).unwrap());
-                    mem::replace(last_snapshot, Snapshot::Persisting { 
+                    mem::replace(last_snapshot, Snapshot::Persisting {
                         index: index_to_persist,
                         chan: rx,
                         slave: slave,
@@ -172,7 +191,7 @@ impl Database {
 
             // Check if several snapshots should be merged
             enum MergeLayout { FirstMemory, AtLeastOneFrozen, MaybeMoreFrozen, LastPersisted, }
-            let merge_decision = 
+            let merge_decision =
                 self.snapshots.iter().fold(Some(MergeLayout::FirstMemory), |state, snapshot| match (state, snapshot) {
                     (Some(MergeLayout::FirstMemory), &Snapshot::Memory(..)) => Some(MergeLayout::AtLeastOneFrozen),
                     (Some(MergeLayout::AtLeastOneFrozen), &Snapshot::Frozen(..)) => Some(MergeLayout::MaybeMoreFrozen),
@@ -296,7 +315,7 @@ impl Drop for Database {
 pub struct Iter<'a> {
     indices: Vec<&'a Index>,
     index: usize,
-    iter: Option<hash_map::Iter<'a, Key, Value>>,
+    iter: Option<hash_map::Iter<'a, Key, ValueSlot>>,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -305,7 +324,7 @@ impl<'a> Iterator for Iter<'a> {
     fn next(&mut self) -> Option<(&'a Key, &'a Value)> {
         while self.index < self.indices.len() {
             if let Some(ref mut map_iter) = self.iter {
-                while let Some((key, value)) = map_iter.next() {
+                while let Some((key, slot)) = map_iter.next() {
                     if self.indices[0 .. self.index]
                         .iter()
                         .rev()
@@ -313,7 +332,12 @@ impl<'a> Iterator for Iter<'a> {
                             continue
                         }
 
-                    return Some((key, value));
+                    match slot {
+                        &ValueSlot::Value(ref value) =>
+                            return Some((key, value)),
+                        &ValueSlot::Tombstone =>
+                            continue,
+                    }
                 }
             } else {
                 self.iter = Some(self.indices[self.index].iter());
@@ -356,7 +380,7 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
             let mut index = Index::with_capacity(total);
             for _ in 0 .. total {
                 let (key, value) = (try!(read_vec(&mut source)), try!(read_vec(&mut source)));
-                index.insert(Arc::new(key), Arc::new(value));
+                index.insert(Arc::new(key), ValueSlot::Value(Arc::new(value)));
             }
             Ok(Some(index))
         },
@@ -380,14 +404,30 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
     tmp_db_file.push(tmp_dir.path());
     tmp_db_file.push(db_filename);
 
+    let approx_len = index.len();
+    let mut actual_len = 0;
+
     {
         let mut file = io::BufWriter::new(
             try!(fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))));
-        try!(file.write_u64::<NativeEndian>(index.len() as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
-        for (key, value) in &*index {
-            try!(write_vec(key, &mut file));
-            try!(write_vec(value, &mut file));
+        try!(file.write_u64::<NativeEndian>(approx_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
+        for (key, slot) in &*index {
+            if let &ValueSlot::Value(ref value) = slot {
+                try!(write_vec(key, &mut file));
+                try!(write_vec(value, &mut file));
+                actual_len += 1;
+            }
         }
+    }
+
+    if actual_len != approx_len {
+        let mut file =
+            try!(fs::OpenOptions::new()
+                 .read(true)
+                 .write(true)
+                 .open(&tmp_db_file)
+                 .map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e)));
+        try!(file.write_u64::<NativeEndian>(actual_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
     }
 
     let mut db_file = PathBuf::new();
@@ -401,14 +441,14 @@ fn merge(indices: Arc<Vec<Arc<Index>>>) -> Index {
     let mut base_index: Option<Index> = None;
     for index in indices.iter().rev() {
         if let Some(ref mut base) = base_index {
-            for (key, value) in &**index {
-                base.insert(key.clone(), value.clone());
+            for (key, slot) in &**index {
+                base.insert(key.clone(), slot.clone());
             }
         } else {
             base_index = Some((**index).clone());
         }
     }
-    
+
     base_index.take().unwrap()
 }
 
@@ -420,7 +460,7 @@ mod test {
     use rand::{thread_rng, sample, Rng};
     use super::{Database};
     use super::super::proto::{Key, Value};
-    
+
     fn mkdb(path: &str, flush_limit: usize) -> Database {
         let _ = fs::remove_dir_all(path);
         Database::new(path, flush_limit).unwrap()
@@ -435,11 +475,22 @@ mod test {
     }
 
     fn rnd_fill_check(db: &mut Database, check_table: &mut HashMap<Key, Value>, count: usize) {
-        for _ in 0 .. count {
+        let mut to_remove = Vec::new();
+        let remove_count = count / 2;
+        for _ in 0 .. count + remove_count {
             let (k, v) = rnd_kv();
             check_table.insert(k.clone(), v.clone());
             db.insert(k.clone(), v.clone());
+            if to_remove.len() < remove_count {
+                to_remove.push(k.clone());
+            }
         }
+
+        for k in to_remove {
+            check_table.remove(&k);
+            db.remove(k);
+        }
+
         check_against(db, check_table);
     }
 
@@ -514,4 +565,3 @@ mod test {
         }
     }
 }
-
