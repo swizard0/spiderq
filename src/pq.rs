@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::collections::hash_map::Entry;
 use time::SteadyTime;
-use super::proto::{Key, RepayStatus};
+use super::proto::{Key, RepayStatus, AddMode};
 
 #[derive(Debug, PartialEq, Eq)]
 struct PQueueEntry {
@@ -69,9 +69,13 @@ impl PQueue {
         self.queue.len()
     }
 
-    pub fn add(&mut self, key: Key) {
+    pub fn add(&mut self, key: Key, mode: AddMode) {
         self.serial += 1;
-        self.queue.push(PQueueEntry { key: key, priority: self.serial, boost: 0, });
+        self.queue.push(PQueueEntry {
+            key: key,
+            priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
+            boost: 0,
+        });
     }
 
     pub fn top(&self) -> Option<(Key, u64)> {
@@ -110,7 +114,7 @@ impl PQueue {
         }
         None
     }
-    
+
     pub fn repay_timed_out(&mut self) {
         if let Some(LentEntry { key: k, snapshot: s, .. }) = self.lentq.pop() {
             self.repay(s, k, RepayStatus::Front);
@@ -164,7 +168,7 @@ mod test {
     use std::sync::Arc;
     use time::{SteadyTime, Duration};
     use super::PQueue;
-    use super::super::proto::{Key, RepayStatus};
+    use super::super::proto::{Key, RepayStatus, AddMode};
 
     fn as_key(value: usize) -> Key {
         Arc::new(format!("{}", value).into_bytes())
@@ -173,7 +177,7 @@ mod test {
     fn make_pq(len: usize) -> PQueue {
         let mut pq = PQueue::new();
         for i in 0 .. len {
-            pq.add(as_key(i));
+            pq.add(as_key(i), AddMode::Tail);
         }
         pq
     }
