@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::collections::hash_map;
 use std::iter::Iterator;
 use tempdir::TempDir;
-use byteorder::{ReadBytesExt, WriteBytesExt, ByteOrder, NativeEndian};
+use byteorder::{ReadBytesExt, WriteBytesExt, NativeEndian};
 use super::proto::{Key, Value};
 
 #[derive(Clone)]

@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::num::ParseIntError;
 use getopts::Options;
 use time::{SteadyTime, Duration};
-use simple_signal::{Signals, Signal};
+use simple_signal::Signal;
 
 pub mod db;
 pub mod pq;
@@ -55,16 +55,16 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
     let flush_limit: usize = try!(matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(|e| Error::InvalidFlushLimit(e)));
     let zmq_addr_cloned = zmq_addr.replace("//*:", "//127.0.0.1:");
-    Signals::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
-        let mut zmq_ctx = zmq::Context::new();
-        let mut sock = zmq_ctx.socket(zmq::REQ).map_err(|e| ZmqError::Socket(e)).unwrap();
+    simple_signal::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
+        let zmq_ctx = zmq::Context::new();
+        let sock = zmq_ctx.socket(zmq::REQ).map_err(|e| ZmqError::Socket(e)).unwrap();
         sock.connect(&zmq_addr_cloned).map_err(|e| ZmqError::Connect(e)).unwrap();
         println!(" ;; {:?} received, terminating server...", signals);
         let packet = GlobalReq::Terminate;
         let required = packet.encode_len();
-        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        let mut msg = zmq::Message::with_capacity(required);
         packet.encode(&mut msg);
-        sock.send_msg(msg, 0).unwrap();
+        sock.send(msg, 0).unwrap();
         let reply_msg = sock.recv_msg(0).map_err(|e| ZmqError::Recv(e)).unwrap();
         let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
         match rep {
@@ -83,12 +83,12 @@ pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Res
         pq.add(k.clone(), AddMode::Tail)
     }
 
-    let mut ctx = zmq::Context::new();
-    let mut sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut sock_master_db_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut sock_master_pq_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut sock_db_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
-    let mut sock_pq_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let ctx = zmq::Context::new();
+    let sock_master_ext = try!(ctx.socket(zmq::ROUTER).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let sock_master_db_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let sock_master_pq_rx = try!(ctx.socket(zmq::PULL).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let sock_db_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
+    let sock_pq_master_tx = try!(ctx.socket(zmq::PUSH).map_err(|e| Error::Zmq(ZmqError::Socket(e))));
 
     try!(sock_master_ext.bind(zmq_addr).map_err(|e| Error::Zmq(ZmqError::Bind(e))));
     try!(sock_master_db_rx.bind("inproc://db_rxtx").map_err(|e| Error::Zmq(ZmqError::Bind(e))));
@@ -198,15 +198,15 @@ fn rx_sock(sock: &mut zmq::Socket) -> Result<(Option<Headers>, Result<GlobalReq,
 
 fn tx_sock(packet: GlobalRep, maybe_headers: Option<Headers>, sock: &mut zmq::Socket) -> Result<(), Error> {
     let required = packet.encode_len();
-    let mut load_msg = try!(zmq::Message::with_capacity(required).map_err(|e| Error::Zmq(ZmqError::Message(e))));
+    let mut load_msg = zmq::Message::with_capacity(required);
     packet.encode(&mut load_msg);
 
     if let Some(headers) = maybe_headers {
         for header in headers {
-            try!(sock.send_msg(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
+            try!(sock.send(header, zmq::SNDMORE).map_err(|e| Error::Zmq(ZmqError::Send(e))));
         }
     }
-    sock.send_msg(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
+    sock.send(load_msg, 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
 pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>) {
@@ -214,8 +214,7 @@ pub fn tx_chan<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Messa
 }
 
 fn notify_sock(sock: &mut zmq::Socket) -> Result<(), Error> {
-    sock.send_msg(try!(zmq::Message::new().map_err(|e| Error::Zmq(ZmqError::Message(e)))), 0)
-        .map_err(|e| Error::Zmq(ZmqError::Send(e)))
+    sock.send(zmq::Message::new(), 0).map_err(|e| Error::Zmq(ZmqError::Send(e)))
 }
 
 fn tx_chan_n<R>(packet: R, maybe_headers: Option<Headers>, chan: &Sender<Message<R>>, sock: &mut zmq::Socket) -> Result<(), Error> {
@@ -344,8 +343,8 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
 }
 
 fn master(mut sock_ext: zmq::Socket,
-          mut sock_db_rx: zmq::Socket,
-          mut sock_pq_rx: zmq::Socket,
+          sock_db_rx: zmq::Socket,
+          sock_pq_rx: zmq::Socket,
           chan_db_tx: Sender<Message<DbReq>>,
           chan_db_rx: Receiver<Message<DbRep>>,
           chan_pq_tx: Sender<Message<PqReq>>,
@@ -693,9 +692,9 @@ mod test {
         MF: FnOnce(zmq::Socket, Sender<Message<Req>>, Receiver<Message<Rep>>) + Send + 'static,
         Req: Send + 'static, Rep: Send + 'static
     {
-        let mut ctx = zmq::Context::new();
-        let mut sock_master_slave_rx = ctx.socket(zmq::PULL).unwrap();
-        let mut sock_slave_master_tx = ctx.socket(zmq::PUSH).unwrap();
+        let ctx = zmq::Context::new();
+        let sock_master_slave_rx = ctx.socket(zmq::PULL).unwrap();
+        let sock_slave_master_tx = ctx.socket(zmq::PUSH).unwrap();
 
         let rx_addr = format!("inproc://{}_rxtx", base_addr);
         sock_master_slave_rx.bind(&rx_addr).unwrap();
@@ -863,9 +862,9 @@ mod test {
 
     fn tx_sock(packet: GlobalReq, sock: &mut zmq::Socket) {
         let required = packet.encode_len();
-        let mut msg = zmq::Message::with_capacity(required).unwrap();
+        let mut msg = zmq::Message::with_capacity(required);
         packet.encode(&mut msg);
-        sock.send_msg(msg, 0).unwrap();
+        sock.send(msg, 0).unwrap();
     }
 
     fn rx_sock(sock: &mut zmq::Socket) -> GlobalRep {
@@ -880,7 +879,7 @@ mod test {
         let path = "/tmp/spiderq_server";
         let _ = fs::remove_dir_all(path);
         let zmq_addr = "inproc://server";
-        let (mut ctx, master_thread) = entrypoint(zmq_addr, path, 16).unwrap();
+        let (ctx, master_thread) = entrypoint(zmq_addr, path, 16).unwrap();
         let mut sock_ftd = ctx.socket(zmq::REQ).unwrap();
         sock_ftd.connect(zmq_addr).unwrap();
         let sock = &mut sock_ftd;
