@@ -100,12 +100,12 @@ impl Database {
             Ok(ref metadata) if metadata.is_dir() => (),
             Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
             Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-                try!(fs::create_dir(database_dir).map_err(|e| Error::DatabaseMkdir(e))),
+                fs::create_dir(database_dir).map_err(Error::DatabaseMkdir)?,
             Err(e) => return Err(Error::DatabaseStat(e)),
         }
 
         let mut snapshots = vec![Snapshot::Memory(Index::new())];
-        if let Some(persisted_index) = try!(load_index(database_dir)) {
+        if let Some(persisted_index) = load_index(database_dir)? {
             snapshots.push(Snapshot::Persisted(Arc::new(persisted_index)));
         }
 
@@ -358,7 +358,7 @@ fn filename_as_string(filename: &PathBuf) -> String {
 }
 
 fn read_vec<R>(source: &mut R) -> Result<Vec<u8>, Error> where R: io::Read {
-    let len = try!(source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))) as usize;
+    let len = source.read_u32::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))? as usize;
     let mut buffer = Vec::with_capacity(len);
     let source_ref = source.by_ref();
     match source_ref.take(len as u64).read_to_end(&mut buffer) {
@@ -376,10 +376,10 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
     match fs::File::open(&db_file) {
         Ok(file) => {
             let mut source = io::BufReader::new(file);
-            let total = try!(source.read_u64::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))) as usize;
+            let total = source.read_u64::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))? as usize;
             let mut index = Index::with_capacity(total);
             for _ in 0 .. total {
-                let (key, value) = (try!(read_vec(&mut source)), try!(read_vec(&mut source)));
+                let (key, value) = (read_vec(&mut source)?, read_vec(&mut source)?);
                 index.insert(Arc::new(key), ValueSlot::Value(Arc::new(value)));
             }
             Ok(Some(index))
@@ -392,14 +392,14 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
 }
 
 fn write_vec<W>(value: &Arc<Vec<u8>>, target: &mut W) -> Result<(), Error> where W: io::Write {
-    try!(target.write_u32::<NativeEndian>(value.len() as u32).map_err(|e| Error::DatabaseWrite(From::from(e))));
-    try!(target.write_all(&value[..]).map_err(|e| Error::DatabaseWrite(e)));
+    target.write_u32::<NativeEndian>(value.len() as u32).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
+    target.write_all(&value[..]).map_err(Error::DatabaseWrite)?;
     Ok(())
 }
 
 fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
     let db_filename = "snapshot";
-    let tmp_dir = try!(TempDir::new_in(&*dir, "snapshot").map_err(|e| Error::DatabaseMkdir(e)));
+    let tmp_dir = TempDir::new_in(&*dir, "snapshot").map_err(Error::DatabaseMkdir)?;
     let mut tmp_db_file = PathBuf::new();
     tmp_db_file.push(tmp_dir.path());
     tmp_db_file.push(db_filename);
@@ -409,25 +409,24 @@ fn persist(dir: Arc<PathBuf>, index: Arc<Index>) -> Result<(), Error> {
 
     {
         let mut file = io::BufWriter::new(
-            try!(fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))));
-        try!(file.write_u64::<NativeEndian>(approx_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
+            fs::File::create(&tmp_db_file).map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))?);
+        file.write_u64::<NativeEndian>(approx_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
         for (key, slot) in &*index {
             if let &ValueSlot::Value(ref value) = slot {
-                try!(write_vec(key, &mut file));
-                try!(write_vec(value, &mut file));
+                write_vec(key, &mut file)?;
+                write_vec(value, &mut file)?;
                 actual_len += 1;
             }
         }
     }
 
     if actual_len != approx_len {
-        let mut file =
-            try!(fs::OpenOptions::new()
-                 .read(true)
-                 .write(true)
-                 .open(&tmp_db_file)
-                 .map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e)));
-        try!(file.write_u64::<NativeEndian>(actual_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e))));
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp_db_file)
+            .map_err(|e| Error::DatabaseTmpFile(filename_as_string(&tmp_db_file), e))?;
+        file.write_u64::<NativeEndian>(actual_len as u64).map_err(|e| Error::DatabaseWrite(From::from(e)))?;
     }
 
     let mut db_file = PathBuf::new();
