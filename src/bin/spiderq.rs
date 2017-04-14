@@ -1,8 +1,7 @@
+extern crate spiderq;
 extern crate zmq;
 extern crate time;
 extern crate getopts;
-extern crate tempdir;
-extern crate byteorder;
 extern crate simple_signal;
 extern crate spiderq_proto as proto;
 #[cfg(test)] extern crate rand;
@@ -17,8 +16,7 @@ use getopts::Options;
 use time::{SteadyTime, Duration};
 use simple_signal::Signal;
 
-pub mod db;
-pub mod pq;
+use spiderq::{db, pq};
 use proto::{Key, Value, LendMode, AddMode, ProtoError, GlobalReq, GlobalRep};
 
 const MAX_POLL_TIMEOUT: i64 = 100;
