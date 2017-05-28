@@ -6,7 +6,7 @@ extern crate simple_signal;
 extern crate spiderq_proto as proto;
 #[cfg(test)] extern crate rand;
 
-use std::{io, env, mem, process};
+use std::{io, env, process};
 use std::io::Write;
 use std::convert::From;
 use std::thread::{Builder, JoinHandle};
@@ -398,6 +398,7 @@ fn master(mut sock_ext: zmq::Socket,
             _ => (),
         }
 
+        let mut pq_changed = false;
         let before_poll_ts = SteadyTime::now();
 
         // calculate poll delay
@@ -412,9 +413,11 @@ fn master(mut sock_ext: zmq::Socket,
                 let interval = next_trigger - before_poll_ts;
                 match interval.num_milliseconds() {
                     timeout if timeout <= 0 => {
-                        next_timeout = None;
                         tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &chan_pq_tx);
-                        continue;
+                        tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
+                        next_timeout = None;
+                        pq_changed = true;
+                        MAX_POLL_TIMEOUT
                     },
                     timeout if timeout > MAX_POLL_TIMEOUT =>
                         MAX_POLL_TIMEOUT,
@@ -514,11 +517,13 @@ fn master(mut sock_ext: zmq::Socket,
                     DbRep::Local(DbLocalRep::Added(key, mode)) => {
                         tx_chan(PqReq::Local(PqLocalReq::Enqueue(key, mode)), None, &chan_pq_tx);
                         stats_add += 1;
+                        pq_changed = true;
                         tx_sock(GlobalRep::Added, message.headers, &mut sock_ext)?;
                     },
                     DbRep::Local(DbLocalRep::Removed(key)) => {
                         tx_chan(PqReq::Local(PqLocalReq::Remove(key)), None, &chan_pq_tx);
                         stats_remove += 1;
+                        pq_changed = true;
                         tx_sock(GlobalRep::Removed, message.headers, &mut sock_ext)?;
                     },
                     DbRep::Local(DbLocalRep::LentNotFound(key, timeout, trigger_at, mode)) => {
@@ -556,6 +561,7 @@ fn master(mut sock_ext: zmq::Socket,
                         stats_heartbeat += 1;
                         tx_sock(rep, message.headers, &mut sock_ext)?;
                         next_timeout = None;
+                        pq_changed = true;
                     },
                     PqRep::Global(rep @ GlobalRep::Skipped) => {
                         stats_heartbeat += 1;
@@ -593,6 +599,7 @@ fn master(mut sock_ext: zmq::Socket,
                     PqRep::Local(PqLocalRep::Repaid(key, value)) => {
                         tx_chan(DbReq::Local(DbLocalReq::RepayUpdate(key, value)), message.headers, &chan_db_tx);
                         next_timeout = None;
+                        pq_changed = true;
                     }
                     PqRep::Local(PqLocalRep::TriggerGot(trigger_at)) =>
                         next_timeout = Some(trigger_at),
@@ -608,6 +615,11 @@ fn master(mut sock_ext: zmq::Socket,
                 Err(TryRecvError::Disconnected) =>
                     panic!("pq worker thread is down"),
             }
+        }
+
+        // repeat pending requests if need to
+        if pq_changed {
+            incoming_queue.extend(pending_queue.drain(..));
         }
 
         // process incoming messages
@@ -661,8 +673,6 @@ fn master(mut sock_ext: zmq::Socket,
                 },
             }
         }
-
-        mem::swap(&mut incoming_queue, &mut pending_queue);
     }
 }
 
