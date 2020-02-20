@@ -1,23 +1,44 @@
-extern crate spiderq;
-extern crate zmq;
-extern crate time;
-extern crate getopts;
-extern crate simple_signal;
-extern crate spiderq_proto as proto;
-#[cfg(test)] extern crate rand;
+use std::{
+    io::{
+        self,
+        Write,
+    },
+    env,
+    process,
+    convert::From,
+    thread::{
+        Builder,
+        JoinHandle,
+    },
+    sync::mpsc::{
+        channel,
+        Sender,
+        Receiver,
+        TryRecvError,
+    },
+    num::ParseIntError,
+};
 
-use std::{io, env, process};
-use std::io::Write;
-use std::convert::From;
-use std::thread::{Builder, JoinHandle};
-use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
-use std::num::ParseIntError;
+use time::{
+    Duration,
+    SteadyTime,
+};
+
 use getopts::Options;
-use time::{SteadyTime, Duration};
+
 use simple_signal::Signal;
 
 use spiderq::{db, pq};
-use proto::{Key, Value, LendMode, AddMode, ProtoError, GlobalReq, GlobalRep};
+
+use spiderq_proto::{
+    Key,
+    Value,
+    LendMode,
+    AddMode,
+    ProtoError,
+    GlobalReq,
+    GlobalRep,
+};
 
 const MAX_POLL_TIMEOUT: i64 = 100;
 
