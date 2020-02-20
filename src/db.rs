@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::thread::{spawn, JoinHandle};
-use std::collections::HashMap;
-use std::collections::hash_map;
+use std::collections::BTreeMap;
+use std::collections::btree_map;
 use std::iter::Iterator;
 use tempdir::TempDir;
 use byteorder::{ReadBytesExt, WriteBytesExt, NativeEndian};
@@ -17,7 +17,7 @@ enum ValueSlot {
     Tombstone,
 }
 
-type Index = HashMap<Key, ValueSlot>;
+type Index = BTreeMap<Key, ValueSlot>;
 
 #[derive(Debug)]
 pub enum Error {
@@ -315,7 +315,7 @@ impl Drop for Database {
 pub struct Iter<'a> {
     indices: Vec<&'a Index>,
     index: usize,
-    iter: Option<hash_map::Iter<'a, Key, ValueSlot>>,
+    iter: Option<btree_map::Iter<'a, Key, ValueSlot>>,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -377,7 +377,7 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
         Ok(file) => {
             let mut source = io::BufReader::new(file);
             let total = source.read_u64::<NativeEndian>().map_err(|e| Error::DatabaseRead(From::from(e)))? as usize;
-            let mut index = Index::with_capacity(total);
+            let mut index = Index::new();
             for _ in 0 .. total {
                 let (key, value) = (read_vec(&mut source)?, read_vec(&mut source)?);
                 index.insert(Arc::new(key), ValueSlot::Value(Arc::new(value)));
