@@ -16,7 +16,6 @@ use std::{
         Receiver,
         TryRecvError,
     },
-    num::ParseIntError,
 };
 
 use time::{
@@ -701,7 +700,6 @@ fn main() {
     let mut opts = Options::new();
 
     opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
-    opts.optopt("l", "flush-limit", "database disk sync threshold (items modified before flush) (optional, default: 131072)", "");
     opts.optopt("z", "zmq-addr", "zeromq interface listen address (optional, default: ipc://./spiderq.ipc)", "");
 
     match bootstrap(opts.parse(args)) {
@@ -723,7 +721,7 @@ mod test {
     use std::fmt::Debug;
     use std::thread::spawn;
     use time::{SteadyTime, Duration};
-    use rand::{thread_rng, sample, Rng};
+    use rand::{thread_rng, Rng, distributions::Uniform};
     use std::sync::mpsc::{channel, Sender, Receiver};
     use zmq;
     use spiderq_proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
@@ -762,10 +760,19 @@ mod test {
 
     fn rnd_kv() -> (Key, Value) {
         let mut rng = thread_rng();
-        let key_len = rng.gen_range(1, 64);
-        let value_len = rng.gen_range(1, 64);
-        (Arc::new(sample(&mut rng, 0 .. 255, key_len)),
-         Arc::new(sample(&mut rng, 0 .. 255, value_len)))
+        let byte_range = Uniform::from(0..255);
+
+        let key: Key = rng
+            .sample_iter(byte_range)
+            .take(rng.gen_range(1, 64))
+            .collect();
+
+        let value: Value = rng
+            .sample_iter(byte_range)
+            .take(rng.gen_range(1, 64))
+            .collect();
+
+        (key, value)
     }
 
     #[test]

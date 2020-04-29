@@ -175,7 +175,7 @@ mod test {
     use super::super::proto::{Key, RepayStatus, AddMode};
 
     fn as_key(value: usize) -> Key {
-        Arc::new(format!("{}", value).into_bytes())
+        Arc::from(format!("{}", value).as_bytes())
     }
 
     fn make_pq(len: usize) -> PQueue {
