@@ -90,12 +90,11 @@ impl Snapshot {
 
 pub struct Database {
     database_dir: Arc<PathBuf>,
-    flush_limit: usize,
     snapshots: Vec<Snapshot>,
 }
 
 impl Database {
-    pub fn new(database_dir: &str, flush_limit: usize) -> Result<Database, Error> {
+    pub fn new(database_dir: &str) -> Result<Database, Error> {
         match fs::metadata(database_dir) {
             Ok(ref metadata) if metadata.is_dir() => (),
             Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
@@ -111,8 +110,7 @@ impl Database {
 
         Ok(Database {
             database_dir: Arc::new(PathBuf::from(database_dir)),
-            flush_limit: flush_limit,
-            snapshots: snapshots,
+            snapshots,
         })
     }
 
@@ -161,7 +159,7 @@ impl Database {
         loop {
             // Check if memory part overflowed
             if let Some(index_to_freeze) = match self.snapshots.first_mut() {
-                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (idx.len() != 0 && flush_mode) =>
+                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() != 0 && flush_mode) =>
                     Some(mem::replace(idx, Index::new())),
                 _ =>
                     None,
@@ -460,9 +458,9 @@ mod test {
     use super::{Database};
     use super::super::proto::{Key, Value};
 
-    fn mkdb(path: &str, flush_limit: usize) -> Database {
+    fn mkdb(path: &str) -> Database {
         let _ = fs::remove_dir_all(path);
-        Database::new(path, flush_limit).unwrap()
+        Database::new(path).unwrap()
     }
 
     fn rnd_kv() -> (Key, Value) {
@@ -505,13 +503,13 @@ mod test {
 
     #[test]
     fn make() {
-        let db = mkdb("/tmp/spiderq_a", 10);
+        let db = mkdb("/tmp/spiderq_a");
         assert_eq!(db.approx_count(), 0);
     }
 
     #[test]
     fn insert_lookup() {
-        let mut db = mkdb("/tmp/spiderq_b", 16);
+        let mut db = mkdb("/tmp/spiderq_b");
         assert_eq!(db.approx_count(), 0);
         let mut check_table = HashMap::new();
         rnd_fill_check(&mut db, &mut check_table, 10);
@@ -521,12 +519,12 @@ mod test {
     fn save_load() {
         let mut check_table = HashMap::new();
         {
-            let mut db = mkdb("/tmp/spiderq_c", 16);
+            let mut db = mkdb("/tmp/spiderq_c");
             assert_eq!(db.approx_count(), 0);
             rnd_fill_check(&mut db, &mut check_table, 10);
         }
         {
-            let db = Database::new("/tmp/spiderq_c", 16).unwrap();
+            let db = Database::new("/tmp/spiderq_c").unwrap();
             assert_eq!(db.approx_count(), 10);
             check_against(&db, &check_table);
         }
@@ -536,11 +534,11 @@ mod test {
     fn stress() {
         let mut check_table = HashMap::new();
         {
-            let mut db = mkdb("/tmp/spiderq_d", 160);
+            let mut db = mkdb("/tmp/spiderq_d");
             rnd_fill_check(&mut db, &mut check_table, 2560);
         }
         {
-            let db = Database::new("/tmp/spiderq_d", 160).unwrap();
+            let db = Database::new("/tmp/spiderq_d").unwrap();
             assert!(db.approx_count() <= 2560);
             check_against(&db, &check_table);
         }
@@ -550,14 +548,14 @@ mod test {
     fn iter() {
         let mut check_table = HashMap::new();
         {
-            let mut db = mkdb("/tmp/spiderq_e", 64);
+            let mut db = mkdb("/tmp/spiderq_e");
             rnd_fill_check(&mut db, &mut check_table, 1024);
             for (k, v) in db.iter() {
                 assert_eq!(check_table.get(k), Some(v));
             }
         }
         {
-            let db = Database::new("/tmp/spiderq_e", 64).unwrap();
+            let db = Database::new("/tmp/spiderq_e").unwrap();
             for (k, v) in db.iter() {
                 assert_eq!(check_table.get(k), Some(v));
             }

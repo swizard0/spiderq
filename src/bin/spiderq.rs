@@ -47,7 +47,6 @@ pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
     Zmq(ZmqError),
-    InvalidFlushLimit(ParseIntError),
 }
 
 #[derive(Debug)]
@@ -72,7 +71,6 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
     let matches = maybe_matches.map_err(Error::Getopts)?;
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
-    let flush_limit: usize = matches.opt_str("flush-limit").unwrap_or("131072".to_owned()).parse().map_err(Error::InvalidFlushLimit)?;
     let zmq_addr_cloned = zmq_addr.replace("//*:", "//127.0.0.1:");
     simple_signal::set_handler(&[Signal::Hup, Signal::Int, Signal::Quit, Signal::Abrt, Signal::Term], move |signals| {
         let zmq_ctx = zmq::Context::new();
@@ -93,11 +91,11 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
             other => panic!("unexpected reply for terminate: {:?}", other),
         }
     });
-    entrypoint(&zmq_addr, &database_dir, flush_limit)
+    entrypoint(&zmq_addr, &database_dir)
 }
 
-pub fn entrypoint(zmq_addr: &str, database_dir: &str, flush_limit: usize) -> Result<(zmq::Context, JoinHandle<()>), Error> {
-    let db = db::Database::new(database_dir, flush_limit).map_err(Error::Db)?;
+pub fn entrypoint(zmq_addr: &str, database_dir: &str) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    let db = db::Database::new(database_dir).map_err(Error::Db)?;
     let mut pq = pq::PQueue::new();
     // initially fill pq
     for (k, _) in db.iter() {
@@ -727,8 +725,9 @@ mod test {
     use time::{SteadyTime, Duration};
     use rand::{thread_rng, sample, Rng};
     use std::sync::mpsc::{channel, Sender, Receiver};
-    use super::proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
-    use super::{zmq, db, pq, worker_db, worker_pq, tx_chan, entrypoint};
+    use zmq;
+    use spiderq_proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
+    use super::{db, pq, worker_db, worker_pq, tx_chan, entrypoint};
     use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
     fn with_worker<WF, MF, Req, Rep>(base_addr: &str, worker_fn: WF, master_fn: MF) where
@@ -773,7 +772,7 @@ mod test {
     fn db_worker() {
         let path = "/tmp/spiderq_main";
         let _ = fs::remove_dir_all(path);
-        let db = db::Database::new(path, 16).unwrap();
+        let db = db::Database::new(path).unwrap();
         with_worker(
             "db",
             move |sock_db_master_tx, chan_tx, chan_rx| worker_db(sock_db_master_tx, chan_tx, chan_rx, db).unwrap(),
@@ -923,7 +922,7 @@ mod test {
         let path = "/tmp/spiderq_server";
         let _ = fs::remove_dir_all(path);
         let zmq_addr = "inproc://server";
-        let (ctx, master_thread) = entrypoint(zmq_addr, path, 16).unwrap();
+        let (ctx, master_thread) = entrypoint(zmq_addr, path).unwrap();
         let mut sock_ftd = ctx.socket(zmq::REQ).unwrap();
         sock_ftd.connect(zmq_addr).unwrap();
         let sock = &mut sock_ftd;
