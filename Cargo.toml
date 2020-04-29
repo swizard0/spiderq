@@ -11,6 +11,7 @@ time = "^0.1"
 tempdir = "^0.3"
 zmq = "^0.8"
 simple-signal = "^1.1"
+sled = "0.31"
 spiderq_proto = { path = "spiderq-proto" }
 
 [dev-dependencies]
