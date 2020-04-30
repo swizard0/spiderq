@@ -20,7 +20,6 @@ use std::{
 
 use time::{
     Duration,
-    SteadyTime,
 };
 
 use getopts::Options;
@@ -95,8 +94,9 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
 
 pub fn entrypoint(zmq_addr: &str, database_dir: &str) -> Result<(zmq::Context, JoinHandle<()>), Error> {
     let db = db::Database::new(database_dir).map_err(Error::Db)?;
-    let mut pq = pq::PQueue::new();
+    let mut pq = pq::PQueue::new(database_dir);
     // initially fill pq
+    // TODO: add all non-existent elements
     for (k, _) in db.iter() {
         pq.add(k.clone(), AddMode::Tail)
     }
@@ -137,7 +137,7 @@ pub fn entrypoint(zmq_addr: &str, database_dir: &str) -> Result<(zmq::Context, J
 
 #[derive(Debug, PartialEq)]
 pub enum DbLocalReq {
-    LoadLent(u64, Key, u64, SteadyTime, LendMode),
+    LoadLent(u64, Key, u64, pq::Instant, LendMode),
     RepayUpdate(Key, Value),
     Stop,
 }
@@ -146,9 +146,9 @@ pub enum DbLocalReq {
 pub enum PqLocalReq {
     NextTrigger,
     Enqueue(Key, AddMode),
-    LendUntil(u64, SteadyTime, LendMode),
+    LendUntil(u64, pq::Instant, LendMode),
     RepayTimedOut,
-    Heartbeat(u64, Key, SteadyTime),
+    Heartbeat(u64, Key, pq::Instant),
     Remove(Key),
     Stop,
 }
@@ -157,14 +157,14 @@ pub enum PqLocalReq {
 pub enum DbLocalRep {
     Added(Key, AddMode),
     Removed(Key),
-    LentNotFound(Key, u64, SteadyTime, LendMode),
+    LentNotFound(Key, u64, pq::Instant, LendMode),
     Stopped,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PqLocalRep {
-    TriggerGot(Option<SteadyTime>),
-    Lent(u64, Key, u64, SteadyTime, LendMode),
+    TriggerGot(Option<pq::Instant>),
+    Lent(u64, Key, u64, pq::Instant, LendMode),
     EmptyQueueHit { timeout: u64, },
     Repaid(Key, Value),
     Stopped,
@@ -399,7 +399,7 @@ fn master(mut sock_ext: zmq::Socket,
     let mut stats_stats = 0;
 
     let (mut incoming_queue, mut pending_queue) = (Vec::new(), Vec::new());
-    let mut next_timeout: Option<Option<SteadyTime>> = None;
+    let mut next_timeout: Option<Option<pq::Instant>> = None;
     let mut stop_state = StopState::NotTriggered;
 
     // sync with workers
@@ -417,7 +417,7 @@ fn master(mut sock_ext: zmq::Socket,
         }
 
         let mut pq_changed = false;
-        let before_poll_ts = SteadyTime::now();
+        let before_poll_ts = pq::Instant::now();
 
         // calculate poll delay
         let timeout = match next_timeout {
@@ -457,7 +457,7 @@ fn master(mut sock_ext: zmq::Socket,
              pollitems[2].get_revents() == zmq::POLLIN]
         };
 
-        let after_poll_ts = SteadyTime::now();
+        let after_poll_ts = pq::Instant::now();
         if avail_socks[0] {
             // sock_ext is online
             match rx_sock(&mut sock_ext) {
@@ -717,10 +717,9 @@ fn main() {
 #[cfg(test)]
 mod test {
     use std::fs;
-    use std::sync::Arc;
     use std::fmt::Debug;
     use std::thread::spawn;
-    use time::{SteadyTime, Duration};
+    use time::Duration;
     use rand::{thread_rng, Rng, distributions::Uniform};
     use std::sync::mpsc::{channel, Sender, Receiver};
     use zmq;
@@ -794,7 +793,7 @@ mod test {
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   DbReq::Global(GlobalReq::Add { key: key_b.clone(), value: value_b.clone(), mode: AddMode::Head, }),
                                   DbRep::Local(DbLocalRep::Added(key_b.clone(), AddMode::Head)));
-                let now = SteadyTime::now();
+                let now = pq::Instant::now();
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   DbReq::Local(DbLocalReq::LoadLent(177, key_a.clone(), 1000, now, LendMode::Poll)),
                                   DbRep::Global(GlobalRep::Lent { lend_key: 177, key: key_a.clone(), value: value_a.clone(), }));
@@ -825,13 +824,15 @@ mod test {
 
     #[test]
     fn pq_worker() {
-        let pq = pq::PQueue::new();
+        let path = "/tmp/spiderq_pq_main";
+        let _ = fs::remove_dir_all(path);
+        let pq = pq::PQueue::new(path);
         with_worker(
             "pq",
             move |sock_pq_master_tx, chan_tx, chan_rx| worker_pq(sock_pq_master_tx, chan_tx, chan_rx, pq).unwrap(),
             move |mut sock, tx, rx| {
                 let ((key_a, value_a), (key_b, value_b)) = (rnd_kv(), rnd_kv());
-                let now = SteadyTime::now();
+                let now = pq::Instant::now();
                 assert_worker_cmd(&mut sock, &tx, &rx, PqReq::Global(GlobalReq::Count), PqRep::Global(GlobalRep::Counted(0)));
                 assert_worker_cmd(&mut sock, &tx, &rx,
                                   PqReq::Local(PqLocalReq::LendUntil(1000, now + Duration::milliseconds(1000), LendMode::Poll)),
@@ -852,7 +853,7 @@ mod test {
                                   PqReq::Local(PqLocalReq::NextTrigger),
                                   PqRep::Local(PqLocalRep::TriggerGot(Some(now + Duration::milliseconds(500)))));
                 assert_worker_cmd(&mut sock, &tx, &rx,
-                                  PqReq::Local(PqLocalReq::LendUntil(250, SteadyTime::now() + Duration::milliseconds(250), LendMode::Block)),
+                                  PqReq::Local(PqLocalReq::LendUntil(250, pq::Instant::now() + Duration::milliseconds(250), LendMode::Block)),
                                   PqRep::Local(PqLocalRep::EmptyQueueHit { timeout: 250 }));
                 tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &tx);
                 assert_worker_cmd(&mut sock, &tx, &rx,
@@ -969,18 +970,18 @@ mod test {
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 6, key: key_a.clone(), value: value_b.clone(), });
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
 
-        fn round_ms(t: SteadyTime, expected: i64, variance: i64) -> i64 {
-            let value = (SteadyTime::now() - t).num_milliseconds();
+        fn round_ms(t: pq::Instant, expected: i64, variance: i64) -> i64 {
+            let value = (pq::Instant::now() - t).num_milliseconds();
             ((value + variance) / expected) * expected
         }
-        let t_start_a = SteadyTime::now();
+        let t_start_a = pq::Instant::now();
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 7, key: key_a.clone(), value: value_b.clone(), });
         assert_eq!(round_ms(t_start_a, 1000, 100), 1000);
         tx_sock(GlobalReq::Count, sock); assert_eq!(rx_sock(sock), GlobalRep::Counted(0));
         tx_sock(GlobalReq::Update(key_a.clone(), value_a.clone()), sock); assert_eq!(rx_sock(sock), GlobalRep::Updated);
         tx_sock(GlobalReq::Heartbeat { lend_key: 7, key: key_a.clone(), timeout: 1000, }, sock); assert_eq!(rx_sock(sock), GlobalRep::Heartbeaten);
-        let t_start_b = SteadyTime::now();
+        let t_start_b = pq::Instant::now();
         tx_sock(GlobalReq::Lend { timeout: 500, mode: LendMode::Block, }, sock);
         assert_eq!(rx_sock(sock), GlobalRep::Lent { lend_key: 8, key: key_a.clone(), value: value_a.clone(), });
         assert_eq!(round_ms(t_start_b, 1000, 100), 1000);

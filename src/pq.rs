@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::collections::hash_map::Entry;
-use time::SteadyTime;
+use serde::{Serialize, Deserialize};
 use super::proto::{Key, RepayStatus, AddMode};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PQueueEntry {
     key: Key,
     priority: u64,
@@ -23,17 +23,63 @@ impl PartialOrd for PQueueEntry {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Instant(i128);
+
+use time::{OffsetDateTime, Duration};
+
+impl Instant {
+    pub fn to_be_bytes(&self) -> [u8; 16] {
+        self.0.to_be_bytes()
+    }
+
+    pub fn now() -> Self {
+        let d = OffsetDateTime::now_utc() - OffsetDateTime::unix_epoch();
+        Self(d.whole_nanoseconds())
+    }
+}
+
+impl std::ops::Sub for Instant {
+    type Output = Duration;
+
+    fn sub(self, other: Self) -> Self::Output {
+        Duration::nanoseconds(self.0 as i64) - Duration::nanoseconds(other.0 as i64)
+    }
+}
+
+impl std::ops::Add<Duration> for Instant {
+    type Output = Self;
+
+    fn add(self, d: Duration) -> Self {
+        let d = Duration::nanoseconds(self.0 as i64) + d;
+        Self(d.whole_nanoseconds())
+    }
+}
+
+impl Ord for Instant {
+    fn cmp(&self, other: &Instant) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Instant {
+    fn partial_cmp(&self, other: &Instant) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
 struct LentEntry {
-    trigger_at: SteadyTime,
+    trigger_at: Instant,
     key: Key,
     snapshot: u64,
 }
 
+
 struct LendSnapshot {
     entry: PQueueEntry,
     serial: u64,
-    recycle: Option<SteadyTime>,
+    recycle: Option<Instant>,
 }
 
 impl Ord for LentEntry {
@@ -50,19 +96,77 @@ impl PartialOrd for LentEntry {
 
 pub struct PQueue {
     serial: u64,
+    db_path: std::path::PathBuf,
     queue: BinaryHeap<PQueueEntry>,
     lentm: HashMap<Key, LendSnapshot>,
-    lentq: BinaryHeap<LentEntry>,
+    lentq: BinaryHeap<LentEntry>
 }
 
+const QUEUE_FILENAME: &str = "queue_dump";
+const LENTQ_FILENAME: &str = "lentq_dump";
+
 impl PQueue {
-    pub fn new() -> PQueue {
+    pub fn new(database_dir: &str) -> PQueue {
+        let mut db_path = std::path::PathBuf::from(database_dir);
+        db_path.push("queue");
+
+        db_path.push(QUEUE_FILENAME);
+        let queue = match std::fs::File::open(&db_path) {
+            Ok(file) => {
+                let rdr = std::io::BufReader::new(file);
+                bincode::deserialize_from(rdr).expect("failed to deserialize queue dump")
+            }
+            Err(_) => BinaryHeap::new()
+        };
+        db_path.pop();
+
+        db_path.push(LENTQ_FILENAME);
+        let lentq = match std::fs::File::open(&db_path) {
+            Ok(file) => {
+                let rdr = std::io::BufReader::new(file);
+                bincode::deserialize_from(rdr).expect("failed to deserialize lentq dump")
+            }
+            Err(_) => BinaryHeap::new()
+        };
+        db_path.pop();
+
         PQueue {
             serial: 1,
-            queue: BinaryHeap::new(),
             lentm: HashMap::new(),
-            lentq: BinaryHeap::new(),
+            queue,
+            lentq,
+            db_path
         }
+    }
+
+    fn dump(&mut self) {
+        if self.serial % 100 != 0 {
+            return;
+        }
+
+        // TODO: dump and restore lentm too
+
+        match std::fs::metadata(&self.db_path) {
+            Ok(ref metadata) if metadata.is_dir() => {},
+            Ok(_) => {
+                panic!("not a dir");
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound =>
+                std::fs::create_dir_all(&self.db_path).expect("failed to create queue dump dir"),
+            Err(_) => {
+                panic!("failed to stat metadata");
+            }
+        }
+
+        self.db_path.push(QUEUE_FILENAME);
+        let f = std::fs::File::create(&self.db_path).expect("failed to create queue dump");
+        bincode::serialize_into(f, &self.queue).expect("failed to write queue dump");
+        self.db_path.pop();
+
+        self.db_path.push(LENTQ_FILENAME);
+        let f = std::fs::File::create(&self.db_path).expect("failed to create lentq dump");
+        bincode::serialize_into(f, &self.lentq).expect("failed to write lentq dump");
+        self.db_path.pop();
     }
 
     pub fn len(&self) -> usize {
@@ -71,53 +175,70 @@ impl PQueue {
 
     pub fn add(&mut self, key: Key, mode: AddMode) {
         self.serial += 1;
-        self.queue.push(PQueueEntry {
-            key: key,
-            priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
+
+        let priority = match mode {
+            AddMode::Head => 0,
+            AddMode::Tail => self.serial
+        };
+
+        let value = PQueueEntry {
+            key,
+            priority,
             boost: 0,
-        });
+        };
+
+        self.queue.push(value);
+
+        self.dump();
     }
 
     pub fn top(&self) -> Option<(Key, u64)> {
         self.queue.peek().map(|e| (e.key.clone(), self.serial))
     }
 
-    pub fn lend(&mut self, trigger_at: SteadyTime) -> Option<u64> {
+    pub fn lend(&mut self, trigger_at: Instant) -> Option<u64> {
         if let Some(entry) = self.queue.pop() {
-            self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
-            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
+            self.lentq.push(LentEntry { trigger_at, key: entry.key.clone(), snapshot: self.serial });
+            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry, });
+            self.dump();
             Some(self.serial)
         } else {
             None
         }
     }
 
-    pub fn next_timeout(&mut self) -> Option<SteadyTime> {
+    pub fn next_timeout(&mut self) -> Option<Instant> {
         loop {
-            let do_recycle = if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
-                match self.lentm.get_mut(k) {
-                    Some(ref mut snapshot) if snapshot.recycle.is_some() =>
-                        snapshot.recycle.take(),
-                    Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
-                        return Some(trigger),
-                    _ =>
-                        None,
-                }
-            } else {
-                break
-            };
+            let do_recycle =
+                if let Some(LentEntry {
+                    trigger_at,
+                    key,
+                    snapshot: qshot, ..
+                }) = self.lentq.peek() {
+                    match self.lentm.get_mut(key) {
+                        Some(ref mut snapshot) if snapshot.recycle.is_some() =>
+                            snapshot.recycle.take(),
+                        Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == *qshot =>
+                            return Some(*trigger_at),
+                        _ =>
+                            None,
+                    }
+                } else {
+                    break
+                };
 
             self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
                 entry.trigger_at = reschedule;
                 self.lentq.push(entry);
             });
         }
+
         None
     }
 
     pub fn repay_timed_out(&mut self) {
-        if let Some(LentEntry { key: k, snapshot: s, .. }) = self.lentq.pop() {
-            self.repay(s, k, RepayStatus::Front);
+        if let Some(LentEntry { key, snapshot, .. }) = self.lentq.pop() {
+            self.repay(snapshot, key, RepayStatus::Front);
         }
     }
 
@@ -127,7 +248,7 @@ impl PQueue {
                 return false
             }
             let LendSnapshot { mut entry, .. } = map_entry.remove();
-            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
+            let min_priority = if let Some(PQueueEntry { priority: p, .. }) = self.queue.peek() { *p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
@@ -143,13 +264,14 @@ impl PQueue {
                 _ => self.serial - (region - (region >> current_boost)),
             };
             self.queue.push(entry);
+            self.dump();
             true
         } else {
             false
         }
     }
 
-    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: SteadyTime) -> bool {
+    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> bool {
         if let Some(snapshot) = self.lentm.get_mut(key) {
             if lend_key == snapshot.serial {
                 snapshot.recycle = Some(trigger_at);
@@ -170,16 +292,17 @@ impl PQueue {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-    use time::{SteadyTime, Duration};
-    use super::PQueue;
+    use time::Duration;
+    use super::{PQueue, Instant};
     use super::super::proto::{Key, RepayStatus, AddMode};
 
     fn as_key(value: usize) -> Key {
         Arc::from(format!("{}", value).as_bytes())
     }
 
-    fn make_pq(len: usize) -> PQueue {
-        let mut pq = PQueue::new();
+    fn make_pq(len: usize, path: &str) -> PQueue {
+        let _ = std::fs::remove_dir_all(path);
+        let mut pq = PQueue::new(path);
         for i in 0 .. len {
             pq.add(as_key(i), AddMode::Tail);
         }
@@ -193,8 +316,8 @@ mod test {
 
     #[test]
     fn basic_api() {
-        let time = SteadyTime::now();
-        let mut pq = make_pq(10); // 0 1 2 3 4 5 6 7 8 9 |
+        let time = Instant::now();
+        let mut pq = make_pq(10, "/tmp/spider_pq_a"); // 0 1 2 3 4 5 6 7 8 9 |
         assert_top(&pq, as_key(0));
         let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 3 4 5 6 7 8 9 | 0
         assert_top(&pq, as_key(1));
@@ -235,8 +358,8 @@ mod test {
 
     #[test]
     fn double_lend() {
-        let time = SteadyTime::now();
-        let mut pq = make_pq(2); // 0 1 |
+        let time = Instant::now();
+        let mut pq = make_pq(2, "/tmp/spider_pq_b"); // 0 1 |
         assert_top(&pq, as_key(0));
         pq.lend(time + Duration::seconds(10)).unwrap(); // 1 | <0/10>
         assert_top(&pq, as_key(1));
@@ -254,8 +377,8 @@ mod test {
 
     #[test]
     fn several_heartbeats() {
-        let time = SteadyTime::now();
-        let mut pq = make_pq(3); // 0 1 2 |
+        let time = Instant::now();
+        let mut pq = make_pq(3, "/tmp/spider_pq_c"); // 0 1 2 |
         assert_top(&pq, as_key(0));
         let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 | <0/10>
         assert_top(&pq, as_key(1));
