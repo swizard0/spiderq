@@ -2,6 +2,24 @@ use std::collections::VecDeque;
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use super::proto::{Key, RepayStatus, AddMode};
 
+#[derive(Debug)]
+pub enum Error {
+    DatabaseDriverError(sled::Error),
+    EncodingError(bincode::Error)
+}
+
+impl From<sled::Error> for Error {
+    fn from(err: sled::Error) -> Self {
+        Error::DatabaseDriverError(err)
+    }
+}
+
+impl From<bincode::Error> for Error {
+    fn from(err: bincode::Error) -> Self {
+        Error::EncodingError(err)
+    }
+}
+
 trait OrdKey {
     type Output: AsRef<[u8]>;
 
@@ -99,27 +117,24 @@ where
     K: AsRef<[u8]>,
     V: Serialize + DeserializeOwned
 {
-    fn insert(&self, key: K, value: V) {
-        let value = bincode::serialize(&value).unwrap();
-        self.inner.insert(key, value).unwrap();
+    fn insert(&self, key: K, value: V) -> Result<(), Error> {
+        let value = bincode::serialize(&value)?;
+        self.inner.insert(key, value)?;
+        Ok(())
     }
 
-    fn get(&self, key: &K) -> Option<V> {
+    fn get(&self, key: &K) -> Result<Option<V>, Error> {
         self.inner
-            .get(key)
-            .unwrap()
-            .map(|v| {
-                bincode::deserialize(&v).unwrap()
-            })
+            .get(key)?
+            .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
+            .transpose()
     }
 
-    fn remove(&self, key: &K) -> Option<V> {
+    fn remove(&self, key: &K) -> Result<Option<V>, Error> {
         self.inner
-            .remove(key)
-            .unwrap()
-            .map(|v| {
-                bincode::deserialize(&v).unwrap()
-            })
+            .remove(key)?
+            .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
+            .transpose()
     }
 }
 
@@ -146,7 +161,7 @@ where
         self.inner.inner.len()
     }
 
-    fn insert(&self, value: V) {
+    fn insert(&self, value: V) -> Result<(), Error> {
         let k = value.key_as_bytes();
 
         self.inner.inner.fetch_and_update(k, |v| {
@@ -168,35 +183,45 @@ where
             let v = bincode::serialize(&vec).unwrap();
 
             Some(v)
-        }).unwrap();
+        })?;
+
+        Ok(())
     }
 
-    fn top(&self) -> Option<V> {
-        self.inner.inner
-            .iter()
-            .next()
-            .and_then(|r| {
-                let (_, v) = r.unwrap();
-                let v: VecDeque<V> = bincode::deserialize(&v).unwrap();
+    fn top(&self) -> Result<Option<V>, Error> {
+        let maybe_top =
+            self.inner.inner
+                .iter()
+                .next();
 
-                v.front().cloned()
-            })
-    }
+        match maybe_top {
+            Some(r) => {
+                let (_, v) = r?;
+                let v: VecDeque<V> = bincode::deserialize(&v)?;
 
-    fn pop(&self) -> Option<V> {
-        let maybe_v = self.inner.inner.pop_min().unwrap();
-
-        maybe_v.and_then(|(k, v)| {
-            let mut vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
-            let to_return = vec.pop_front();
-
-            if !vec.is_empty() {
-                let v = bincode::serialize(&vec).unwrap();
-                self.inner.inner.insert(k, v).unwrap();
+                Ok(v.front().cloned())
             }
+            None => Ok(None)
+        }
+    }
 
-            to_return
-        })
+    fn pop(&self) -> Result<Option<V>, Error> {
+        let maybe_v = self.inner.inner.pop_min()?;
+
+        match maybe_v {
+            Some((k, v)) => {
+                let mut vec: VecDeque<V> = bincode::deserialize(&v)?;
+                let to_return = vec.pop_front();
+
+                if !vec.is_empty() {
+                    let v = bincode::serialize(&vec)?;
+                    self.inner.inner.insert(k, v)?;
+                }
+
+                Ok(to_return)
+            }
+            None => Ok(None)
+        }
     }
 }
 
@@ -210,7 +235,7 @@ pub struct PQueue {
 }
 
 impl PQueue {
-    pub fn new(database_dir: &str) -> PQueue {
+    pub fn new(database_dir: &str) -> Result<PQueue, Error> {
         let mut db_path = std::path::PathBuf::from(database_dir);
         db_path.push("queue");
 
@@ -218,32 +243,32 @@ impl PQueue {
             .path(db_path)
             .flush_every_ms(Some(1000));
 
-        let db = db_cfg.open().expect("failed to open pqueue db");
+        let db = db_cfg.open()?;
 
-        let queue = db.open_tree("queue").unwrap();
+        let queue = db.open_tree("queue")?;
         let queue = TreeBag::new(queue);
 
-        let lentm = db.open_tree("lentm").unwrap();
+        let lentm = db.open_tree("lentm")?;
         let lentm = Tree::new(lentm);
 
-        let lentq = db.open_tree("lentq").unwrap();
+        let lentq = db.open_tree("lentq")?;
         let lentq = TreeBag::new(lentq);
 
-        PQueue {
+        Ok(PQueue {
             serial: 1,
             lentm,
             queue,
             lentq,
             db,
             db_cfg
-        }
+        })
     }
 
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
-    pub fn add(&mut self, key: Key, mode: AddMode) {
+    pub fn add(&mut self, key: Key, mode: AddMode) -> Result<(), Error> {
         self.serial += 1;
 
         let priority = match mode {
@@ -257,48 +282,54 @@ impl PQueue {
             boost: 0,
         };
 
-        self.queue.insert(value);
+        self.queue.insert(value)?;
+
+        Ok(())
     }
 
-    pub fn top(&self) -> Option<(Key, u64)> {
-        self.queue.top()
-            .map(|e: PQueueEntry| (e.key.clone(), self.serial))
+    pub fn top(&self) -> Result<Option<(Key, u64)>, Error> {
+        let maybe_top =
+            self.queue
+                .top()?
+                .map(|e: PQueueEntry| (e.key.clone(), self.serial));
+
+        Ok(maybe_top)
     }
 
-    pub fn lend(&mut self, trigger_at: Instant) -> Option<u64> {
-        if let Some(entry) = self.queue.pop() {
+    pub fn lend(&mut self, trigger_at: Instant) -> Result<Option<u64>, Error> {
+        if let Some(entry) = self.queue.pop()? {
             // TODO: transaction
             let snapshot = LendSnapshot { serial: self.serial, recycle: None, entry: entry.clone() };
-            self.lentm.insert(entry.key.clone(), snapshot);
+            self.lentm.insert(entry.key.clone(), snapshot)?;
 
             let lent_entry = LentEntry { trigger_at, key: entry.key, snapshot: self.serial };
-            self.lentq.insert(lent_entry);
+            self.lentq.insert(lent_entry)?;
 
-            Some(self.serial)
+            Ok(Some(self.serial))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    pub fn next_timeout(&mut self) -> Option<Instant> {
+    pub fn next_timeout(&mut self) -> Result<Option<Instant>, Error> {
         loop {
             let do_recycle =
                 if let Some(LentEntry {
                     trigger_at,
                     key,
                     snapshot: qshot, ..
-                }) = self.lentq.top() {
+                }) = self.lentq.top()? {
                     let snapshot = self.lentm.get(&key);
 
                     match snapshot {
-                        Some(mut snapshot) if snapshot.recycle.is_some() => {
+                        Ok(Some(mut snapshot)) if snapshot.recycle.is_some() => {
                             let v = snapshot.recycle.take();
-                            self.lentm.insert(key, snapshot);
+                            self.lentm.insert(key, snapshot)?;
 
                             v
                         },
-                        Some(LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
-                            return Some(trigger_at),
+                        Ok(Some(LendSnapshot { serial: mshot, .. })) if mshot == qshot =>
+                            return Ok(Some(trigger_at)),
                         _ =>
                             None,
                     }
@@ -306,36 +337,40 @@ impl PQueue {
                     break
                 };
 
-            self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
-                entry.trigger_at = reschedule;
-                self.lentq.insert(entry);
-            });
+            if let Some(mut entry) = self.lentq.pop()? {
+                if let Some(reschedule) = do_recycle {
+                    entry.trigger_at = reschedule;
+                    self.lentq.insert(entry)?;
+                }
+            }
         }
 
-        None
+        Ok(None)
     }
 
-    pub fn repay_timed_out(&mut self) {
-        let entry = self.lentq.pop();
+    pub fn repay_timed_out(&mut self) -> Result<(), Error> {
+        let entry = self.lentq.pop()?;
         if let Some(LentEntry { key, snapshot, .. }) = entry {
-            self.repay(snapshot, key, RepayStatus::Front);
+            self.repay(snapshot, key, RepayStatus::Front)?;
         }
+
+        Ok(())
     }
 
-    pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> bool {
+    pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> Result<bool, Error> {
         let entry = self.lentm.get(&key);
 
-        if let Some(map_entry) = entry {
+        if let Ok(Some(map_entry)) = entry {
             if lend_key != map_entry.serial {
-                return false
+                return Ok(false)
             }
 
             let LendSnapshot { mut entry, .. } = map_entry;
-            self.lentm.remove(&key);
+            self.lentm.remove(&key)?;
 
             let min_priority =
                 self.queue
-                    .top()
+                    .top()?
                     .map(|e| e.priority)
                     .unwrap_or(0);
 
@@ -346,7 +381,7 @@ impl PQueue {
                 RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
                 RepayStatus::Reward => { entry.boost += 1; entry.boost },
                 RepayStatus::Front => 0,
-                RepayStatus::Drop => return true,
+                RepayStatus::Drop => return Ok(true),
             };
             self.serial += 1;
             entry.priority = match status {
@@ -354,33 +389,37 @@ impl PQueue {
                 _ => self.serial - (region - (region >> current_boost)),
             };
 
-            self.queue.insert(entry);
+            self.queue.insert(entry)?;
 
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> bool {
+    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> Result<bool, Error> {
         let entry = self.lentm.remove(key);
 
-        if let Some(mut snapshot) = entry {
-            if lend_key == snapshot.serial {
-                snapshot.recycle = Some(trigger_at);
-                self.lentm.insert(key.clone(), snapshot);
+        let r =
+            if let Ok(Some(mut snapshot)) = entry {
+                if lend_key == snapshot.serial {
+                    snapshot.recycle = Some(trigger_at);
+                    self.lentm.insert(key.clone(), snapshot)?;
 
-                true
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        }
+            };
+
+        Ok(r)
     }
 
-    pub fn remove(&mut self, key: Key) {
-        self.lentm.remove(&key);
+    pub fn remove(&mut self, key: Key) -> Result<(), Error> {
+        self.lentm.remove(&key)?;
+        Ok(())
     }
 }
 
@@ -397,15 +436,15 @@ mod test {
 
     fn make_pq(len: usize, path: &str) -> PQueue {
         let _ = std::fs::remove_dir_all(path);
-        let mut pq = PQueue::new(path);
+        let mut pq = PQueue::new(path).unwrap();
         for i in 0 .. len {
-            pq.add(as_key(i), AddMode::Tail);
+            pq.add(as_key(i), AddMode::Tail).unwrap();
         }
         pq
     }
 
     fn assert_top(pq: &PQueue, sample: Key) {
-        let (peek, _) = pq.top().unwrap();
+        let (peek, _) = pq.top().unwrap().unwrap();
         assert_eq!(peek, sample);
     }
 
@@ -414,20 +453,20 @@ mod test {
         let time = Instant::now();
         let mut pq = make_pq(10, "/tmp/spider_pq_a"); // 0 1 2 3 4 5 6 7 8 9 |
         assert_top(&pq, as_key(0));
-        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 3 4 5 6 7 8 9 | <0/10>
+        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap().unwrap(); // 1 2 3 4 5 6 7 8 9 | <0/10>
         assert_top(&pq, as_key(1));
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
-        let lend_key_1 = pq.lend(time + Duration::seconds(5)).unwrap(); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(10)));
+        let lend_key_1 = pq.lend(time + Duration::seconds(5)).unwrap().unwrap(); // 2 3 4 5 6 7 8 9 | <1/5> <0/10>
         assert_top(&pq, as_key(2));
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(5)));
-        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(13))); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
-        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(7))); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(7)));
-        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Reward)); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(5)));
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(13)).unwrap()); // 2 3 4 5 6 7 8 9 | <1/5> <0/13>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(7)).unwrap()); // 2 3 4 5 6 7 8 9 | <1/7> <0/13>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(7)));
+        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Reward).unwrap()); // 2 3 4 5 (1 6) 7 8 9 | <0/13>
         assert_top(&pq, as_key(2));
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(13)));
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(13)));
         pq.repay_timed_out(); // 0 2 3 4 5 (1 6) 7 8 9 |
-        assert_eq!(pq.next_timeout(), None);
+        assert_eq!(pq.next_timeout().unwrap(), None);
         assert_top(&pq, as_key(0));
         pq.lend(time + Duration::seconds(5)).unwrap(); // 2 3 4 5 (1 6) 7 8 9 | <0/5>
         assert_top(&pq, as_key(2));
@@ -458,15 +497,15 @@ mod test {
         assert_top(&pq, as_key(0));
         pq.lend(time + Duration::seconds(10)).unwrap(); // 1 | <0/10>
         assert_top(&pq, as_key(1));
-        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap(); // | <0/10> <1/15>
+        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap().unwrap(); // | <0/10> <1/15>
         assert_eq!(pq.len(), 0);
-        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Penalty)); // 1 | <0/10>
+        assert!(pq.repay(lend_key_1, as_key(1), RepayStatus::Penalty).unwrap()); // 1 | <0/10>
         assert_top(&pq, as_key(1));
         pq.lend(time + Duration::seconds(20)).unwrap(); // | <0/10> <1/20>
         assert_eq!(pq.len(), 0);
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(10)));
         pq.repay_timed_out(); // 0 | <1/20>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(20)));
         assert_top(&pq, as_key(0));
     }
 
@@ -475,21 +514,21 @@ mod test {
         let time = Instant::now();
         let mut pq = make_pq(3, "/tmp/spider_pq_c"); // 0 1 2 |
         assert_top(&pq, as_key(0));
-        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap(); // 1 2 | <0/10>
+        let lend_key_0 = pq.lend(time + Duration::seconds(10)).unwrap().unwrap(); // 1 2 | <0/10>
         assert_top(&pq, as_key(1));
-        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap(); // 2 | <0/10> <1/15>
+        let lend_key_1 = pq.lend(time + Duration::seconds(15)).unwrap().unwrap(); // 2 | <0/10> <1/15>
         assert_top(&pq, as_key(2));
         pq.lend(time + Duration::seconds(20)).unwrap(); // | <0/10> <1/15> <2/20>
         assert_eq!(pq.len(), 0);
-        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(17))); // | <0/10> <1/17> <2/20>
-        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(18))); // | <0/10> <1/18> <2/20>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(10)));
-        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(19))); // | <1/18> <0/19> <2/20>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(18)));
-        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(21))); // | <0/19> <2/20> <1/21>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(19)));
-        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(22))); // | <2/20> <1/21> <0/22>
-        assert_eq!(pq.next_timeout(), Some(time + Duration::seconds(20)));
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(17)).unwrap()); // | <0/10> <1/17> <2/20>
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(18)).unwrap()); // | <0/10> <1/18> <2/20>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(10)));
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(19)).unwrap()); // | <1/18> <0/19> <2/20>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(18)));
+        assert!(pq.heartbeat(lend_key_1, &as_key(1), time + Duration::seconds(21)).unwrap()); // | <0/19> <2/20> <1/21>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(19)));
+        assert!(pq.heartbeat(lend_key_0, &as_key(0), time + Duration::seconds(22)).unwrap()); // | <2/20> <1/21> <0/22>
+        assert_eq!(pq.next_timeout().unwrap(), Some(time + Duration::seconds(20)));
         pq.repay_timed_out(); // 2 | <1/21> <0/22>
         assert_top(&pq, as_key(2));
         pq.lend(time + Duration::seconds(100)).unwrap(); // | <1/21> <0/22> <2/100>

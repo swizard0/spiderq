@@ -44,7 +44,14 @@ const MAX_POLL_TIMEOUT: i64 = 100;
 pub enum Error {
     Getopts(getopts::Fail),
     Db(db::Error),
+    Pq(pq::Error),
     Zmq(ZmqError),
+}
+
+impl From<pq::Error> for Error {
+    fn from(err: pq::Error) -> Self {
+        Error::Pq(err)
+    }
 }
 
 #[derive(Debug)]
@@ -94,12 +101,7 @@ pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHa
 
 pub fn entrypoint(zmq_addr: &str, database_dir: &str) -> Result<(zmq::Context, JoinHandle<()>), Error> {
     let db = db::Database::new(database_dir).map_err(Error::Db)?;
-    let mut pq = pq::PQueue::new(database_dir);
-    // initially fill pq
-    // TODO: add all non-existent elements
-    for (k, _) in db.iter() {
-        pq.add(k.clone(), AddMode::Tail)
-    }
+    let pq = pq::PQueue::new(database_dir).map_err(Error::Pq)?;
 
     let ctx = zmq::Context::new();
     let sock_master_ext = ctx.socket(zmq::ROUTER).map_err(ZmqError::Socket).map_err(Error::Zmq)?;
@@ -265,13 +267,13 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                 if db.lookup(&k).is_some() {
                     tx_chan_n(DbRep::Global(GlobalRep::Kept), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
-                    db.insert(k.clone(), v);
+                    db.insert(k.clone(), v)?;
                     tx_chan_n(DbRep::Local(DbLocalRep::Added(k, m)), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
             DbReq::Global(GlobalReq::Update(key, value)) => {
                 if db.lookup(&key).is_some() {
-                    db.insert(key.clone(), value);
+                    db.insert(key.clone(), value)?;
                     tx_chan_n(DbRep::Global(GlobalRep::Updated), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(DbRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx)?
@@ -286,14 +288,14 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
             },
             DbReq::Global(GlobalReq::Remove(key)) => {
                 if db.lookup(&key).is_some() {
-                    db.remove(key.clone());
+                    db.remove(key.clone())?;
                     tx_chan_n(DbRep::Local(DbLocalRep::Removed(key)), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(DbRep::Global(GlobalRep::NotRemoved), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
             DbReq::Global(GlobalReq::Flush) => {
-                db.flush();
+                db.flush()?;
                 tx_chan_n(DbRep::Global(GlobalRep::Flushed), req.headers, &chan_tx, &mut sock_tx)?
             },
             DbReq::Global(..) =>
@@ -306,7 +308,7 @@ pub fn worker_db(mut sock_tx: zmq::Socket,
                     tx_chan_n(DbRep::Local(DbLocalRep::LentNotFound(key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?
                 },
             DbReq::Local(DbLocalReq::RepayUpdate(key, value)) => {
-                db.insert(key, value);
+                db.insert(key, value)?;
                 tx_chan_n(DbRep::Global(GlobalRep::Repaid), req.headers, &chan_tx, &mut sock_tx)?
             },
             DbReq::Local(DbLocalReq::Stop) => {
@@ -329,7 +331,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(GlobalReq::Count) =>
                 tx_chan_n(PqRep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Global(GlobalReq::Repay { lend_key: rlend_key, key: rkey, value: rvalue, status: rstatus, }) =>
-                if pq.repay(rlend_key, rkey.clone(), rstatus) {
+                if pq.repay(rlend_key, rkey.clone(), rstatus)? {
                     tx_chan_n(PqRep::Local(PqLocalRep::Repaid(rkey, rvalue)), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx)?
@@ -337,13 +339,13 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(..) =>
                 unreachable!(),
             PqReq::Local(PqLocalReq::Enqueue(key, mode)) =>
-                pq.add(key, mode),
+                pq.add(key, mode)?,
             PqReq::Local(PqLocalReq::Remove(key)) =>
-                pq.remove(key),
+                pq.remove(key)?,
             PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) =>
-                if let Some((key, serial)) = pq.top() {
+                if let Some((key, serial)) = pq.top()? {
                     tx_chan_n(PqRep::Local(PqLocalRep::Lent(serial, key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?;
-                    pq.lend(trigger_at);
+                    pq.lend(trigger_at)?;
                 } else {
                     match mode {
                         LendMode::Block =>
@@ -353,16 +355,16 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                     }
                 },
             PqReq::Local(PqLocalReq::Heartbeat(lend_key, ref key, trigger_at)) => {
-                if pq.heartbeat(lend_key, key, trigger_at) {
+                if pq.heartbeat(lend_key, key, trigger_at)? {
                     tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::Skipped), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
             PqReq::Local(PqLocalReq::NextTrigger) =>
-                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)?,
+                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout()?)), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Local(PqLocalReq::RepayTimedOut) =>
-                pq.repay_timed_out(),
+                pq.repay_timed_out()?,
             PqReq::Local(PqLocalReq::Stop) => {
                 tx_chan_n(PqRep::Local(PqLocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx)?;
                 return Ok(())
@@ -826,7 +828,7 @@ mod test {
     fn pq_worker() {
         let path = "/tmp/spiderq_pq_main";
         let _ = fs::remove_dir_all(path);
-        let pq = pq::PQueue::new(path);
+        let pq = pq::PQueue::new(path).unwrap();
         with_worker(
             "pq",
             move |sock_pq_master_tx, chan_tx, chan_rx| worker_pq(sock_pq_master_tx, chan_tx, chan_rx, pq).unwrap(),

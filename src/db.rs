@@ -10,6 +10,12 @@ pub enum Error {
     DatabaseDriverError(sled::Error),
 }
 
+impl From<sled::Error> for Error {
+    fn from(err: sled::Error) -> Self {
+        Error::DatabaseDriverError(err)
+    }
+}
+
 pub struct Database {
     db_cfg: sled::Config,
     db: sled::Db
@@ -51,16 +57,19 @@ impl Database {
         }
     }
 
-    pub fn insert(&mut self, key: Key, value: Value) {
-        self.db.insert(key, value).expect("failed to insert");
+    pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
+        self.db.insert(key, value)?;
+        Ok(())
     }
 
-    pub fn remove(&mut self, key: Key) {
-        self.db.remove(key.as_ref()).expect("failed to remove key");
+    pub fn remove(&mut self, key: Key) -> Result<(), Error> {
+        self.db.remove(key.as_ref())?;
+        Ok(())
     }
 
-    pub fn flush(&mut self) {
-        self.db.flush().expect("failed to flush");
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.db.flush()?;
+        Ok(())
     }
 
     pub fn iter(&self) -> Iter {
@@ -74,7 +83,7 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        self.flush();
+        self.flush().unwrap();
     }
 }
 
