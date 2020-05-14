@@ -127,12 +127,12 @@ pub fn entrypoint(zmq_addr: &str, database_dir: &str) -> Result<(zmq::Context, J
         .spawn(move || worker_pq(sock_pq_master_tx, chan_pq_master_tx, chan_pq_master_rx, pq).unwrap()).unwrap();
     let master_thread = Builder::new().name("master".to_owned())
    	.spawn(move || master(sock_master_ext,
-                              sock_master_db_rx,
-                              sock_master_pq_rx,
-                              chan_master_db_tx,
-                              chan_master_db_rx,
-                              chan_master_pq_tx,
-                              chan_master_pq_rx).unwrap())
+                          sock_master_db_rx,
+                          sock_master_pq_rx,
+                          chan_master_db_tx,
+                          chan_master_db_rx,
+                          chan_master_pq_tx,
+                          chan_master_pq_rx).unwrap())
         .unwrap();
     Ok((ctx, master_thread))
 }

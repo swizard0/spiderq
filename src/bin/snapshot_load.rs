@@ -3,7 +3,7 @@ use std::io::{Write, BufRead};
 use getopts::Options;
 
 use spiderq::{db, pq};
-use spiderq_proto::{Key, AddMode};
+use spiderq_proto::{Key, Value, AddMode};
 
 #[derive(Debug)]
 pub enum Error {
@@ -29,19 +29,32 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let snapshot_path = matches.opt_str("snapshot").unwrap();
     println!("loading from: {}", snapshot_path);
 
+    let lines_count: Option<usize> = matches.opt_get("number").unwrap();
+
     let file = File::open(snapshot_path)?;
     let lines = io::BufReader::new(file).lines();
 
-    for line in lines {
+    fn maybe_take<B>(lines: io::Lines<B>, count: Option<usize>) -> Box<dyn Iterator<Item = io::Result<String>>>
+        where
+            B: BufRead + 'static
+    {
+        match count {
+            Some(n) => Box::new(lines.take(n)),
+            None => Box::new(lines)
+        }
+    }
+
+    for line in maybe_take(lines, lines_count) {
         if let Ok(line) = line {
             let mut split_iter = line.splitn(2, '\t');
+
             let key = split_iter.next().unwrap().to_owned();
             let key = key.into_boxed_str();
             let key: Key = key.into_boxed_bytes().into();
 
             let value = split_iter.next().unwrap().to_owned();
             let value = value.into_boxed_str();
-            let value = value.into_boxed_bytes().into();
+            let value: Value = value.into_boxed_bytes().into();
 
             db.insert(key.clone(), value).unwrap();
             queue.add(key, AddMode::Tail).unwrap();
@@ -58,6 +71,7 @@ fn main() {
 
     opts.reqopt("s", "snapshot", "snapshot file path", "snapshot.dump");
     opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
+    opts.optopt("n", "number", "load this number of rows only (optional)", "");
 
     match entrypoint(opts.parse(args)) {
         Ok(()) =>
