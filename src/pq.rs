@@ -147,7 +147,6 @@ struct TreeBag<V>
 {
     inner: sled::Tree,
     marker: std::marker::PhantomData<V>,
-    buf: Vec<u8>
 }
 
 impl<V> TreeBag<V>
