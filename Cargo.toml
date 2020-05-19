@@ -7,11 +7,15 @@ edition = "2018"
 [dependencies]
 getopts = "^0.2"
 byteorder = "^0.4"
-time = "^0.1"
+time = { version = "^0.2", features = ["serde"] }
 tempdir = "^0.3"
 zmq = "^0.8"
 simple-signal = "^1.1"
+sled = "0.31"
+bincode = "1.2"
+quickcheck = "0.9"
+serde = { version = "1.0", features = ["derive", "rc"] }
 spiderq_proto = { path = "spiderq-proto" }
 
 [dev-dependencies]
-rand = "^0.3"
+rand = "^0.7"
