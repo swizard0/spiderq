@@ -36,6 +36,7 @@ impl Database {
 
         let db_cfg = sled::Config::new()
             .path(db_path)
+            // .cache_capacity(1024 * 1024 * 10)
             .flush_every_ms(Some(1000));
 
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;

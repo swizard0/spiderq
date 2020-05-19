@@ -42,18 +42,18 @@ impl OrdKey for PQueueEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Instant(i128);
+pub struct Instant(u64);
 
 use time::{OffsetDateTime, Duration};
 
 impl Instant {
-    pub fn to_be_bytes(&self) -> [u8; 16] {
+    pub fn to_be_bytes(&self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
     pub fn now() -> Self {
         let d = OffsetDateTime::now_utc() - OffsetDateTime::unix_epoch();
-        Self(d.whole_nanoseconds())
+        Self(d.whole_nanoseconds() as u64)
     }
 }
 
@@ -70,7 +70,7 @@ impl std::ops::Add<Duration> for Instant {
 
     fn add(self, d: Duration) -> Self {
         let d = Duration::nanoseconds(self.0 as i64) + d;
-        Self(d.whole_nanoseconds())
+        Self(d.whole_nanoseconds() as u64)
     }
 }
 
@@ -82,7 +82,7 @@ struct LentEntry {
 }
 
 impl OrdKey for LentEntry {
-    type Output = [u8; 16];
+    type Output = [u8; 8];
 
     fn key_as_bytes(&self) -> Self::Output {
         self.trigger_at.to_be_bytes()
@@ -98,6 +98,7 @@ struct LendSnapshot {
 
 struct Tree<K, V> {
     inner: sled::Tree,
+    buf: Vec<u8>,
     key_marker: std::marker::PhantomData<K>,
     value_marker: std::marker::PhantomData<V>
 }
@@ -106,6 +107,7 @@ impl<K, V> Tree<K, V> {
     fn new(inner: sled::Tree) -> Self {
         Tree {
             inner,
+            buf: Vec::new(),
             key_marker: std::marker::PhantomData {},
             value_marker: std::marker::PhantomData {}
         }
@@ -117,9 +119,12 @@ where
     K: AsRef<[u8]>,
     V: Serialize + DeserializeOwned
 {
-    fn insert(&self, key: K, value: V) -> Result<(), Error> {
-        let value = bincode::serialize(&value)?;
-        self.inner.insert(key, value)?;
+    fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
+        bincode::serialize_into(&mut self.buf, &value)?;
+
+        self.inner.insert(key, self.buf.as_slice())?;
+        self.buf.clear();
+
         Ok(())
     }
 
@@ -139,10 +144,10 @@ where
 }
 
 struct TreeBag<V>
-where
-    V: OrdKey
 {
-    inner: Tree<<V as OrdKey>::Output, VecDeque<V>>
+    inner: sled::Tree,
+    marker: std::marker::PhantomData<V>,
+    buf: Vec<u8>
 }
 
 impl<V> TreeBag<V>
@@ -150,21 +155,21 @@ where
     V: OrdKey + Clone + DeserializeOwned + Serialize
 {
     fn new(tree: sled::Tree) -> Self {
-        let inner = Tree::new(tree);
-
         TreeBag {
-            inner
+            inner: tree,
+            marker: std::marker::PhantomData {}
         }
     }
 
     fn len(&self) -> usize {
-        self.inner.inner.len()
+        // TODO: fix length counting
+        self.inner.len()
     }
 
     fn insert(&self, value: V) -> Result<(), Error> {
         let k = value.key_as_bytes();
 
-        self.inner.inner.fetch_and_update(k, |v| {
+        self.inner.fetch_and_update(k, |v| {
             let vec = match v {
                 Some(vec) => {
                     let mut vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
@@ -190,7 +195,7 @@ where
 
     fn top(&self) -> Result<Option<V>, Error> {
         let maybe_top =
-            self.inner.inner
+            self.inner
                 .iter()
                 .next();
 
@@ -206,7 +211,7 @@ where
     }
 
     fn pop(&self) -> Result<Option<V>, Error> {
-        let maybe_v = self.inner.inner.pop_min()?;
+        let maybe_v = self.inner.pop_min()?;
 
         match maybe_v {
             Some((k, v)) => {
@@ -215,7 +220,7 @@ where
 
                 if !vec.is_empty() {
                     let v = bincode::serialize(&vec)?;
-                    self.inner.inner.insert(k, v)?;
+                    self.inner.insert(k, v)?;
                 }
 
                 Ok(to_return)
@@ -241,6 +246,7 @@ impl PQueue {
 
         let db_cfg = sled::Config::new()
             .path(db_path)
+            // .cache_capacity(1024 * 1024 * 10)
             .flush_every_ms(Some(1000));
 
         let db = db_cfg.open()?;

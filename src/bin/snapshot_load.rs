@@ -3,7 +3,7 @@ use std::io::{Write, BufRead};
 use getopts::Options;
 
 use spiderq::{db, pq};
-use spiderq_proto::{Key, Value, AddMode};
+use spiderq_proto::{Key, Value, AddMode, GlobalReq, GlobalRep};
 
 #[derive(Debug)]
 pub enum Error {
@@ -22,29 +22,38 @@ impl From<io::Error> for Error {
 pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = maybe_matches.map_err(Error::Getopts)?;
 
-    let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
-    let mut db = db::Database::new(&database_dir).map_err(Error::Db)?;
-    let mut queue = pq::PQueue::new(&database_dir).map_err(Error::Pq)?;
+    let addr = matches.opt_str("addr").unwrap();
 
     let snapshot_path = matches.opt_str("snapshot").unwrap();
     println!("loading from: {}", snapshot_path);
 
     let lines_count: Option<usize> = matches.opt_get("number").unwrap();
+    let skip_lines_count: Option<usize> = matches.opt_get("drop").unwrap();
 
     let file = File::open(snapshot_path)?;
     let lines = io::BufReader::new(file).lines();
 
-    fn maybe_take<B>(lines: io::Lines<B>, count: Option<usize>) -> Box<dyn Iterator<Item = io::Result<String>>>
+    fn maybe_take<B>(
+        lines: io::Lines<B>,
+        count: Option<usize>,
+        skip: Option<usize>
+    ) -> Box<dyn Iterator<Item = io::Result<String>>>
         where
             B: BufRead + 'static
     {
-        match count {
-            Some(n) => Box::new(lines.take(n)),
-            None => Box::new(lines)
+        match (count, skip) {
+            (Some(t), Some(s)) => Box::new(lines.skip(s).take(t)),
+            (Some(t), None) => Box::new(lines.take(t)),
+            (None, Some(s)) => Box::new(lines.skip(s)),
+            (None, None) => Box::new(lines)
         }
     }
 
-    for line in maybe_take(lines, lines_count) {
+    let zmq_ctx = zmq::Context::new();
+    let sock = zmq_ctx.socket(zmq::REQ).unwrap();
+    sock.connect(&addr).unwrap();
+
+    for line in maybe_take(lines, lines_count, skip_lines_count) {
         if let Ok(line) = line {
             let mut split_iter = line.splitn(2, '\t');
 
@@ -56,8 +65,24 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
             let value = value.into_boxed_str();
             let value: Value = value.into_boxed_bytes().into();
 
-            db.insert(key.clone(), value).unwrap();
-            queue.add(key, AddMode::Tail).unwrap();
+            let packet = GlobalReq::Add {
+                key,
+                value,
+                mode: AddMode::Tail
+            };
+            let required = packet.encode_len();
+            let mut msg = zmq::Message::with_capacity(required).unwrap();
+            packet.encode(&mut msg);
+            sock.send_msg(msg, 0).unwrap();
+
+            let reply_msg = sock.recv_msg(0).unwrap();
+            let (rep, _) = GlobalRep::decode(&reply_msg).unwrap();
+            match rep {
+                GlobalRep::Added | GlobalRep::Kept => {
+                    println!("{:?}", rep);
+                },
+                other => panic!("unexpected reply for add: {:?}", other),
+            }
         }
     }
 
@@ -70,8 +95,9 @@ fn main() {
     let mut opts = Options::new();
 
     opts.reqopt("s", "snapshot", "snapshot file path", "snapshot.dump");
-    opts.optopt("d", "database", "database directory path (optional, default: ./spiderq)", "");
+    opts.reqopt("a", "addr", "database addr", "");
     opts.optopt("n", "number", "load this number of rows only (optional)", "");
+    opts.optopt("d", "drop", "drop this number of rows and import the rest (or n if specified)", "");
 
     match entrypoint(opts.parse(args)) {
         Ok(()) =>
