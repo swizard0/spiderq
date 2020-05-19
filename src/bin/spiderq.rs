@@ -727,8 +727,9 @@ mod test {
     use time::{SteadyTime, Duration};
     use rand::{thread_rng, sample, Rng};
     use std::sync::mpsc::{channel, Sender, Receiver};
-    use super::proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
-    use super::{zmq, db, pq, worker_db, worker_pq, tx_chan, entrypoint};
+    use spiderq_proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
+    use zmq;
+    use super::{db, pq, worker_db, worker_pq, tx_chan, entrypoint};
     use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
     fn with_worker<WF, MF, Req, Rep>(base_addr: &str, worker_fn: WF, master_fn: MF) where
