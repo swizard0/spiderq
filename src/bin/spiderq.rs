@@ -724,8 +724,8 @@ mod test {
     use time::Duration;
     use rand::{thread_rng, Rng, distributions::Uniform};
     use std::sync::mpsc::{channel, Sender, Receiver};
-    use zmq;
     use spiderq_proto::{Key, Value, LendMode, AddMode, RepayStatus, GlobalReq, GlobalRep};
+    use zmq;
     use super::{db, pq, worker_db, worker_pq, tx_chan, entrypoint};
     use super::{Message, DbReq, DbRep, PqReq, PqRep, DbLocalReq, DbLocalRep, PqLocalReq, PqLocalRep};
 
