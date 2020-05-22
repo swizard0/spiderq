@@ -145,8 +145,10 @@ where
 
 struct TreeBag<V>
 {
-    inner: sled::Tree,
+    inner: std::sync::Arc<sled::Tree>,
     marker: std::marker::PhantomData<V>,
+    count: usize,
+    count_rx: std::sync::mpsc::Receiver<usize>
 }
 
 impl<V> TreeBag<V>
@@ -154,18 +156,48 @@ where
     V: OrdKey + Clone + DeserializeOwned + Serialize
 {
     fn new(tree: sled::Tree) -> Self {
+        let inner = std::sync::Arc::new(tree);
+        let count_rx = Self::init_len(inner.clone());
+
         TreeBag {
-            inner: tree,
-            marker: std::marker::PhantomData {}
+            inner,
+            marker: std::marker::PhantomData {},
+            count: 0,
+            count_rx
         }
     }
 
-    fn len(&self) -> usize {
-        // TODO: fix length counting
-        self.inner.len()
+    fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move|| {
+            let mut count = 0;
+
+            for v in tree.iter().values() {
+                let v = v.unwrap();
+                let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
+
+                count += vec.len();
+            }
+
+            tx.send(count).unwrap();
+        });
+
+        rx
     }
 
-    fn insert(&self, value: V) -> Result<(), Error> {
+    fn len(&mut self) -> usize {
+        match self.count_rx.try_recv() {
+            Ok(count) => {
+                self.count = count;
+            }
+            Err(_) => {}
+        }
+
+        self.count
+    }
+
+    fn insert(&mut self, value: V) -> Result<(), Error> {
         let k = value.key_as_bytes();
 
         self.inner.fetch_and_update(k, |v| {
@@ -189,6 +221,8 @@ where
             Some(v)
         })?;
 
+        self.count += 1;
+
         Ok(())
     }
 
@@ -209,7 +243,7 @@ where
         }
     }
 
-    fn pop(&self) -> Result<Option<V>, Error> {
+    fn pop(&mut self) -> Result<Option<V>, Error> {
         let maybe_v = self.inner.pop_min()?;
 
         match maybe_v {
@@ -221,6 +255,8 @@ where
                     let v = bincode::serialize(&vec)?;
                     self.inner.insert(k, v)?;
                 }
+
+                self.count -= 1;
 
                 Ok(to_return)
             }
@@ -269,7 +305,7 @@ impl PQueue {
         })
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&mut self) -> usize {
         self.queue.len()
     }
 

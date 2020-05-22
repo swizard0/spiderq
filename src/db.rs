@@ -18,7 +18,8 @@ impl From<sled::Error> for Error {
 
 pub struct Database {
     db_cfg: sled::Config,
-    db: sled::Db
+    db: sled::Db,
+    count: usize
 }
 
 impl Database {
@@ -40,15 +41,17 @@ impl Database {
             .flush_every_ms(Some(1000));
 
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;
+        let count = db.len();
 
         Ok(Database {
             db_cfg,
-            db
+            db,
+            count
         })
     }
 
     pub fn approx_count(&self) -> usize {
-        self.db.len()
+        self.count
     }
 
     pub fn lookup(&self, key: &Key) -> Option<Value> {
@@ -60,11 +63,13 @@ impl Database {
 
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
         self.db.insert(key, value)?;
+        self.count += 1;
         Ok(())
     }
 
     pub fn remove(&mut self, key: Key) -> Result<(), Error> {
         self.db.remove(key.as_ref())?;
+        self.count -= 1;
         Ok(())
     }
 
