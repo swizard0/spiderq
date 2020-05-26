@@ -51,6 +51,8 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
         }
     }
 
+    let mut buf = std::collections::VecDeque::with_capacity(1000);
+
     for line in maybe_take(lines, lines_count, skip_lines_count) {
         if let Ok(line) = line {
             let mut split_iter = line.splitn(2, '\t');
@@ -64,8 +66,14 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
             let value = value.into_boxed_str();
             let value: Value = value.into_boxed_bytes().into();
 
-            db.insert(key.clone(), value).unwrap();
-            queue.add(key.clone(), AddMode::Tail).unwrap();
+            buf.push_back((key.clone(), value));
+
+            if buf.len() == 1000 {
+                db.insert_many(buf.iter().cloned()).unwrap();
+                queue.add_many(buf.iter().map(|(k, _v)| k).cloned(), AddMode::Tail).unwrap();
+
+                buf.clear();
+            }
         }
     }
 

@@ -189,7 +189,7 @@ where
     fn len(&mut self) -> usize {
         match self.count_rx.try_recv() {
             Ok(count) => {
-                self.count = count;
+                self.count += count;
             }
             Err(_) => {}
         }
@@ -222,6 +222,40 @@ where
         })?;
 
         self.count += 1;
+
+        Ok(())
+    }
+
+    fn insert_many<I>(&mut self, mut items: I) -> Result<(), Error>
+    where
+        I: std::iter::Iterator<Item = V>
+    {
+        let v_first = items.nth(0);
+
+        if let Some(v_first) = v_first {
+            let key = v_first.key_as_bytes();
+
+            let mut new_items = VecDeque::new();
+            new_items.push_back(v_first);
+
+            for item in items {
+                new_items.push_back(item);
+            }
+
+            self.count += new_items.len();
+
+            self.inner.fetch_and_update(key, |v| {
+                let mut vec = match v {
+                    Some(vec) => bincode::deserialize(&vec).unwrap(),
+                    None => VecDeque::new()
+                };
+
+                vec.append(&mut new_items);
+                let v = bincode::serialize(&vec).unwrap();
+
+                Some(v)
+            })?;
+        }
 
         Ok(())
     }
@@ -324,6 +358,28 @@ impl PQueue {
         };
 
         self.queue.insert(value)?;
+
+        Ok(())
+    }
+
+    pub fn add_many<I>(&mut self, items: I, mode: AddMode) -> Result<(), Error>
+    where
+        I: std::iter::Iterator<Item = Key>
+    {
+        self.serial += 1;
+
+        let priority = match mode {
+            AddMode::Head => 0,
+            AddMode::Tail => self.serial
+        };
+
+        let items = items.map(|key| PQueueEntry {
+            key,
+            priority,
+            boost: 0
+        });
+
+        self.queue.insert_many(items)?;
 
         Ok(())
     }
