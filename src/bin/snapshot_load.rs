@@ -56,16 +56,7 @@ eprintln!("done queue load");
     let (pq_tx, pq_rx) = std::sync::mpsc::sync_channel(10000);
 
     let db_thread = std::thread::spawn(move || {
-        // let mut buf = std::collections::VecDeque::with_capacity(1000);
-
         for (k, v) in db_rx {
-            // buf.push_back((k, v));
-
-            // if buf.len() == 1000 {
-            //     db.insert_many(buf.drain(..)).unwrap();
-            //     eprintln!("db done write");
-            //     buf.clear();
-            // }
             db.insert(k, v).unwrap();
         }
     });

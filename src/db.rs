@@ -88,20 +88,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_many<I>(&mut self, items: I) -> Result<(), Error>
-    where
-        I: std::iter::Iterator<Item = (Key, Value)>
-    {
-        let mut batch = sled::Batch::default();
-        for (k, v) in items {
-            batch.insert(k, v);
-        }
-
-        self.db.apply_batch(batch)?;
-
-        Ok(())
-    }
-
     pub fn remove(&mut self, key: Key) -> Result<(), Error> {
         self.db.remove(key.as_ref())?;
         self.count -= 1;
