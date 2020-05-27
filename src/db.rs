@@ -18,8 +18,9 @@ impl From<sled::Error> for Error {
 
 pub struct Database {
     db_cfg: sled::Config,
-    db: sled::Db,
-    count: usize
+    db: std::sync::Arc<sled::Db>,
+    count: usize,
+    count_rx: std::sync::mpsc::Receiver<usize>
 }
 
 impl Database {
@@ -41,16 +42,36 @@ impl Database {
             .flush_every_ms(Some(1000));
 
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;
-        let count = db.len();
+        let db = std::sync::Arc::new(db);
+        let count_rx = Self::init_len(db.clone());
 
         Ok(Database {
             db_cfg,
             db,
-            count
+            count: 0,
+            count_rx
         })
     }
 
-    pub fn approx_count(&self) -> usize {
+    fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move|| {
+            let count = db.len();
+            tx.send(count).unwrap();
+        });
+
+        rx
+    }
+
+    fn approx_count(&mut self) -> usize {
+        match self.count_rx.try_recv() {
+            Ok(count) => {
+                self.count += count;
+            }
+            Err(_) => {}
+        }
+
         self.count
     }
 
