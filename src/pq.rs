@@ -170,18 +170,18 @@ where
     fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move|| {
-            let mut count = 0;
+        // std::thread::spawn(move|| {
+        //     let mut count = 0;
 
-            for v in tree.iter().values() {
-                let v = v.unwrap();
-                let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
+        //     for v in tree.iter().values() {
+        //         let v = v.unwrap();
+        //         let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
 
-                count += vec.len();
-            }
+        //         count += vec.len();
+        //     }
 
-            tx.send(count).unwrap();
-        });
+        //     tx.send(count).unwrap();
+        // });
 
         rx
     }
@@ -222,6 +222,40 @@ where
         })?;
 
         self.count += 1;
+
+        Ok(())
+    }
+
+    fn insert_many<I>(&mut self, mut items: I) -> Result<(), Error>
+    where
+        I: std::iter::Iterator<Item = V>
+    {
+        let v_first = items.nth(0);
+
+        if let Some(v_first) = v_first {
+            let key = v_first.key_as_bytes();
+
+            let mut new_items = VecDeque::new();
+            new_items.push_back(v_first);
+
+            for item in items {
+                new_items.push_back(item);
+            }
+
+            self.count += new_items.len();
+
+            self.inner.fetch_and_update(key, |v| {
+                let mut vec = match v {
+                    Some(vec) => bincode::deserialize(&vec).unwrap(),
+                    None => VecDeque::new()
+                };
+
+                vec.append(&mut new_items);
+                let v = bincode::serialize(&vec).unwrap();
+
+                Some(v)
+            })?;
+        }
 
         Ok(())
     }
@@ -324,6 +358,28 @@ impl PQueue {
         };
 
         self.queue.insert(value)?;
+
+        Ok(())
+    }
+
+    pub fn add_many<I>(&mut self, items: I, mode: AddMode) -> Result<(), Error>
+    where
+        I: std::iter::Iterator<Item = Key>
+    {
+        self.serial += 1;
+
+        let priority = match mode {
+            AddMode::Head => 0,
+            AddMode::Tail => self.serial
+        };
+
+        let items = items.map(|key| PQueueEntry {
+            key,
+            priority,
+            boost: 0
+        });
+
+        self.queue.insert_many(items)?;
 
         Ok(())
     }

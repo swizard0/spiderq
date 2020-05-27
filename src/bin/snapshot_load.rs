@@ -25,8 +25,9 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let database_dir = matches.opt_str("database").unwrap();
 
     let mut db = db::Database::new(&database_dir).map_err(Error::Db)?;
+eprintln!("done db load");
     let mut queue = pq::PQueue::new(&database_dir).map_err(Error::Pq)?;
-
+eprintln!("done queue load");
     let snapshot_path = matches.opt_str("snapshot").unwrap();
 
     let lines_count: Option<usize> = matches.opt_get("number").unwrap();
@@ -51,6 +52,30 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
         }
     }
 
+    let (db_tx, db_rx) = std::sync::mpsc::sync_channel(10000);
+    let (pq_tx, pq_rx) = std::sync::mpsc::sync_channel(10000);
+
+    let db_thread = std::thread::spawn(move || {
+        // let mut buf = std::collections::VecDeque::with_capacity(1000);
+
+        for (k, v) in db_rx {
+            // buf.push_back((k, v));
+
+            // if buf.len() == 1000 {
+            //     db.insert_many(buf.drain(..)).unwrap();
+            //     eprintln!("db done write");
+            //     buf.clear();
+            // }
+            db.insert(k, v).unwrap();
+        }
+    });
+
+    let pq_thread = std::thread::spawn(move || {
+        for key in pq_rx {
+            queue.add(key, AddMode::Tail).unwrap();
+        }
+    });
+
     for line in maybe_take(lines, lines_count, skip_lines_count) {
         if let Ok(line) = line {
             let mut split_iter = line.splitn(2, '\t');
@@ -64,10 +89,16 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
             let value = value.into_boxed_str();
             let value: Value = value.into_boxed_bytes().into();
 
-            db.insert(key.clone(), value).unwrap();
-            queue.add(key.clone(), AddMode::Tail).unwrap();
+            db_tx.send((key.clone(), value.clone())).unwrap();
+            pq_tx.send(key).unwrap();
         }
     }
+
+    db_thread.join().unwrap();
+    eprintln!("done db writes");
+
+    pq_thread.join().unwrap();
+    eprintln!("done pq write");
 
     Ok(())
 }

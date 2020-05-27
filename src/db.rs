@@ -56,10 +56,10 @@ impl Database {
     fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move|| {
-            let count = db.len();
-            tx.send(count).unwrap();
-        });
+        // std::thread::spawn(move|| {
+        //     let count = db.len();
+        //     tx.send(count).unwrap();
+        // });
 
         rx
     }
@@ -85,6 +85,20 @@ impl Database {
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
         self.db.insert(key, value)?;
         self.count += 1;
+        Ok(())
+    }
+
+    pub fn insert_many<I>(&mut self, items: I) -> Result<(), Error>
+    where
+        I: std::iter::Iterator<Item = (Key, Value)>
+    {
+        let mut batch = sled::Batch::default();
+        for (k, v) in items {
+            batch.insert(k, v);
+        }
+
+        self.db.apply_batch(batch)?;
+
         Ok(())
     }
 
