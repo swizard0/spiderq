@@ -38,8 +38,8 @@ impl Database {
 
         let db_cfg = sled::Config::new()
             .path(db_path)
-            // .cache_capacity(1024 * 1024 * 10)
-            .flush_every_ms(Some(1000));
+            .mode(sled::Mode::HighThroughput)
+            .flush_every_ms(Some(10 * 60 * 1000));
 
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;
         let db = std::sync::Arc::new(db);
@@ -56,10 +56,10 @@ impl Database {
     fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // std::thread::spawn(move|| {
-        //     let count = db.len();
-        //     tx.send(count).unwrap();
-        // });
+        std::thread::spawn(move|| {
+            let count = db.len();
+            tx.send(count).unwrap();
+        });
 
         rx
     }
@@ -182,10 +182,15 @@ mod test {
         check_against(db, check_table);
     }
 
-    fn check_against(db: &Database, check_table: &HashMap<Key, Value>) {
-        if db.approx_count() < check_table.len() {
-            panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
+    fn check_against(db: &mut Database, check_table: &HashMap<Key, Value>) {
+        loop {
+            if db.approx_count() == check_table.len() {
+                break;
+            }
         }
+        // if db.approx_count() < check_table.len() {
+        //     panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
+        // }
 
         for (k, v) in check_table {
             assert_eq!(db.lookup(k).as_ref(), Some(v));
@@ -194,7 +199,7 @@ mod test {
 
     #[test]
     fn make() {
-        let db = mkdb("/tmp/spiderq_a");
+        let mut db = mkdb("/tmp/spiderq_a");
         assert_eq!(db.approx_count(), 0);
     }
 
@@ -215,9 +220,13 @@ mod test {
             rnd_fill_check(&mut db, &mut check_table, 10);
         }
         {
-            let db = Database::new("/tmp/spiderq_c").unwrap();
-            assert_eq!(db.approx_count(), 10);
-            check_against(&db, &check_table);
+            let mut db = Database::new("/tmp/spiderq_c").unwrap();
+            loop {
+                if db.approx_count() == 10 {
+                    break;
+                }
+            }
+            check_against(&mut db, &check_table);
         }
     }
 
@@ -229,9 +238,9 @@ mod test {
             rnd_fill_check(&mut db, &mut check_table, 2560);
         }
         {
-            let db = Database::new("/tmp/spiderq_d").unwrap();
+            let mut db = Database::new("/tmp/spiderq_d").unwrap();
             assert!(db.approx_count() <= 2560);
-            check_against(&db, &check_table);
+            check_against(&mut db, &check_table);
         }
     }
 

@@ -63,7 +63,7 @@ eprintln!("done queue load");
 
     let pq_thread = std::thread::spawn(move || {
         for key in pq_rx {
-            queue.add(key, AddMode::Tail).unwrap();
+            // queue.add(key, AddMode::Tail).unwrap();
         }
     });
 

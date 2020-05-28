@@ -143,12 +143,31 @@ where
     }
 }
 
+// fn concat_value(_key: &[u8], old_value: Option<&[u8]>, merged_bytes: &[u8]) -> Option<Vec<u8>> {
+//     let value = bincode::deserialize(merged_bytes).unwrap();
+
+//     let mut vec = match old_value {
+//         Some(vec) => {
+//             let vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
+//             vec
+//         }
+//         None => VecDeque::new()
+//     };
+
+//     vec.push_back(value);
+
+//     let v = bincode::serialize(&vec).unwrap();
+
+//     Some(v)
+// }
+
 struct TreeBag<V>
 {
     inner: std::sync::Arc<sled::Tree>,
     marker: std::marker::PhantomData<V>,
     count: usize,
-    count_rx: std::sync::mpsc::Receiver<usize>
+    count_rx: std::sync::mpsc::Receiver<usize>,
+    buf: Vec<u8>
 }
 
 impl<V> TreeBag<V>
@@ -156,6 +175,24 @@ where
     V: OrdKey + Clone + DeserializeOwned + Serialize
 {
     fn new(tree: sled::Tree) -> Self {
+        tree.set_merge_operator(|_key: &[u8], old_value: Option<&[u8]>, merged_bytes: &[u8]| -> Option<Vec<u8>> {
+            let value = bincode::deserialize(merged_bytes).unwrap();
+
+            let mut vec = match old_value {
+                Some(vec) => {
+                    let vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
+                    vec
+                }
+                None => VecDeque::new()
+            };
+
+            vec.push_back(value);
+
+            let v = bincode::serialize(&vec).unwrap();
+
+            Some(v)
+        });
+
         let inner = std::sync::Arc::new(tree);
         let count_rx = Self::init_len(inner.clone());
 
@@ -163,25 +200,26 @@ where
             inner,
             marker: std::marker::PhantomData {},
             count: 0,
-            count_rx
+            count_rx,
+            buf: Vec::new()
         }
     }
 
     fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // std::thread::spawn(move|| {
-        //     let mut count = 0;
+        std::thread::spawn(move|| {
+            let mut count = 0;
 
-        //     for v in tree.iter().values() {
-        //         let v = v.unwrap();
-        //         let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
+            for v in tree.iter().values() {
+                let v = v.unwrap();
+                let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
 
-        //         count += vec.len();
-        //     }
+                count += vec.len();
+            }
 
-        //     tx.send(count).unwrap();
-        // });
+            tx.send(count).unwrap();
+        });
 
         rx
     }
@@ -199,28 +237,10 @@ where
 
     fn insert(&mut self, value: V) -> Result<(), Error> {
         let k = value.key_as_bytes();
+        bincode::serialize_into(&mut self.buf, &value)?;
 
-        self.inner.fetch_and_update(k, |v| {
-            let vec = match v {
-                Some(vec) => {
-                    let mut vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
-                    vec.push_back(value.clone());
-
-                    vec
-                }
-                None => {
-                    let mut vec = VecDeque::new();
-                    vec.push_back(value.clone());
-
-                    vec
-                }
-            };
-
-            let v = bincode::serialize(&vec).unwrap();
-
-            Some(v)
-        })?;
-
+        self.inner.merge(k, &self.buf)?;
+        self.buf.clear();
         self.count += 1;
 
         Ok(())
@@ -315,8 +335,8 @@ impl PQueue {
 
         let db_cfg = sled::Config::new()
             .path(db_path)
-            // .cache_capacity(1024 * 1024 * 10)
-            .flush_every_ms(Some(1000));
+            .mode(sled::Mode::HighThroughput)
+            .flush_every_ms(Some(10 * 60 * 1000));
 
         let db = db_cfg.open()?;
 
