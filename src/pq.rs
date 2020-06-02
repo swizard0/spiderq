@@ -208,29 +208,29 @@ where
     fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move|| {
-            let mut count = 0;
+        // std::thread::spawn(move|| {
+        //     let mut count = 0;
 
-            for v in tree.iter().values() {
-                let v = v.unwrap();
-                let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
+        //     for v in tree.iter().values() {
+        //         let v = v.unwrap();
+        //         let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
 
-                count += vec.len();
-            }
+        //         count += vec.len();
+        //     }
 
-            tx.send(count).unwrap();
-        });
+        //     tx.send(count).unwrap();
+        // });
 
         rx
     }
 
     fn len(&mut self) -> usize {
-        match self.count_rx.try_recv() {
-            Ok(count) => {
-                self.count += count;
-            }
-            Err(_) => {}
-        }
+        // match self.count_rx.try_recv() {
+        //     Ok(count) => {
+        //         self.count += count;
+        //     }
+        //     Err(_) => {}
+        // }
 
         self.count
     }

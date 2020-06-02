@@ -56,21 +56,21 @@ impl Database {
     fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move|| {
-            let count = db.len();
-            tx.send(count).unwrap();
-        });
+        // std::thread::spawn(move|| {
+        //     let count = db.len();
+        //     tx.send(count).unwrap();
+        // });
 
         rx
     }
 
     fn approx_count(&mut self) -> usize {
-        match self.count_rx.try_recv() {
-            Ok(count) => {
-                self.count += count;
-            }
-            Err(_) => {}
-        }
+        // match self.count_rx.try_recv() {
+        //     Ok(count) => {
+        //         self.count += count;
+        //     }
+        //     Err(_) => {}
+        // }
 
         self.count
     }
