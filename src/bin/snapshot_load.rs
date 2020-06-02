@@ -33,7 +33,7 @@ eprintln!("done queue load");
     let lines_count: Option<usize> = matches.opt_get("number").unwrap();
     let skip_lines_count: Option<usize> = matches.opt_get("drop").unwrap();
 
-    let file = File::open(snapshot_path)?;
+    let file = File::open(snapshot_path.clone())?;
     let lines = io::BufReader::new(file).lines();
 
     fn maybe_take<B>(
@@ -63,7 +63,7 @@ eprintln!("done queue load");
 
     let pq_thread = std::thread::spawn(move || {
         for key in pq_rx {
-            // queue.add(key, AddMode::Tail).unwrap();
+            queue.add(key, AddMode::Tail).unwrap();
         }
     });
 
@@ -81,12 +81,27 @@ eprintln!("done queue load");
             let value: Value = value.into_boxed_bytes().into();
 
             db_tx.send((key.clone(), value.clone())).unwrap();
-            pq_tx.send(key).unwrap();
         }
     }
 
     db_thread.join().unwrap();
     eprintln!("done db writes");
+
+    let file = File::open(snapshot_path)?;
+    let lines = io::BufReader::new(file).lines();
+
+    for line in maybe_take(lines, lines_count, skip_lines_count) {
+        if let Ok(line) = line {
+            let mut split_iter = line.splitn(2, '\t');
+
+            let key = split_iter.next().unwrap().to_owned();
+            let key = key.into_boxed_str();
+            println!("{}", key);
+            let key: Key = key.into_boxed_bytes().into();
+
+            pq_tx.send(key).unwrap();
+        }
+    }
 
     pq_thread.join().unwrap();
     eprintln!("done pq write");
