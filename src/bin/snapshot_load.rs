@@ -56,14 +56,28 @@ eprintln!("done queue load");
     let (pq_tx, pq_rx) = std::sync::mpsc::sync_channel(10000);
 
     let db_thread = std::thread::spawn(move || {
-        for (k, v) in db_rx {
-            db.insert(k, v).unwrap();
+        for r in db_rx {
+            match r {
+                Ok((k, v)) => {
+                    db.insert(k, v).unwrap();
+                }
+                Err(_) => {
+                    break;
+                }
+            }
         }
     });
 
     let pq_thread = std::thread::spawn(move || {
-        for key in pq_rx {
-            queue.add(key, AddMode::Tail).unwrap();
+        for r in pq_rx {
+            match r {
+                Ok(key) => {
+                    queue.add(key, AddMode::Tail).unwrap();
+                }
+                Err(_) => {
+                    break;
+                }
+            }
         }
     });
 
@@ -80,10 +94,11 @@ eprintln!("done queue load");
             let value = value.into_boxed_str();
             let value: Value = value.into_boxed_bytes().into();
 
-            db_tx.send((key.clone(), value.clone())).unwrap();
+            db_tx.send(Ok((key, value))).unwrap();
         }
     }
 
+    db_tx.send(Err(())).unwrap();
     db_thread.join().unwrap();
     eprintln!("done db writes");
 
@@ -99,10 +114,11 @@ eprintln!("done queue load");
             println!("{}", key);
             let key: Key = key.into_boxed_bytes().into();
 
-            pq_tx.send(key).unwrap();
+            pq_tx.send(Ok(key)).unwrap();
         }
     }
 
+    pq_tx.send(Err(())).unwrap();
     pq_thread.join().unwrap();
     eprintln!("done pq write");
 
