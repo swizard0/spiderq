@@ -1,6 +1,7 @@
 use std::{io, fs};
 use std::iter::Iterator;
 use super::proto::{Key, Value};
+use crate::system::{SledTree, System};
 
 #[derive(Debug)]
 pub enum Error {
@@ -18,9 +19,8 @@ impl From<sled::Error> for Error {
 
 pub struct Database {
     db_cfg: sled::Config,
-    db: std::sync::Arc<sled::Db>,
-    count: usize,
-    count_rx: std::sync::mpsc::Receiver<usize>
+    db: sled::Db,
+    system: System,
 }
 
 impl Database {
@@ -46,41 +46,22 @@ impl Database {
         let end = std::time::Instant::now();
         metrics::timing!("db.init_time", start, end);
 
-        let db = std::sync::Arc::new(db);
-        let count_rx = Self::init_len(db.clone());
+        let system = db.open_tree("system")?;
+        let system = System::new(system, SledTree::Db(db.clone()), false);
 
         Ok(Database {
             db_cfg,
             db,
-            count: 0,
-            count_rx
+            system
         })
     }
 
-    fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move|| {
-            let start = std::time::Instant::now();
-            let count = db.len();
-            let end = std::time::Instant::now();
-            metrics::timing!("db.init_len_time", start, end);
-
-            // tx.send(count).unwrap();
-        });
-
-        rx
+    fn approx_count(&mut self) -> usize {
+        self.system.count()
     }
 
-    fn approx_count(&mut self) -> usize {
-        match self.count_rx.try_recv() {
-            Ok(count) => {
-                self.count += count;
-            }
-            Err(_) => {}
-        }
-
-        self.count
+    fn count(&self) -> usize {
+        self.db.len()
     }
 
     pub fn lookup(&self, key: &Key) -> Option<Value> {
@@ -101,8 +82,12 @@ impl Database {
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
         let start = std::time::Instant::now();
 
-        self.db.insert(key, value)?;
-        self.count += 1;
+        match self.db.insert(key, value)? {
+            None => {
+                self.system.incr();
+            }
+            Some(_) => {}
+        }
 
         let end = std::time::Instant::now();
         metrics::timing!("db.insert_time", start, end);
@@ -114,8 +99,12 @@ impl Database {
     pub fn remove(&mut self, key: Key) -> Result<(), Error> {
         let start = std::time::Instant::now();
 
-        self.db.remove(key.as_ref())?;
-        self.count -= 1;
+        match self.db.remove(key.as_ref())? {
+            None => {}
+            Some(_) => {
+                self.system.decr();
+            }
+        }
 
         let end = std::time::Instant::now();
         metrics::timing!("db.remove_time", start, end);
@@ -220,14 +209,9 @@ mod test {
     }
 
     fn check_against(db: &mut Database, check_table: &HashMap<Key, Value>) {
-        loop {
-            if db.approx_count() == check_table.len() {
-                break;
-            }
+        if db.count() < check_table.len() {
+            panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
         }
-        // if db.approx_count() < check_table.len() {
-        //     panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
-        // }
 
         for (k, v) in check_table {
             assert_eq!(db.lookup(k).as_ref(), Some(v));
@@ -237,13 +221,13 @@ mod test {
     #[test]
     fn make() {
         let mut db = mkdb("/tmp/spiderq_a");
-        assert_eq!(db.approx_count(), 0);
+        assert_eq!(db.count(), 0);
     }
 
     #[test]
     fn insert_lookup() {
         let mut db = mkdb("/tmp/spiderq_b");
-        assert_eq!(db.approx_count(), 0);
+        assert_eq!(db.count(), 0);
         let mut check_table = HashMap::new();
         rnd_fill_check(&mut db, &mut check_table, 10);
     }
@@ -253,16 +237,12 @@ mod test {
         let mut check_table = HashMap::new();
         {
             let mut db = mkdb("/tmp/spiderq_c");
-            assert_eq!(db.approx_count(), 0);
+            assert_eq!(db.count(), 0);
             rnd_fill_check(&mut db, &mut check_table, 10);
         }
         {
             let mut db = Database::new("/tmp/spiderq_c").unwrap();
-            loop {
-                if db.approx_count() == 10 {
-                    break;
-                }
-            }
+            assert_eq!(db.count(), 10);
             check_against(&mut db, &check_table);
         }
     }

@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use super::proto::{Key, RepayStatus, AddMode};
+use crate::system::{SledTree, System};
 
 #[derive(Debug)]
 pub enum Error {
@@ -169,10 +169,7 @@ struct TreeBag<V>
 {
     inner: std::sync::Arc<sled::Tree>,
     marker: std::marker::PhantomData<V>,
-    count: usize,
-    count_rx: std::sync::mpsc::Receiver<usize>,
-    key_buf: Vec<u8>,
-    buf: Vec<u8>
+    key_buf: Vec<u8>
 }
 
 impl<V> TreeBag<V>
@@ -181,63 +178,34 @@ where
 {
     fn new(tree: sled::Tree) -> Self {
         let inner = std::sync::Arc::new(tree);
-        let count_rx = Self::init_len(inner.clone());
 
         TreeBag {
             inner,
             marker: std::marker::PhantomData {},
-            count: 0,
-            count_rx,
             key_buf: Vec::new(),
-            buf: Vec::new()
         }
     }
 
-    fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move|| {
-            let start = std::time::Instant::now();
-
-            let mut count = tree.len();
-
-            let end = std::time::Instant::now();
-            metrics::timing!("pq.tree_bag.init_len_time", start, end);
-
-            tx.send(count).unwrap();
-        });
-
-        rx
-    }
-
-    fn len(&mut self) -> usize {
-        match self.count_rx.try_recv() {
-            Ok(count) => {
-                self.count += count;
-            }
-            Err(_) => {}
-        }
-
-        self.count
-    }
-
-    fn insert(&mut self, value: V) -> Result<(), Error> {
+    fn insert(&mut self, value: V) -> Result<Option<V>, Error> {
         let start = std::time::Instant::now();
 
         let k = value.key();
         bincode::serialize_into(&mut self.key_buf, &k)?;
         let value = bincode::serialize(&value)?;
 
-        self.inner.insert(&self.key_buf, value)?;
+        let r = self.inner.insert(&self.key_buf, value)?;
+        let r = match r {
+            Some(v) => Some(bincode::deserialize(&v)?),
+            None => None
+        };
 
         self.key_buf.clear();
-        self.count += 1;
 
         let end = std::time::Instant::now();
         metrics::timing!("pq.tree_bag.insert_time", start, end);
         metrics::counter!("pq.tree_bag.insert", 1);
 
-        Ok(())
+        Ok(r)
     }
 
     fn top(&self) -> Result<Option<V>, Error> {
@@ -270,9 +238,8 @@ where
         let maybe_v = self.inner.pop_min()?;
 
         let r = match maybe_v {
-            Some((k, v)) => {
-                let mut v: V = bincode::deserialize(&v)?;
-                self.count -= 1;
+            Some((_, v)) => {
+                let v: V = bincode::deserialize(&v)?;
 
                 Ok(Some(v))
             }
@@ -293,7 +260,8 @@ pub struct PQueue {
     db: sled::Db,
     queue: TreeBag<PQueueEntry>,
     lentm: Tree<Key, LendSnapshot>,
-    lentq: TreeBag<LentEntry>
+    lentq: TreeBag<LentEntry>,
+    system: System
 }
 
 impl PQueue {
@@ -313,8 +281,8 @@ impl PQueue {
         let end = std::time::Instant::now();
         metrics::timing!("pq.init_time", start, end);
 
-        let queue = db.open_tree("queue")?;
-        let queue = TreeBag::new(queue);
+        let queue_tree = db.open_tree("queue")?;
+        let queue = TreeBag::new(queue_tree.clone());
 
         let lentm = db.open_tree("lentm")?;
         let lentm = Tree::new(lentm);
@@ -322,18 +290,22 @@ impl PQueue {
         let lentq = db.open_tree("lentq")?;
         let lentq = TreeBag::new(lentq);
 
+        let system = db.open_tree("system")?;
+        let system = System::new(system, SledTree::Tree(queue_tree), false);
+
         Ok(PQueue {
             serial: 1,
             lentm,
             queue,
             lentq,
             db,
-            db_cfg
+            db_cfg,
+            system
         })
     }
 
     pub fn len(&mut self) -> usize {
-        self.queue.len()
+        self.system.count()
     }
 
     pub fn add(&mut self, key: Key, mode: AddMode) -> Result<(), Error> {
@@ -350,7 +322,12 @@ impl PQueue {
             boost: 0,
         };
 
-        self.queue.insert(value)?;
+        match self.queue.insert(value)? {
+            Some(_) => {}
+            None => {
+                self.system.incr();
+            }
+        }
 
         Ok(())
     }
@@ -379,6 +356,8 @@ impl PQueue {
         } else {
             Ok(None)
         };
+
+        self.system.decr();
 
         let end = std::time::Instant::now();
         metrics::timing!("pq.lend_time", start, end);
@@ -490,6 +469,7 @@ impl PQueue {
                 RepayStatus::Drop => return Ok(true),
             };
             self.serial += 1;
+            self.system.incr();
             entry.priority = match status {
                 RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
