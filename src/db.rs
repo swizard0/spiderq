@@ -41,7 +41,11 @@ impl Database {
             .mode(sled::Mode::HighThroughput)
             .flush_every_ms(Some(10 * 60 * 1000));
 
+        let start = std::time::Instant::now();
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;
+        let end = std::time::Instant::now();
+        metrics::timing!("db.init_time", start, end);
+
         let db = std::sync::Arc::new(db);
         let count_rx = Self::init_len(db.clone());
 
@@ -56,46 +60,79 @@ impl Database {
     fn init_len(db: std::sync::Arc<sled::Db>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // std::thread::spawn(move|| {
-        //     let count = db.len();
-        //     tx.send(count).unwrap();
-        // });
+        std::thread::spawn(move|| {
+            let start = std::time::Instant::now();
+            let count = db.len();
+            let end = std::time::Instant::now();
+            metrics::timing!("db.init_len_time", start, end);
+
+            // tx.send(count).unwrap();
+        });
 
         rx
     }
 
     fn approx_count(&mut self) -> usize {
-        // match self.count_rx.try_recv() {
-        //     Ok(count) => {
-        //         self.count += count;
-        //     }
-        //     Err(_) => {}
-        // }
+        match self.count_rx.try_recv() {
+            Ok(count) => {
+                self.count += count;
+            }
+            Err(_) => {}
+        }
 
         self.count
     }
 
     pub fn lookup(&self, key: &Key) -> Option<Value> {
-        match self.db.get(key) {
+        let start = std::time::Instant::now();
+
+        let r = match self.db.get(key) {
             Ok(value) => value.map(|v| v.into()),
             Err(_) => None
-        }
+        };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.lookup_time", start, end);
+        metrics::counter!("db.lookup", 1);
+
+        r
     }
 
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         self.db.insert(key, value)?;
         self.count += 1;
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.insert_time", start, end);
+        metrics::counter!("db.insert", 1);
+
         Ok(())
     }
 
     pub fn remove(&mut self, key: Key) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         self.db.remove(key.as_ref())?;
         self.count -= 1;
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.remove_time", start, end);
+        metrics::counter!("db.remove", 1);
+
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         self.db.flush()?;
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.flush_time", start, end);
+        metrics::counter!("db.flush", 1);
+
         Ok(())
     }
 

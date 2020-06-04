@@ -21,9 +21,9 @@ impl From<bincode::Error> for Error {
 }
 
 trait OrdKey {
-    type Output: AsRef<[u8]>;
+    type Output: Serialize;
 
-    fn key_as_bytes(&self) -> Self::Output;
+    fn key(&self) -> Self::Output;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +34,10 @@ struct PQueueEntry {
 }
 
 impl OrdKey for PQueueEntry {
-    type Output = [u8; 8];
+    type Output = ([u8; 8], Key);
 
-    fn key_as_bytes(&self) -> Self::Output {
-        self.priority.to_be_bytes()
+    fn key(&self) -> Self::Output {
+        (self.priority.to_be_bytes(), self.key.clone())
     }
 }
 
@@ -82,10 +82,10 @@ struct LentEntry {
 }
 
 impl OrdKey for LentEntry {
-    type Output = [u8; 8];
+    type Output = ([u8; 8], Key);
 
-    fn key_as_bytes(&self) -> Self::Output {
-        self.trigger_at.to_be_bytes()
+    fn key(&self) -> Self::Output {
+        (self.trigger_at.to_be_bytes(), self.key.clone())
     }
 }
 
@@ -120,46 +120,50 @@ where
     V: Serialize + DeserializeOwned
 {
     fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         bincode::serialize_into(&mut self.buf, &value)?;
 
         self.inner.insert(key, self.buf.as_slice())?;
         self.buf.clear();
 
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree.insert_time", start, end);
+        metrics::counter!("pq.tree.insert", 1);
+
         Ok(())
     }
 
     fn get(&self, key: &K) -> Result<Option<V>, Error> {
-        self.inner
+        let start = std::time::Instant::now();
+
+        let r = self.inner
             .get(key)?
             .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
-            .transpose()
+            .transpose();
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree.get_time", start, end);
+        metrics::counter!("pq.tree.get", 1);
+
+        r
     }
 
     fn remove(&self, key: &K) -> Result<Option<V>, Error> {
-        self.inner
+        let start = std::time::Instant::now();
+
+        let r = self.inner
             .remove(key)?
             .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
-            .transpose()
+            .transpose();
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree.remove_time", start, end);
+        metrics::counter!("pq.tree.remove", 1);
+
+        r
     }
 }
-
-// fn concat_value(_key: &[u8], old_value: Option<&[u8]>, merged_bytes: &[u8]) -> Option<Vec<u8>> {
-//     let value = bincode::deserialize(merged_bytes).unwrap();
-
-//     let mut vec = match old_value {
-//         Some(vec) => {
-//             let vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
-//             vec
-//         }
-//         None => VecDeque::new()
-//     };
-
-//     vec.push_back(value);
-
-//     let v = bincode::serialize(&vec).unwrap();
-
-//     Some(v)
-// }
 
 struct TreeBag<V>
 {
@@ -167,6 +171,7 @@ struct TreeBag<V>
     marker: std::marker::PhantomData<V>,
     count: usize,
     count_rx: std::sync::mpsc::Receiver<usize>,
+    key_buf: Vec<u8>,
     buf: Vec<u8>
 }
 
@@ -175,24 +180,6 @@ where
     V: OrdKey + Clone + DeserializeOwned + Serialize
 {
     fn new(tree: sled::Tree) -> Self {
-        tree.set_merge_operator(|_key: &[u8], old_value: Option<&[u8]>, merged_bytes: &[u8]| -> Option<Vec<u8>> {
-            let value = bincode::deserialize(merged_bytes).unwrap();
-
-            let mut vec = match old_value {
-                Some(vec) => {
-                    let vec: VecDeque<V> = bincode::deserialize(&vec).unwrap();
-                    vec
-                }
-                None => VecDeque::new()
-            };
-
-            vec.push_back(value);
-
-            let v = bincode::serialize(&vec).unwrap();
-
-            Some(v)
-        });
-
         let inner = std::sync::Arc::new(tree);
         let count_rx = Self::init_len(inner.clone());
 
@@ -201,6 +188,7 @@ where
             marker: std::marker::PhantomData {},
             count: 0,
             count_rx,
+            key_buf: Vec::new(),
             buf: Vec::new()
         }
     }
@@ -208,114 +196,94 @@ where
     fn init_len(tree: std::sync::Arc<sled::Tree>) -> std::sync::mpsc::Receiver<usize> {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // std::thread::spawn(move|| {
-        //     let mut count = 0;
+        std::thread::spawn(move|| {
+            let start = std::time::Instant::now();
 
-        //     for v in tree.iter().values() {
-        //         let v = v.unwrap();
-        //         let vec: VecDeque<V> = bincode::deserialize(&v).unwrap();
+            let mut count = tree.len();
 
-        //         count += vec.len();
-        //     }
+            let end = std::time::Instant::now();
+            metrics::timing!("pq.tree_bag.init_len_time", start, end);
 
-        //     tx.send(count).unwrap();
-        // });
+            tx.send(count).unwrap();
+        });
 
         rx
     }
 
     fn len(&mut self) -> usize {
-        // match self.count_rx.try_recv() {
-        //     Ok(count) => {
-        //         self.count += count;
-        //     }
-        //     Err(_) => {}
-        // }
+        match self.count_rx.try_recv() {
+            Ok(count) => {
+                self.count += count;
+            }
+            Err(_) => {}
+        }
 
         self.count
     }
 
     fn insert(&mut self, value: V) -> Result<(), Error> {
-        let k = value.key_as_bytes();
-        bincode::serialize_into(&mut self.buf, &value)?;
+        let start = std::time::Instant::now();
 
-        self.inner.merge(k, &self.buf)?;
-        self.buf.clear();
+        let k = value.key();
+        bincode::serialize_into(&mut self.key_buf, &k)?;
+        let value = bincode::serialize(&value)?;
+
+        self.inner.insert(&self.key_buf, value)?;
+
+        self.key_buf.clear();
         self.count += 1;
 
-        Ok(())
-    }
-
-    fn insert_many<I>(&mut self, mut items: I) -> Result<(), Error>
-    where
-        I: std::iter::Iterator<Item = V>
-    {
-        let v_first = items.nth(0);
-
-        if let Some(v_first) = v_first {
-            let key = v_first.key_as_bytes();
-
-            let mut new_items = VecDeque::new();
-            new_items.push_back(v_first);
-
-            for item in items {
-                new_items.push_back(item);
-            }
-
-            self.count += new_items.len();
-
-            self.inner.fetch_and_update(key, |v| {
-                let mut vec = match v {
-                    Some(vec) => bincode::deserialize(&vec).unwrap(),
-                    None => VecDeque::new()
-                };
-
-                vec.append(&mut new_items);
-                let v = bincode::serialize(&vec).unwrap();
-
-                Some(v)
-            })?;
-        }
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree_bag.insert_time", start, end);
+        metrics::counter!("pq.tree_bag.insert", 1);
 
         Ok(())
     }
 
     fn top(&self) -> Result<Option<V>, Error> {
+        let start = std::time::Instant::now();
+
         let maybe_top =
             self.inner
                 .iter()
                 .next();
 
-        match maybe_top {
+        let r = match maybe_top {
             Some(r) => {
                 let (_, v) = r?;
-                let v: VecDeque<V> = bincode::deserialize(&v)?;
+                let v: V = bincode::deserialize(&v)?;
 
-                Ok(v.front().cloned())
+                Ok(Some(v))
             }
             None => Ok(None)
-        }
+        };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree_bag.top_time", start, end);
+        metrics::counter!("pq.tree_bag.top", 1);
+
+        r
     }
 
     fn pop(&mut self) -> Result<Option<V>, Error> {
+        let start = std::time::Instant::now();
         let maybe_v = self.inner.pop_min()?;
 
-        match maybe_v {
+        let r = match maybe_v {
             Some((k, v)) => {
-                let mut vec: VecDeque<V> = bincode::deserialize(&v)?;
-                let to_return = vec.pop_front();
-
-                if !vec.is_empty() {
-                    let v = bincode::serialize(&vec)?;
-                    self.inner.insert(k, v)?;
-                }
-
+                let mut v: V = bincode::deserialize(&v)?;
                 self.count -= 1;
 
-                Ok(to_return)
+                Ok(Some(v))
             }
             None => Ok(None)
-        }
+        };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.tree_bag.pop_time", start, end);
+        metrics::counter!("pq.tree_bag.pop", 1);
+
+        r
     }
 }
 
@@ -338,7 +306,12 @@ impl PQueue {
             .mode(sled::Mode::HighThroughput)
             .flush_every_ms(Some(10 * 60 * 1000));
 
+        let start = std::time::Instant::now();
+
         let db = db_cfg.open()?;
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.init_time", start, end);
 
         let queue = db.open_tree("queue")?;
         let queue = TreeBag::new(queue);
@@ -382,28 +355,6 @@ impl PQueue {
         Ok(())
     }
 
-    pub fn add_many<I>(&mut self, items: I, mode: AddMode) -> Result<(), Error>
-    where
-        I: std::iter::Iterator<Item = Key>
-    {
-        self.serial += 1;
-
-        let priority = match mode {
-            AddMode::Head => 0,
-            AddMode::Tail => self.serial
-        };
-
-        let items = items.map(|key| PQueueEntry {
-            key,
-            priority,
-            boost: 0
-        });
-
-        self.queue.insert_many(items)?;
-
-        Ok(())
-    }
-
     pub fn top(&self) -> Result<Option<(Key, u64)>, Error> {
         let maybe_top =
             self.queue
@@ -414,7 +365,9 @@ impl PQueue {
     }
 
     pub fn lend(&mut self, trigger_at: Instant) -> Result<Option<u64>, Error> {
-        if let Some(entry) = self.queue.pop()? {
+        let start = std::time::Instant::now();
+
+        let r = if let Some(entry) = self.queue.pop()? {
             // TODO: transaction
             let snapshot = LendSnapshot { serial: self.serial, recycle: None, entry: entry.clone() };
             self.lentm.insert(entry.key.clone(), snapshot)?;
@@ -425,10 +378,28 @@ impl PQueue {
             Ok(Some(self.serial))
         } else {
             Ok(None)
-        }
+        };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.lend_time", start, end);
+        metrics::counter!("pq.lend", 1);
+
+        r
     }
 
     pub fn next_timeout(&mut self) -> Result<Option<Instant>, Error> {
+        let start = std::time::Instant::now();
+
+        let r = self.do_next_timeout();
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.next_timeout_time", start, end);
+        metrics::counter!("pq.next_timeout", 1);
+
+        r
+    }
+
+    fn do_next_timeout(&mut self) -> Result<Option<Instant>, Error> {
         loop {
             let do_recycle =
                 if let Some(LentEntry {
@@ -466,15 +437,33 @@ impl PQueue {
     }
 
     pub fn repay_timed_out(&mut self) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         let entry = self.lentq.pop()?;
         if let Some(LentEntry { key, snapshot, .. }) = entry {
             self.repay(snapshot, key, RepayStatus::Front)?;
         }
 
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.repay_timed_out_time", start, end);
+        metrics::counter!("pq.repay_timed_out", 1);
+
         Ok(())
     }
 
     pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> Result<bool, Error> {
+        let start = std::time::Instant::now();
+
+        let r = self.do_repay(lend_key, key, status);
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.repay_timed_out_time", start, end);
+        metrics::counter!("pq.repay_timed_out", 1);
+
+        r
+    }
+
+    fn do_repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> Result<bool, Error> {
         let entry = self.lentm.get(&key);
 
         if let Ok(Some(map_entry)) = entry {
@@ -515,6 +504,8 @@ impl PQueue {
     }
 
     pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> Result<bool, Error> {
+        let start = std::time::Instant::now();
+
         let entry = self.lentm.remove(key);
 
         let r =
@@ -530,6 +521,10 @@ impl PQueue {
             } else {
                 false
             };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("pq.heartbeat_time", start, end);
+        metrics::counter!("pq.heartbeat", 1);
 
         Ok(r)
     }
@@ -594,9 +589,9 @@ mod test {
         pq.lend(time + Duration::seconds(8)).unwrap(); // 5 (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8>
         assert_top(&pq, as_key(5));
         pq.lend(time + Duration::seconds(9)).unwrap(); // (1 6) 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9>
-        assert_top(&pq, as_key(6));
-        pq.lend(time + Duration::seconds(10)).unwrap(); // 1 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10>
         assert_top(&pq, as_key(1));
+        pq.lend(time + Duration::seconds(10)).unwrap(); // 6 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <1/10>
+        assert_top(&pq, as_key(6));
         pq.lend(time + Duration::seconds(11)).unwrap(); // 7 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11>
         assert_top(&pq, as_key(7));
         pq.lend(time + Duration::seconds(12)).unwrap(); // 8 9 | <0/10> <2/6> <3/7> <4/8> <5/9> <6/10> <1/11> <7/12>

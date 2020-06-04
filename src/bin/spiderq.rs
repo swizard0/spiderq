@@ -73,6 +73,24 @@ impl From<db::Error> for Error {
 }
 
 pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    env_logger::init();
+
+    let receiver = metrics_runtime::Receiver::builder().build().unwrap();
+    let controller = receiver.controller();
+
+    std::thread::spawn(|| {
+        let mut exporter = metrics_runtime::exporters::LogExporter::new(
+            controller,
+            metrics_runtime::observers::YamlBuilder::new(),
+            log::Level::Info,
+            std::time::Duration::from_secs(60),
+        );
+
+        exporter.run();
+    });
+
+    receiver.install();
+
     let matches = maybe_matches.map_err(Error::Getopts)?;
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
