@@ -97,13 +97,17 @@ eprintln!("done queue load");
         for r in pq_rx {
             match r {
                 Ok(key) => {
-                    queue.add(key, AddMode::Tail).unwrap();
+                    queue.add(key, AddMode::Tail, false);
                 }
                 Err(_) => {
                     break;
                 }
             }
         }
+
+        let start = std::time::Instant::now();
+        queue.flush();
+        eprintln!("flush took {} ms", start.elapsed().as_millis());
     });
 
     let file = File::open(snapshot_path)?;

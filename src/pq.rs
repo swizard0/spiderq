@@ -1,17 +1,16 @@
-use serde::{Serialize, Deserialize, de::DeserializeOwned};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::collections::hash_map::Entry;
+use serde::{Serialize, Deserialize};
 use super::proto::{Key, RepayStatus, AddMode};
-use crate::system::{SledTree, System};
 
 #[derive(Debug)]
 pub enum Error {
-    DatabaseDriverError(sled::Error),
+    DatabaseIsNotADir(String),
+    DatabaseStat(std::io::Error),
+    DatabaseMkdir(std::io::Error),
+    LoadSnapshotError(std::io::Error),
     EncodingError(bincode::Error)
-}
-
-impl From<sled::Error> for Error {
-    fn from(err: sled::Error) -> Self {
-        Error::DatabaseDriverError(err)
-    }
 }
 
 impl From<bincode::Error> for Error {
@@ -20,24 +19,22 @@ impl From<bincode::Error> for Error {
     }
 }
 
-trait OrdKey {
-    type Output: Serialize;
-
-    fn key(&self) -> Self::Output;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PQueueEntry {
     key: Key,
     priority: u64,
     boost: u32,
 }
 
-impl OrdKey for PQueueEntry {
-    type Output = ([u8; 8], Key);
+impl Ord for PQueueEntry {
+    fn cmp(&self, other: &PQueueEntry) -> Ordering {
+        other.priority.cmp(&self.priority)
+    }
+}
 
-    fn key(&self) -> Self::Output {
-        (self.priority.to_be_bytes(), self.key.clone())
+impl PartialOrd for PQueueEntry {
+    fn partial_cmp(&self, other: &PQueueEntry) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -54,6 +51,18 @@ impl Instant {
     pub fn now() -> Self {
         let d = OffsetDateTime::now_utc() - OffsetDateTime::unix_epoch();
         Self(d.whole_nanoseconds() as u64)
+    }
+}
+
+impl PartialOrd for Instant {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Instant {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.cmp(&self.0)
     }
 }
 
@@ -74,391 +83,163 @@ impl std::ops::Add<Duration> for Instant {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct LentEntry {
     trigger_at: Instant,
     key: Key,
     snapshot: u64,
 }
 
-impl OrdKey for LentEntry {
-    type Output = ([u8; 8], Key);
-
-    fn key(&self) -> Self::Output {
-        (self.trigger_at.to_be_bytes(), self.key.clone())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct LendSnapshot {
     entry: PQueueEntry,
     serial: u64,
     recycle: Option<Instant>,
 }
 
-struct Tree<K, V> {
-    inner: sled::Tree,
-    buf: Vec<u8>,
-    key_marker: std::marker::PhantomData<K>,
-    value_marker: std::marker::PhantomData<V>
-}
-
-impl<K, V> Tree<K, V> {
-    fn new(inner: sled::Tree) -> Self {
-        Tree {
-            inner,
-            buf: Vec::new(),
-            key_marker: std::marker::PhantomData {},
-            value_marker: std::marker::PhantomData {}
-        }
+impl Ord for LentEntry {
+    fn cmp(&self, other: &LentEntry) -> Ordering {
+        other.trigger_at.cmp(&self.trigger_at)
     }
 }
 
-impl<K, V> Tree<K, V>
-where
-    K: AsRef<[u8]>,
-    V: Serialize + DeserializeOwned
-{
-    fn insert(&mut self, key: K, value: V) -> Result<(), Error> {
-        let start = std::time::Instant::now();
-
-        bincode::serialize_into(&mut self.buf, &value)?;
-
-        self.inner.insert(key, self.buf.as_slice())?;
-        self.buf.clear();
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree.insert_time", start, end);
-        metrics::counter!("pq.tree.insert", 1);
-
-        Ok(())
-    }
-
-    fn get(&self, key: &K) -> Result<Option<V>, Error> {
-        let start = std::time::Instant::now();
-
-        let r = self.inner
-            .get(key)?
-            .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
-            .transpose();
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree.get_time", start, end);
-        metrics::counter!("pq.tree.get", 1);
-
-        r
-    }
-
-    fn remove(&self, key: &K) -> Result<Option<V>, Error> {
-        let start = std::time::Instant::now();
-
-        let r = self.inner
-            .remove(key)?
-            .map(|v| bincode::deserialize(&v).map_err(Error::EncodingError))
-            .transpose();
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree.remove_time", start, end);
-        metrics::counter!("pq.tree.remove", 1);
-
-        r
-    }
-}
-
-struct TreeBag<V>
-{
-    inner: std::sync::Arc<sled::Tree>,
-    marker: std::marker::PhantomData<V>,
-    key_buf: Vec<u8>
-}
-
-impl<V> TreeBag<V>
-where
-    V: OrdKey + Clone + DeserializeOwned + Serialize
-{
-    fn new(tree: sled::Tree) -> Self {
-        let inner = std::sync::Arc::new(tree);
-
-        TreeBag {
-            inner,
-            marker: std::marker::PhantomData {},
-            key_buf: Vec::new(),
-        }
-    }
-
-    fn insert(&mut self, value: V) -> Result<Option<V>, Error> {
-        let start = std::time::Instant::now();
-
-        let k = value.key();
-        bincode::serialize_into(&mut self.key_buf, &k)?;
-        let value = bincode::serialize(&value)?;
-
-        let r = self.inner.insert(&self.key_buf, value)?;
-        let r = match r {
-            Some(v) => Some(bincode::deserialize(&v)?),
-            None => None
-        };
-
-        self.key_buf.clear();
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree_bag.insert_time", start, end);
-        metrics::counter!("pq.tree_bag.insert", 1);
-
-        Ok(r)
-    }
-
-    fn top(&self) -> Result<Option<V>, Error> {
-        let start = std::time::Instant::now();
-
-        let maybe_top =
-            self.inner
-                .iter()
-                .next();
-
-        let r = match maybe_top {
-            Some(r) => {
-                let (_, v) = r?;
-                let v: V = bincode::deserialize(&v)?;
-
-                Ok(Some(v))
-            }
-            None => Ok(None)
-        };
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree_bag.top_time", start, end);
-        metrics::counter!("pq.tree_bag.top", 1);
-
-        r
-    }
-
-    fn pop(&mut self) -> Result<Option<V>, Error> {
-        let start = std::time::Instant::now();
-        let maybe_v = self.inner.pop_min()?;
-
-        let r = match maybe_v {
-            Some((_, v)) => {
-                let v: V = bincode::deserialize(&v)?;
-
-                Ok(Some(v))
-            }
-            None => Ok(None)
-        };
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.tree_bag.pop_time", start, end);
-        metrics::counter!("pq.tree_bag.pop", 1);
-
-        r
+impl PartialOrd for LentEntry {
+    fn partial_cmp(&self, other: &LentEntry) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 pub struct PQueue {
     serial: u64,
-    db_cfg: sled::Config,
-    db: sled::Db,
-    queue: TreeBag<PQueueEntry>,
-    lentm: Tree<Key, LendSnapshot>,
-    lentq: TreeBag<LentEntry>,
-    system: System
+    queue: BinaryHeap<PQueueEntry>,
+    lentm: HashMap<Key, LendSnapshot>,
+    lentq: BinaryHeap<LentEntry>,
+    db_path: std::path::PathBuf,
+    snapshot_counter: usize,
 }
+
+const QUEUE_DUMP_FILENAME: &str = "queue.dump";
 
 impl PQueue {
     pub fn new(database_dir: &str) -> Result<PQueue, Error> {
         let mut db_path = std::path::PathBuf::from(database_dir);
         db_path.push("queue");
 
-        let db_cfg = sled::Config::new()
-            .path(db_path)
-            .mode(sled::Mode::HighThroughput)
-            .flush_every_ms(Some(10 * 60 * 1000));
+        match std::fs::metadata(&db_path) {
+            Ok(ref metadata) if metadata.is_dir() => (),
+            Ok(_) => return Err(Error::DatabaseIsNotADir(db_path.to_string_lossy().to_owned().to_string())),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound =>
+                std::fs::create_dir_all(&db_path).map_err(Error::DatabaseMkdir)?,
+            Err(e) => return Err(Error::DatabaseStat(e)),
+        }
 
-        let start = std::time::Instant::now();
-
-        let db = db_cfg.open()?;
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.init_time", start, end);
-
-        let queue_tree = db.open_tree("queue")?;
-        let queue = TreeBag::new(queue_tree.clone());
-
-        let lentm = db.open_tree("lentm")?;
-        let lentm = Tree::new(lentm);
-
-        let lentq = db.open_tree("lentq")?;
-        let lentq = TreeBag::new(lentq);
-
-        let system = db.open_tree("system")?;
-        let system = System::new(system, SledTree::Tree(queue_tree), false);
+        db_path.push(QUEUE_DUMP_FILENAME);
+        let (queue, lentm, lentq) = match std::fs::File::open(&db_path) {
+            Ok(file) => {
+                let mut buf_reader = std::io::BufReader::new(file);
+                bincode::deserialize_from(buf_reader)?
+            }
+            Err(_) => (BinaryHeap::new(), HashMap::new(), BinaryHeap::new())
+        };
+        db_path.pop();
 
         Ok(PQueue {
             serial: 1,
-            lentm,
             queue,
+            lentm,
             lentq,
-            db,
-            db_cfg,
-            system
+            db_path,
+            snapshot_counter: 0
         })
     }
 
-    pub fn len(&mut self) -> usize {
-        self.system.count()
+    pub fn len(&self) -> usize {
+        self.queue.len()
     }
 
-    pub fn add(&mut self, key: Key, mode: AddMode) -> Result<(), Error> {
+    pub fn add(&mut self, key: Key, mode: AddMode, dump: bool) {
         self.serial += 1;
-
-        let priority = match mode {
-            AddMode::Head => 0,
-            AddMode::Tail => self.serial
-        };
-
-        let value = PQueueEntry {
-            key,
-            priority,
+        self.queue.push(PQueueEntry {
+            key: key,
+            priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
             boost: 0,
-        };
+        });
 
-        match self.queue.insert(value)? {
-            Some(_) => {}
-            None => {
-                self.system.incr();
-            }
+        if dump {
+            self.dump();
         }
-
-        Ok(())
     }
 
-    pub fn top(&self) -> Result<Option<(Key, u64)>, Error> {
-        let maybe_top =
-            self.queue
-                .top()?
-                .map(|e: PQueueEntry| (e.key.clone(), self.serial));
-
-        Ok(maybe_top)
+    pub fn top(&self) -> Option<(Key, u64)> {
+        self.queue.peek().map(|e| (e.key.clone(), self.serial))
     }
 
-    pub fn lend(&mut self, trigger_at: Instant) -> Result<Option<u64>, Error> {
-        let start = std::time::Instant::now();
-
-        let r = if let Some(entry) = self.queue.pop()? {
-            // TODO: transaction
-            let snapshot = LendSnapshot { serial: self.serial, recycle: None, entry: entry.clone() };
-            self.lentm.insert(entry.key.clone(), snapshot)?;
-
-            let lent_entry = LentEntry { trigger_at, key: entry.key, snapshot: self.serial };
-            self.lentq.insert(lent_entry)?;
-
-            Ok(Some(self.serial))
+    pub fn lend(&mut self, trigger_at: Instant) -> Option<u64> {
+        let r = if let Some(entry) = self.queue.pop() {
+            self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
+            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
+            Some(self.serial)
         } else {
-            Ok(None)
+            None
         };
 
-        self.system.decr();
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.lend_time", start, end);
-        metrics::counter!("pq.lend", 1);
+        self.dump();
 
         r
     }
 
-    pub fn next_timeout(&mut self) -> Result<Option<Instant>, Error> {
-        let start = std::time::Instant::now();
-
+    pub fn next_timeout(&mut self) -> Option<Instant> {
         let r = self.do_next_timeout();
 
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.next_timeout_time", start, end);
-        metrics::counter!("pq.next_timeout", 1);
+        self.dump();
 
         r
     }
 
-    fn do_next_timeout(&mut self) -> Result<Option<Instant>, Error> {
+    fn do_next_timeout(&mut self) -> Option<Instant> {
         loop {
-            let do_recycle =
-                if let Some(LentEntry {
-                    trigger_at,
-                    key,
-                    snapshot: qshot, ..
-                }) = self.lentq.top()? {
-                    let snapshot = self.lentm.get(&key);
-
-                    match snapshot {
-                        Ok(Some(mut snapshot)) if snapshot.recycle.is_some() => {
-                            let v = snapshot.recycle.take();
-                            self.lentm.insert(key, snapshot)?;
-
-                            v
-                        },
-                        Ok(Some(LendSnapshot { serial: mshot, .. })) if mshot == qshot =>
-                            return Ok(Some(trigger_at)),
-                        _ =>
-                            None,
-                    }
-                } else {
-                    break
-                };
-
-            if let Some(mut entry) = self.lentq.pop()? {
-                if let Some(reschedule) = do_recycle {
-                    entry.trigger_at = reschedule;
-                    self.lentq.insert(entry)?;
+            let do_recycle = if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
+                match self.lentm.get_mut(k) {
+                    Some(ref mut snapshot) if snapshot.recycle.is_some() =>
+                        snapshot.recycle.take(),
+                    Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
+                        return Some(trigger),
+                    _ =>
+                        None,
                 }
-            }
-        }
+            } else {
+                break
+            };
 
-        Ok(None)
+            self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
+                entry.trigger_at = reschedule;
+                self.lentq.push(entry);
+            });
+        }
+        None
     }
 
-    pub fn repay_timed_out(&mut self) -> Result<(), Error> {
-        let start = std::time::Instant::now();
-
-        let entry = self.lentq.pop()?;
-        if let Some(LentEntry { key, snapshot, .. }) = entry {
-            self.repay(snapshot, key, RepayStatus::Front)?;
+    pub fn repay_timed_out(&mut self) {
+        if let Some(LentEntry { key: k, snapshot: s, .. }) = self.lentq.pop() {
+            self.repay(s, k, RepayStatus::Front);
         }
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.repay_timed_out_time", start, end);
-        metrics::counter!("pq.repay_timed_out", 1);
-
-        Ok(())
     }
 
-    pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> Result<bool, Error> {
-        let start = std::time::Instant::now();
-
+    pub fn repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> bool {
         let r = self.do_repay(lend_key, key, status);
 
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.repay_timed_out_time", start, end);
-        metrics::counter!("pq.repay_timed_out", 1);
+        self.dump();
 
         r
     }
 
-    fn do_repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> Result<bool, Error> {
-        let entry = self.lentm.get(&key);
-
-        if let Ok(Some(map_entry)) = entry {
-            if lend_key != map_entry.serial {
-                return Ok(false)
+    fn do_repay(&mut self, lend_key: u64, key: Key, status: RepayStatus) -> bool {
+        if let Entry::Occupied(map_entry) = self.lentm.entry(key) {
+            if lend_key != map_entry.get().serial {
+                return false
             }
-
-            let LendSnapshot { mut entry, .. } = map_entry;
-            self.lentm.remove(&key)?;
-
-            let min_priority =
-                self.queue
-                    .top()?
-                    .map(|e| e.priority)
-                    .unwrap_or(0);
-
+            let LendSnapshot { mut entry, .. } = map_entry.remove();
+            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
@@ -466,52 +247,68 @@ impl PQueue {
                 RepayStatus::Reward if region >> (entry.boost + 1) == 0 => entry.boost,
                 RepayStatus::Reward => { entry.boost += 1; entry.boost },
                 RepayStatus::Front => 0,
-                RepayStatus::Drop => return Ok(true),
+                RepayStatus::Drop => return true,
             };
             self.serial += 1;
-            self.system.incr();
             entry.priority = match status {
                 RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
             };
-
-            self.queue.insert(entry)?;
-
-            Ok(true)
+            self.queue.push(entry);
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
-    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> Result<bool, Error> {
-        let start = std::time::Instant::now();
-
-        let entry = self.lentm.remove(key);
-
-        let r =
-            if let Ok(Some(mut snapshot)) = entry {
-                if lend_key == snapshot.serial {
-                    snapshot.recycle = Some(trigger_at);
-                    self.lentm.insert(key.clone(), snapshot)?;
-
-                    true
-                } else {
-                    false
-                }
+    pub fn heartbeat(&mut self, lend_key: u64, key: &Key, trigger_at: Instant) -> bool {
+        if let Some(snapshot) = self.lentm.get_mut(key) {
+            if lend_key == snapshot.serial {
+                snapshot.recycle = Some(trigger_at);
+                true
             } else {
                 false
-            };
-
-        let end = std::time::Instant::now();
-        metrics::timing!("pq.heartbeat_time", start, end);
-        metrics::counter!("pq.heartbeat", 1);
-
-        Ok(r)
+            }
+        } else {
+            false
+        }
     }
 
-    pub fn remove(&mut self, key: Key) -> Result<(), Error> {
-        self.lentm.remove(&key)?;
+    pub fn remove(&mut self, key: Key) {
+        self.lentm.remove(&key);
+        self.dump();
+    }
+
+    fn dump(&mut self) {
+        self.snapshot_counter += 1;
+
+        if self.snapshot_counter == 100000 {
+            self.flush();
+            self.snapshot_counter = 0;
+        }
+    }
+
+    pub fn flush(&mut self) -> Result<(), Error> {
+        let new_queue_filename = format!("{}.new", QUEUE_DUMP_FILENAME);
+        self.db_path.push(&new_queue_filename);
+
+        let file = std::fs::File::create(&self.db_path).map_err(Error::LoadSnapshotError)?;
+        let mut buf_reader = std::io::BufWriter::new(file);
+        let queue = bincode::serialize_into(buf_reader, &(&self.queue, &self.lentm, &self.lentq))?;
+
+        let new_file_path = self.db_path.clone();
+        self.db_path.pop();
+        self.db_path.push(QUEUE_DUMP_FILENAME);
+        std::fs::rename(new_file_path, &self.db_path);
+        self.db_path.pop();
+
         Ok(())
+    }
+}
+
+impl Drop for PQueue {
+    fn drop(&mut self) {
+        self.flush().unwrap();
     }
 }
 

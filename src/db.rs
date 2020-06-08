@@ -25,14 +25,6 @@ pub struct Database {
 
 impl Database {
     pub fn new(database_dir: &str) -> Result<Database, Error> {
-        match fs::metadata(database_dir) {
-            Ok(ref metadata) if metadata.is_dir() => (),
-            Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-                fs::create_dir(database_dir).map_err(Error::DatabaseMkdir)?,
-            Err(e) => return Err(Error::DatabaseStat(e)),
-        }
-
         let mut db_path = std::path::PathBuf::from(database_dir);
         db_path.push("store");
 

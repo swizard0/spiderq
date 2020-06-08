@@ -349,7 +349,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(GlobalReq::Count) =>
                 tx_chan_n(PqRep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Global(GlobalReq::Repay { lend_key: rlend_key, key: rkey, value: rvalue, status: rstatus, }) =>
-                if pq.repay(rlend_key, rkey.clone(), rstatus)? {
+                if pq.repay(rlend_key, rkey.clone(), rstatus) {
                     tx_chan_n(PqRep::Local(PqLocalRep::Repaid(rkey, rvalue)), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx)?
@@ -357,13 +357,13 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(..) =>
                 unreachable!(),
             PqReq::Local(PqLocalReq::Enqueue(key, mode)) =>
-                pq.add(key, mode)?,
+                pq.add(key, mode, true),
             PqReq::Local(PqLocalReq::Remove(key)) =>
-                pq.remove(key)?,
+                pq.remove(key),
             PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) =>
-                if let Some((key, serial)) = pq.top()? {
+                if let Some((key, serial)) = pq.top() {
                     tx_chan_n(PqRep::Local(PqLocalRep::Lent(serial, key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?;
-                    pq.lend(trigger_at)?;
+                    pq.lend(trigger_at);
                 } else {
                     match mode {
                         LendMode::Block =>
@@ -373,16 +373,16 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                     }
                 },
             PqReq::Local(PqLocalReq::Heartbeat(lend_key, ref key, trigger_at)) => {
-                if pq.heartbeat(lend_key, key, trigger_at)? {
+                if pq.heartbeat(lend_key, key, trigger_at) {
                     tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::Skipped), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
             PqReq::Local(PqLocalReq::NextTrigger) =>
-                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout()?)), req.headers, &chan_tx, &mut sock_tx)?,
+                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Local(PqLocalReq::RepayTimedOut) =>
-                pq.repay_timed_out()?,
+                pq.repay_timed_out(),
             PqReq::Local(PqLocalReq::Stop) => {
                 tx_chan_n(PqRep::Local(PqLocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx)?;
                 return Ok(())
