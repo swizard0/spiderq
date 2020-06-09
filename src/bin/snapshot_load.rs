@@ -104,10 +104,6 @@ eprintln!("done queue load");
                 }
             }
         }
-
-        let start = std::time::Instant::now();
-        queue.flush();
-        eprintln!("flush took {} ms", start.elapsed().as_millis());
     });
 
     let file = File::open(snapshot_path)?;

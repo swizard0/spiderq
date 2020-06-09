@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::collections::hash_map::Entry;
@@ -19,7 +20,7 @@ impl From<bincode::Error> for Error {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 struct PQueueEntry {
     key: Key,
     priority: u64,
@@ -90,7 +91,7 @@ struct LentEntry {
     snapshot: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct LendSnapshot {
     entry: PQueueEntry,
     serial: u64,
@@ -109,9 +110,11 @@ impl PartialOrd for LentEntry {
     }
 }
 
+use std::sync::{Arc, RwLock};
+
 pub struct PQueue {
     serial: u64,
-    queue: BinaryHeap<PQueueEntry>,
+    queue: Arc<RwLock<BinaryHeap<PQueueEntry>>>,
     lentm: HashMap<Key, LendSnapshot>,
     lentq: BinaryHeap<LentEntry>,
     db_path: std::path::PathBuf,
@@ -134,36 +137,73 @@ impl PQueue {
         }
 
         db_path.push(QUEUE_DUMP_FILENAME);
-        let (queue, lentm, lentq) = match std::fs::File::open(&db_path) {
+        let queue = Arc::new(RwLock::new(BinaryHeap::new()));
+
+        match std::fs::File::open(&db_path) {
             Ok(file) => {
-                let mut buf_reader = std::io::BufReader::new(file);
-                bincode::deserialize_from(buf_reader)?
+                let queue_copy = queue.clone();
+
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut reader = snap::read::FrameDecoder::new(reader);
+
+                    let mut buf = Vec::new();
+
+                    loop {
+                        match bincode::deserialize_from::<_, PQueueEntry>(&mut reader) {
+                            Ok(next) => {
+                                buf.push(next);
+
+                                if buf.len() == 100000 {
+                                    let mut q = queue_copy.write().unwrap();
+                                    for v in buf.drain(..) {
+                                        q.push(v);
+                                    }
+
+                                    buf.clear();
+                                }
+                            }
+                            Err(err) => {
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut q = queue_copy.write().unwrap();
+                    for v in buf.drain(..) {
+                        q.push(v);
+                    }
+                });
             }
-            Err(_) => (BinaryHeap::new(), HashMap::new(), BinaryHeap::new())
+            Err(_) => {}
         };
         db_path.pop();
 
         Ok(PQueue {
             serial: 1,
             queue,
-            lentm,
-            lentq,
+            lentm: HashMap::new(),
+            lentq: BinaryHeap::new(),
             db_path,
             snapshot_counter: 0
         })
     }
 
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.queue.read().unwrap().len()
     }
 
     pub fn add(&mut self, key: Key, mode: AddMode, dump: bool) {
         self.serial += 1;
-        self.queue.push(PQueueEntry {
-            key: key,
-            priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
-            boost: 0,
-        });
+
+        {
+            let mut q = self.queue.write().unwrap();
+            q.push(PQueueEntry {
+                key: key,
+                priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
+                boost: 0,
+            });
+        }
 
         if dump {
             self.dump();
@@ -171,11 +211,11 @@ impl PQueue {
     }
 
     pub fn top(&self) -> Option<(Key, u64)> {
-        self.queue.peek().map(|e| (e.key.clone(), self.serial))
+        self.queue.read().unwrap().peek().map(|e| (e.key.clone(), self.serial))
     }
 
     pub fn lend(&mut self, trigger_at: Instant) -> Option<u64> {
-        let r = if let Some(entry) = self.queue.pop() {
+        let r = if let Some(entry) = self.queue.write().unwrap().pop() {
             self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
             self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
             Some(self.serial)
@@ -239,7 +279,7 @@ impl PQueue {
                 return false
             }
             let LendSnapshot { mut entry, .. } = map_entry.remove();
-            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.peek() { p } else { 0 };
+            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.read().unwrap().peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
@@ -254,7 +294,10 @@ impl PQueue {
                 RepayStatus::Front => 0,
                 _ => self.serial - (region - (region >> current_boost)),
             };
-            self.queue.push(entry);
+
+            let mut q = self.queue.write().unwrap();
+            q.push(entry);
+
             true
         } else {
             false
@@ -282,33 +325,75 @@ impl PQueue {
     fn dump(&mut self) {
         self.snapshot_counter += 1;
 
-        if self.snapshot_counter == 100000 {
+        if self.snapshot_counter == 1_000_000 {
             self.flush();
             self.snapshot_counter = 0;
         }
     }
 
-    pub fn flush(&mut self) -> Result<(), Error> {
+    pub fn flush(&mut self) -> Result<std::thread::JoinHandle<()>, Error> {
         let new_queue_filename = format!("{}.new", QUEUE_DUMP_FILENAME);
         self.db_path.push(&new_queue_filename);
-
-        let file = std::fs::File::create(&self.db_path).map_err(Error::LoadSnapshotError)?;
-        let mut buf_reader = std::io::BufWriter::new(file);
-        let queue = bincode::serialize_into(buf_reader, &(&self.queue, &self.lentm, &self.lentq))?;
-
-        let new_file_path = self.db_path.clone();
+        let new_queue_filename = self.db_path.clone();
         self.db_path.pop();
+
         self.db_path.push(QUEUE_DUMP_FILENAME);
-        std::fs::rename(new_file_path, &self.db_path);
+        let proper_filename = self.db_path.clone();
         self.db_path.pop();
 
-        Ok(())
+        let mut lentm_copy = self.lentm.clone();
+
+        let new_heap = BinaryHeap::with_capacity(self.queue.read().unwrap().len());
+        let mut q = self.queue.write().unwrap();
+        let mut old_heap = std::mem::replace(&mut *q, new_heap);
+        let queue = self.queue.clone();
+
+        let snapshot_thread_handle = std::thread::spawn(move || {
+            let file = std::fs::File::create(&new_queue_filename).unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+            let mut writer = snap::write::FrameEncoder::new(writer);
+
+            for (_, v) in lentm_copy.drain() {
+                bincode::serialize_into(&mut writer, &v.entry);
+            }
+
+            let mut buf = Vec::new();
+
+            while let Some(next) = old_heap.pop() {
+                bincode::serialize_into(&mut writer, &next);
+
+                buf.push(next);
+
+                if buf.len() == 100000 {
+                    let mut q = queue.write().unwrap();
+                    for v in buf.drain(..) {
+                        q.push(v);
+                    }
+                    buf.clear();
+                }
+            }
+
+            let mut q = queue.write().unwrap();
+            for v in buf.drain(..) {
+                q.push(v);
+            }
+
+            writer.flush().unwrap();
+            std::fs::rename(new_queue_filename, proper_filename);
+        });
+
+        Ok(snapshot_thread_handle)
     }
 }
 
 impl Drop for PQueue {
     fn drop(&mut self) {
-        self.flush().unwrap();
+        let start = std::time::Instant::now();
+
+        let h = self.flush().unwrap();
+        h.join().unwrap();
+
+        eprintln!("flush took {} ms", start.elapsed().as_millis());
     }
 }
 

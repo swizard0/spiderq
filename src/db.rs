@@ -1,4 +1,4 @@
-use std::{io, fs};
+use std::io;
 use std::iter::Iterator;
 use super::proto::{Key, Value};
 use crate::system::{SledTree, System};
