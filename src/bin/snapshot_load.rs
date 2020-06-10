@@ -20,6 +20,8 @@ impl From<io::Error> for Error {
 }
 
 pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
+    env_logger::init();
+
     let matches = maybe_matches.map_err(Error::Getopts)?;
     let skip_db = matches.opt_present("skip-db");
 

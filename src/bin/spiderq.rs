@@ -38,7 +38,7 @@ use spiderq_proto::{
     GlobalRep,
 };
 
-const MAX_POLL_TIMEOUT: i64 = 100;
+const MAX_POLL_TIMEOUT: i128 = 100;
 
 #[derive(Debug)]
 pub enum Error {
@@ -449,7 +449,7 @@ fn master(mut sock_ext: zmq::Socket,
                 MAX_POLL_TIMEOUT,
             Some(Some(next_trigger)) => {
                 let interval = next_trigger - before_poll_ts;
-                match interval.num_milliseconds() {
+                match interval.whole_milliseconds() {
                     timeout if timeout <= 0 => {
                         tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &chan_pq_tx);
                         tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
@@ -469,7 +469,7 @@ fn master(mut sock_ext: zmq::Socket,
             let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                                  sock_db_rx.as_poll_item(zmq::POLLIN),
                                  sock_pq_rx.as_poll_item(zmq::POLLIN)];
-            zmq::poll(&mut pollitems, timeout)
+            zmq::poll(&mut pollitems, timeout as i64)
                 .map_err(ZmqError::Poll)
                 .map_err(Error::Zmq)?;
             [pollitems[0].get_revents() == zmq::POLLIN,

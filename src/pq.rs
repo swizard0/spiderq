@@ -11,6 +11,7 @@ pub enum Error {
     DatabaseStat(std::io::Error),
     DatabaseMkdir(std::io::Error),
     LoadSnapshotError(std::io::Error),
+    FlushError(std::io::Error),
     EncodingError(bincode::Error)
 }
 
@@ -110,15 +111,18 @@ impl PartialOrd for LentEntry {
     }
 }
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub struct PQueue {
     serial: u64,
-    queue: Arc<RwLock<BinaryHeap<PQueueEntry>>>,
+    queue: Arc<Mutex<BinaryHeap<PQueueEntry>>>,
     lentm: HashMap<Key, LendSnapshot>,
     lentq: BinaryHeap<LentEntry>,
     db_path: std::path::PathBuf,
     snapshot_counter: usize,
+    snapshot_in_progress: Arc<Mutex<bool>>,
+    count_before_snapshot: usize,
+    last_snapshot_at: std::time::Instant
 }
 
 const QUEUE_DUMP_FILENAME: &str = "queue.dump";
@@ -137,14 +141,14 @@ impl PQueue {
         }
 
         db_path.push(QUEUE_DUMP_FILENAME);
-        let queue = Arc::new(RwLock::new(BinaryHeap::new()));
+        let queue = Arc::new(Mutex::new(BinaryHeap::new()));
 
         match std::fs::File::open(&db_path) {
             Ok(file) => {
                 let queue_copy = queue.clone();
 
                 std::thread::spawn(move || {
-                    let mut reader = std::io::BufReader::new(file);
+                    let reader = std::io::BufReader::new(file);
                     let mut reader = snap::read::FrameDecoder::new(reader);
 
                     let mut buf = Vec::new();
@@ -155,21 +159,25 @@ impl PQueue {
                                 buf.push(next);
 
                                 if buf.len() == 100000 {
-                                    let mut q = queue_copy.write().unwrap();
+                                    let mut q = match queue_copy.lock() {
+                                        Ok(g) => g,
+                                        Err(p) => p.into_inner()
+                                    };
                                     for v in buf.drain(..) {
                                         q.push(v);
                                     }
-
-                                    buf.clear();
                                 }
                             }
-                            Err(err) => {
+                            Err(_) => {
                                 break;
                             }
                         }
                     }
 
-                    let mut q = queue_copy.write().unwrap();
+                    let mut q = match queue_copy.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner()
+                    };
                     for v in buf.drain(..) {
                         q.push(v);
                     }
@@ -185,19 +193,39 @@ impl PQueue {
             lentm: HashMap::new(),
             lentq: BinaryHeap::new(),
             db_path,
-            snapshot_counter: 0
+            snapshot_counter: 0,
+            snapshot_in_progress: Arc::new(Mutex::new(false)),
+            count_before_snapshot: 0,
+            last_snapshot_at: std::time::Instant::now()
         })
     }
 
     pub fn len(&self) -> usize {
-        self.queue.read().unwrap().len()
+        let in_progress = match self.snapshot_in_progress.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+
+        if *in_progress {
+            self.count_before_snapshot
+        } else {
+            let q = match self.queue.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+            q.len()
+        }
     }
 
     pub fn add(&mut self, key: Key, mode: AddMode, dump: bool) {
         self.serial += 1;
 
         {
-            let mut q = self.queue.write().unwrap();
+            let mut q = match self.queue.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+
             q.push(PQueueEntry {
                 key: key,
                 priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
@@ -211,16 +239,28 @@ impl PQueue {
     }
 
     pub fn top(&self) -> Option<(Key, u64)> {
-        self.queue.read().unwrap().peek().map(|e| (e.key.clone(), self.serial))
+        let q = match self.queue.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+
+        q.peek().map(|e| (e.key.clone(), self.serial))
     }
 
     pub fn lend(&mut self, trigger_at: Instant) -> Option<u64> {
-        let r = if let Some(entry) = self.queue.write().unwrap().pop() {
-            self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
-            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
-            Some(self.serial)
-        } else {
-            None
+        let r = {
+            let mut q = match self.queue.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+
+            if let Some(entry) = q.pop() {
+                self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
+                self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
+                Some(self.serial)
+            } else {
+                None
+            }
         };
 
         self.dump();
@@ -279,7 +319,11 @@ impl PQueue {
                 return false
             }
             let LendSnapshot { mut entry, .. } = map_entry.remove();
-            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = self.queue.read().unwrap().peek() { p } else { 0 };
+            let mut q = match self.queue.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+            let min_priority = if let Some(&PQueueEntry { priority: p, .. }) = q.peek() { p } else { 0 };
             let region = self.serial + 1 - min_priority;
             let current_boost = match status {
                 RepayStatus::Penalty if entry.boost == 0 => 0,
@@ -295,7 +339,6 @@ impl PQueue {
                 _ => self.serial - (region - (region >> current_boost)),
             };
 
-            let mut q = self.queue.write().unwrap();
             q.push(entry);
 
             true
@@ -325,61 +368,127 @@ impl PQueue {
     fn dump(&mut self) {
         self.snapshot_counter += 1;
 
-        if self.snapshot_counter == 1_000_000 {
-            self.flush();
-            self.snapshot_counter = 0;
+        let time_to_snapshot = self.last_snapshot_at.elapsed() >= std::time::Duration::from_secs(30 * 60);
+        let too_much_ops_to_snapshot = self.snapshot_counter == 1_000_000;
+        let should_do_snapshot = time_to_snapshot || too_much_ops_to_snapshot;
+
+        if should_do_snapshot {
+            let mut in_progress = self.snapshot_in_progress.lock().unwrap();
+
+            if !*in_progress {
+
+                *in_progress = true;
+                self.count_before_snapshot = {
+                    let q = match self.queue.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner()
+                    };
+                    q.len()
+                };
+
+                match self.flush() {
+                    Ok(_handle) => {
+                        self.snapshot_counter = 0;
+                        self.last_snapshot_at = std::time::Instant::now();
+                    }
+                    Err(err) => {
+                        *in_progress = false;
+                        log::error!("failed to flush: {:?}", err);
+                    }
+                }
+            }
         }
     }
 
-    pub fn flush(&mut self) -> Result<std::thread::JoinHandle<()>, Error> {
-        let new_queue_filename = format!("{}.new", QUEUE_DUMP_FILENAME);
-        self.db_path.push(&new_queue_filename);
-        let new_queue_filename = self.db_path.clone();
-        self.db_path.pop();
-
-        self.db_path.push(QUEUE_DUMP_FILENAME);
-        let proper_filename = self.db_path.clone();
-        self.db_path.pop();
+    pub fn flush(&self) -> Result<std::thread::JoinHandle<()>, Error> {
+        let proper_filename = self.db_path.join(QUEUE_DUMP_FILENAME);
 
         let mut lentm_copy = self.lentm.clone();
 
-        let new_heap = BinaryHeap::with_capacity(self.queue.read().unwrap().len());
-        let mut q = self.queue.write().unwrap();
-        let mut old_heap = std::mem::replace(&mut *q, new_heap);
+        let mut old_heap = {
+            let mut q = match self.queue.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+            let queue_len = q.len();
+
+            let new_heap = BinaryHeap::with_capacity(queue_len);
+            std::mem::replace(&mut *q, new_heap)
+        };
+
         let queue = self.queue.clone();
+        let snapshot_in_progress = self.snapshot_in_progress.clone();
 
         let snapshot_thread_handle = std::thread::spawn(move || {
-            let file = std::fs::File::create(&new_queue_filename).unwrap();
-            let mut writer = std::io::BufWriter::new(file);
-            let mut writer = snap::write::FrameEncoder::new(writer);
+            match tempdir::TempDir::new("spiderq_snapshot") {
+                Ok(tmp_dir) => {
+                    let new_queue_filename = tmp_dir.path().join(QUEUE_DUMP_FILENAME);
 
-            for (_, v) in lentm_copy.drain() {
-                bincode::serialize_into(&mut writer, &v.entry);
-            }
+                    match std::fs::File::create(&new_queue_filename) {
+                        Ok(file) => {
+                            let writer = std::io::BufWriter::new(file);
+                            let mut writer = snap::write::FrameEncoder::new(writer);
 
-            let mut buf = Vec::new();
+                            for (_, v) in lentm_copy.drain() {
+                                bincode::serialize_into(&mut writer, &v.entry);
+                            }
 
-            while let Some(next) = old_heap.pop() {
-                bincode::serialize_into(&mut writer, &next);
+                            let mut buf = Vec::new();
 
-                buf.push(next);
+                            while let Some(next) = old_heap.pop() {
+                                bincode::serialize_into(&mut writer, &next);
 
-                if buf.len() == 100000 {
-                    let mut q = queue.write().unwrap();
-                    for v in buf.drain(..) {
-                        q.push(v);
+                                buf.push(next);
+
+                                if buf.len() == 100000 {
+                                    let mut q = match queue.lock() {
+                                        Ok(g) => g,
+                                        Err(p) => p.into_inner()
+                                    };
+                                    for v in buf.drain(..) {
+                                        q.push(v);
+                                    }
+                                }
+                            }
+
+                            let mut q = match queue.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner()
+                            };
+                            for v in buf.drain(..) {
+                                q.push(v);
+                            }
+
+                            match writer.flush() {
+                                Ok(_) => {
+                                    match std::fs::copy(new_queue_filename, proper_filename) {
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            log::error!("failed to copy snapshot file: {}", err);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    log::error!("failed to flush writer: {}", err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("failed to create snapshot file: {}", err);
+                        }
                     }
-                    buf.clear();
+                }
+                Err(err) => {
+                    log::error!("failed to create temp dir: {}", err);
                 }
             }
 
-            let mut q = queue.write().unwrap();
-            for v in buf.drain(..) {
-                q.push(v);
-            }
+            let mut in_progress = match snapshot_in_progress.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
 
-            writer.flush().unwrap();
-            std::fs::rename(new_queue_filename, proper_filename);
+            *in_progress = false;
         });
 
         Ok(snapshot_thread_handle)
