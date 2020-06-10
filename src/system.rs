@@ -1,3 +1,4 @@
+#[derive(Debug)]
 enum Op {
     Incr,
     Decr,
@@ -14,7 +15,8 @@ pub enum SledTree {
 
 pub struct System {
     tree: sled::Tree,
-    update_tx: std::sync::mpsc::Sender<Op>
+    update_tx: std::sync::mpsc::Sender<Op>,
+    thread_handle: Option<std::thread::JoinHandle<()>>
 }
 
 impl System {
@@ -39,8 +41,8 @@ impl System {
         let tree_copy = tree.clone();
         let db_copy = db.clone();
 
-        std::thread::spawn(move || {
-            let mut count: usize = 0;
+        let thread_handle = std::thread::spawn(move || {
+            let mut count: i128 = 0;
             let mut ops_count = 0;
 
             for m in recv {
@@ -57,10 +59,10 @@ impl System {
                         count = match db_copy {
                             SledTree::Db(ref db) => db.len(),
                             SledTree::Tree(ref db) => db.len()
-                        };
+                        } as i128;
                     }
                     Op::Set(new_count) => {
-                        count = new_count;
+                        count = new_count as i128;
                     }
                     Op::Stop => {
                         break;
@@ -73,17 +75,17 @@ impl System {
                             Some(v) => {
                                 let new_count = match bincode::deserialize::<usize>(v) {
                                     Ok(existing_count) => match m {
-                                        Op::Set(..) | Op::Recount => count,
-                                        _ => existing_count + count
+                                        Op::Set(..) | Op::Recount => count as usize,
+                                        _ => (existing_count as isize + count as isize) as usize
                                     },
-                                    Err(_) => count
+                                    Err(_) => count as usize
                                 };
 
                                 let v = bincode::serialize::<usize>(&new_count).unwrap();
                                 Some(v)
                             }
                             None => {
-                                let v = bincode::serialize::<usize>(&count).unwrap();
+                                let v = bincode::serialize::<usize>(&(count as usize)).unwrap();
                                 Some(v)
                             }
                         }
@@ -104,7 +106,8 @@ impl System {
 
         Self {
             tree,
-            update_tx: send
+            update_tx: send,
+            thread_handle: Some(thread_handle)
         }
     }
 
@@ -132,10 +135,15 @@ impl System {
         // }
         0
     }
+
+    pub fn stop(&mut self) {
+        self.update_tx.send(Op::Stop);
+        let h = self.thread_handle.take().map(|h| h.join());
+    }
 }
 
 impl Drop for System {
     fn drop(&mut self) {
-        self.update_tx.send(Op::Stop).unwrap();
+        self.stop();
     }
 }
