@@ -140,17 +140,18 @@ impl PQueue {
             Err(e) => return Err(Error::DatabaseStat(e)),
         }
 
-        db_path.push(QUEUE_DUMP_FILENAME);
+        let snapshot_filename = db_path.join(QUEUE_DUMP_FILENAME);
         let queue = Arc::new(Mutex::new(BinaryHeap::new()));
 
-        match std::fs::File::open(&db_path) {
+        let serial = match std::fs::File::open(snapshot_filename) {
             Ok(file) => {
                 let queue_copy = queue.clone();
 
-                std::thread::spawn(move || {
-                    let reader = std::io::BufReader::new(file);
-                    let mut reader = snap::read::FrameDecoder::new(reader);
+                let reader = std::io::BufReader::new(file);
+                let mut reader = snap::read::FrameDecoder::new(reader);
+                let serial = bincode::deserialize_from::<_, u64>(&mut reader)?;
 
+                std::thread::spawn(move || {
                     let mut buf = Vec::new();
 
                     loop {
@@ -182,13 +183,16 @@ impl PQueue {
                         q.push(v);
                     }
                 });
+
+                serial
             }
-            Err(_) => {}
+            Err(_) => 1
         };
-        db_path.pop();
+
+        eprintln!("serial = {}", serial);
 
         Ok(PQueue {
-            serial: 1,
+            serial,
             queue,
             lentm: HashMap::new(),
             lentq: BinaryHeap::new(),
@@ -418,6 +422,7 @@ impl PQueue {
 
         let queue = self.queue.clone();
         let snapshot_in_progress = self.snapshot_in_progress.clone();
+        let serial = self.serial;
 
         let snapshot_thread_handle = std::thread::spawn(move || {
             match tempdir::TempDir::new("spiderq_snapshot") {
@@ -428,6 +433,8 @@ impl PQueue {
                         Ok(file) => {
                             let writer = std::io::BufWriter::new(file);
                             let mut writer = snap::write::FrameEncoder::new(writer);
+
+                            bincode::serialize_into::<_, u64>(&mut writer, &serial);
 
                             for (_, v) in lentm_copy.drain() {
                                 bincode::serialize_into(&mut writer, &v.entry);
