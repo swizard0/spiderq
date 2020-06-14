@@ -169,7 +169,13 @@ impl PQueue {
                                     }
                                 }
                             }
-                            Err(_) => {
+                            Err(err) => {
+                                match *err {
+                                    bincode::ErrorKind::Io(_) => {}
+                                    _ => {
+                                        log::error!("failed to load snapshot: {}", err);
+                                    }
+                                }
                                 break;
                             }
                         }
@@ -407,6 +413,10 @@ impl PQueue {
     pub fn flush(&self) -> Result<std::thread::JoinHandle<()>, Error> {
         let proper_filename = self.db_path.join(QUEUE_DUMP_FILENAME);
 
+        let cur_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let new_queue_filename = format!("{}.{}", QUEUE_DUMP_FILENAME, cur_time.as_nanos());
+        let new_queue_filename = self.db_path.join(new_queue_filename);
+
         let mut lentm_copy = self.lentm.clone();
 
         let mut old_heap = {
@@ -425,69 +435,11 @@ impl PQueue {
         let serial = self.serial;
 
         let snapshot_thread_handle = std::thread::spawn(move || {
-            match tempdir::TempDir::new("spiderq_snapshot") {
-                Ok(tmp_dir) => {
-                    let new_queue_filename = tmp_dir.path().join(QUEUE_DUMP_FILENAME);
-
-                    match std::fs::File::create(&new_queue_filename) {
-                        Ok(file) => {
-                            let writer = std::io::BufWriter::new(file);
-                            let mut writer = snap::write::FrameEncoder::new(writer);
-
-                            bincode::serialize_into::<_, u64>(&mut writer, &serial);
-
-                            for (_, v) in lentm_copy.drain() {
-                                bincode::serialize_into(&mut writer, &v.entry);
-                            }
-
-                            let mut buf = Vec::new();
-
-                            while let Some(next) = old_heap.pop() {
-                                bincode::serialize_into(&mut writer, &next);
-
-                                buf.push(next);
-
-                                if buf.len() == 100000 {
-                                    let mut q = match queue.lock() {
-                                        Ok(g) => g,
-                                        Err(p) => p.into_inner()
-                                    };
-                                    for v in buf.drain(..) {
-                                        q.push(v);
-                                    }
-                                }
-                            }
-
-                            let mut q = match queue.lock() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner()
-                            };
-                            for v in buf.drain(..) {
-                                q.push(v);
-                            }
-
-                            match writer.flush() {
-                                Ok(_) => {
-                                    match std::fs::copy(new_queue_filename, proper_filename) {
-                                        Ok(_) => {}
-                                        Err(err) => {
-                                            log::error!("failed to copy snapshot file: {}", err);
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    log::error!("failed to flush writer: {}", err);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            log::error!("failed to create snapshot file: {}", err);
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::error!("failed to create temp dir: {}", err);
-                }
+            if let Err(err) = Self::mk_snapshot(
+                old_heap, queue, serial, lentm_copy,
+                &proper_filename, &new_queue_filename
+            ) {
+                log::error!("failed to create snapshot: {:?}", err);
             }
 
             let mut in_progress = match snapshot_in_progress.lock() {
@@ -499,6 +451,57 @@ impl PQueue {
         });
 
         Ok(snapshot_thread_handle)
+    }
+
+    fn mk_snapshot(
+        mut old_heap: BinaryHeap<PQueueEntry>,
+        queue: Arc<Mutex<BinaryHeap<PQueueEntry>>>,
+        serial: u64,
+        mut lentm_copy: HashMap<Key, LendSnapshot>,
+        proper_filename: &std::path::Path,
+        new_queue_filename: &std::path::Path
+    ) -> Result<(), Error> {
+        let file = std::fs::File::create(&new_queue_filename).map_err(Error::FlushError)?;
+
+        let writer = std::io::BufWriter::new(file);
+        let mut writer = snap::write::FrameEncoder::new(writer);
+
+        bincode::serialize_into::<_, u64>(&mut writer, &serial)?;
+
+        for (_, v) in lentm_copy.drain() {
+            bincode::serialize_into(&mut writer, &v.entry)?;
+        }
+
+        let mut buf = Vec::new();
+
+        while let Some(next) = old_heap.pop() {
+            bincode::serialize_into(&mut writer, &next)?;
+
+            buf.push(next);
+
+            if buf.len() == 100000 {
+                let mut q = match queue.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner()
+                };
+                for v in buf.drain(..) {
+                    q.push(v);
+                }
+            }
+        }
+
+        let mut q = match queue.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        for v in buf.drain(..) {
+            q.push(v);
+        }
+
+        writer.flush().map_err(Error::FlushError)?;
+        std::fs::rename(new_queue_filename, proper_filename).map_err(Error::FlushError)?;
+
+        Ok(())
     }
 }
 
