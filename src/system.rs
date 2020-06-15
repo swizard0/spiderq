@@ -120,20 +120,19 @@ impl System {
     }
 
     pub fn count(&self) -> usize {
-        // match self.tree.get("count") {
-        //     Ok(Some(value)) => {
-        //         let count = match bincode::deserialize::<usize>(&value) {
-        //             Ok(count) => count,
-        //             Err(_) => 0
-        //         };
+        match self.tree.get("count") {
+            Ok(Some(value)) => {
+                let count = match bincode::deserialize::<usize>(&value) {
+                    Ok(count) => count,
+                    Err(_) => 0
+                };
 
-        //         count
-        //     }
-        //     Ok(None) | Err(_) => {
-        //         0
-        //     }
-        // }
-        0
+                count
+            }
+            Ok(None) | Err(_) => {
+                0
+            }
+        }
     }
 
     pub fn stop(&mut self) {
