@@ -18,7 +18,6 @@ impl From<sled::Error> for Error {
 }
 
 pub struct Database {
-    db_cfg: sled::Config,
     db: sled::Db,
     system: System,
 }
@@ -42,17 +41,16 @@ impl Database {
         let system = System::new(system, SledTree::Db(db.clone()), false);
 
         Ok(Database {
-            db_cfg,
             db,
             system
         })
     }
 
-    fn approx_count(&mut self) -> usize {
+    pub fn approx_count(&mut self) -> usize {
         self.system.count()
     }
 
-    fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.db.len()
     }
 

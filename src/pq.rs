@@ -417,9 +417,9 @@ impl PQueue {
         let new_queue_filename = format!("{}.{}", QUEUE_DUMP_FILENAME, cur_time.as_nanos());
         let new_queue_filename = self.db_path.join(new_queue_filename);
 
-        let mut lentm_copy = self.lentm.clone();
+        let lentm_copy = self.lentm.clone();
 
-        let mut old_heap = {
+        let old_heap = {
             let mut q = match self.queue.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner()

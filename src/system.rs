@@ -22,7 +22,7 @@ pub struct System {
 impl System {
     pub fn new(tree: sled::Tree, db: SledTree, recount: bool) -> Self
     {
-        let count = match tree.get("count") {
+        match tree.get("count") {
             Ok(Some(value)) => {
                 match bincode::deserialize::<usize>(&value) {
                     Ok(count) => count,
@@ -137,7 +137,7 @@ impl System {
 
     pub fn stop(&mut self) {
         self.update_tx.send(Op::Stop);
-        let h = self.thread_handle.take().map(|h| h.join());
+        self.thread_handle.take().map(|h| h.join().unwrap());
     }
 }
 
