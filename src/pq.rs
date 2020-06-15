@@ -12,6 +12,7 @@ pub enum Error {
     DatabaseMkdir(std::io::Error),
     LoadSnapshotError(std::io::Error),
     FlushError(std::io::Error),
+    PoisonedLockError,
     EncodingError(bincode::Error)
 }
 
@@ -171,9 +172,18 @@ impl PQueue {
                             }
                             Err(err) => {
                                 match *err {
-                                    bincode::ErrorKind::Io(_) => {}
+                                    bincode::ErrorKind::Io(err) => {
+                                        match err.kind() {
+                                            std::io::ErrorKind::UnexpectedEof => {}
+                                            _ => {
+                                                log::error!("failed to load snapshot, exiting...\n{}", err);
+                                                exit_process();
+                                            }
+                                        }
+                                    }
                                     _ => {
-                                        log::error!("failed to load snapshot: {}", err);
+                                        log::error!("failed to load snapshot, exiting...\n{}", err);
+                                        exit_process();
                                     }
                                 }
                                 break;
@@ -192,7 +202,14 @@ impl PQueue {
 
                 serial
             }
-            Err(_) => 1
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::NotFound => 1,
+                _ => {
+                    log::error!("failed to load snapshot, exiting...\n{}", err);
+                    exit_process();
+                    1
+                }
+            }
         };
 
         eprintln!("serial = {}", serial);
@@ -439,12 +456,17 @@ impl PQueue {
                 old_heap, queue, serial, lentm_copy,
                 &proper_filename, &new_queue_filename
             ) {
-                log::error!("failed to create snapshot: {:?}", err);
+                log::error!("failed to create snapshot, exiting...\n{:?}", err);
+                exit_process();
             }
 
             let mut in_progress = match snapshot_in_progress.lock() {
                 Ok(g) => g,
-                Err(p) => p.into_inner()
+                Err(_) => {
+                    log::error!("lock is poisoned by main thread, exiting...");
+                    exit_process();
+                    return;
+                }
             };
 
             *in_progress = false;
@@ -482,7 +504,9 @@ impl PQueue {
             if buf.len() == 100000 {
                 let mut q = match queue.lock() {
                     Ok(g) => g,
-                    Err(p) => p.into_inner()
+                    Err(_) => {
+                        return Err(Error::PoisonedLockError);
+                    }
                 };
                 for v in buf.drain(..) {
                     q.push(v);
@@ -492,7 +516,9 @@ impl PQueue {
 
         let mut q = match queue.lock() {
             Ok(g) => g,
-            Err(p) => p.into_inner()
+            Err(_) => {
+                return Err(Error::PoisonedLockError);
+            }
         };
         for v in buf.drain(..) {
             q.push(v);
@@ -507,13 +533,13 @@ impl PQueue {
 
 impl Drop for PQueue {
     fn drop(&mut self) {
-        let start = std::time::Instant::now();
-
         let h = self.flush().unwrap();
         h.join().unwrap();
-
-        eprintln!("flush took {} ms", start.elapsed().as_millis());
     }
+}
+
+fn exit_process() {
+    signal_simple::signal::kill(signal_simple::signal::SIGINT);
 }
 
 #[cfg(test)]
