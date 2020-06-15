@@ -764,7 +764,8 @@ mod test {
         let (chan_slave_master_tx, chan_master_slave_rx) = channel();
 
         let worker = spawn(move || worker_fn(sock_slave_master_tx, chan_slave_master_tx, chan_slave_master_rx));
-        // assert_eq!(sock_master_slave_rx.recv_bytes(0).unwrap(), &[]); // sync
+        let should_be_bytes_from_slave: [u8; 0] = [];
+        assert_eq!(sock_master_slave_rx.recv_bytes(0).unwrap(), &should_be_bytes_from_slave); // sync
         master_fn(sock_master_slave_rx, chan_master_slave_tx, chan_master_slave_rx);
         worker.join().unwrap();
     }
@@ -773,7 +774,8 @@ mod test {
         where Rep: PartialEq + Debug
     {
         tx_chan(req, None, tx);
-        // assert_eq!(sock.recv_bytes(0).unwrap(), &[]);
+        let should_be_bytes_from_sock: [u8; 0] = [];
+        assert_eq!(sock.recv_bytes(0).unwrap(), &should_be_bytes_from_sock);
         assert_eq!(rx.recv().unwrap().load, rep);
     }
 
