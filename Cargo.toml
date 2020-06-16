@@ -11,9 +11,15 @@ time = { version = "^0.2", features = ["serde"] }
 tempdir = "^0.3"
 zmq = "^0.8"
 simple-signal = "^1.1"
-sled = "0.31"
+signal-simple = "0.1"
+sled = "0.32.0-rc1"
 bincode = "1.2"
+snap = "1.0"
 quickcheck = "0.9"
+metrics = "0.12"
+metrics-runtime = "0.12"
+env_logger = "0.7"
+log = "0.4"
 serde = { version = "1.0", features = ["derive", "rc"] }
 spiderq_proto = { path = "spiderq-proto" }
 

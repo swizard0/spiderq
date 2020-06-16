@@ -38,7 +38,7 @@ use spiderq_proto::{
     GlobalRep,
 };
 
-const MAX_POLL_TIMEOUT: i64 = 100;
+const MAX_POLL_TIMEOUT: i128 = 100;
 
 #[derive(Debug)]
 pub enum Error {
@@ -73,6 +73,24 @@ impl From<db::Error> for Error {
 }
 
 pub fn bootstrap(maybe_matches: getopts::Result) -> Result<(zmq::Context, JoinHandle<()>), Error> {
+    env_logger::init();
+
+    let receiver = metrics_runtime::Receiver::builder().build().unwrap();
+    let controller = receiver.controller();
+
+    std::thread::spawn(|| {
+        let mut exporter = metrics_runtime::exporters::LogExporter::new(
+            controller,
+            metrics_runtime::observers::YamlBuilder::new(),
+            log::Level::Info,
+            std::time::Duration::from_secs(60),
+        );
+
+        exporter.run();
+    });
+
+    receiver.install();
+
     let matches = maybe_matches.map_err(Error::Getopts)?;
     let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
     let zmq_addr = matches.opt_str("zmq-addr").unwrap_or("ipc://./spiderq.ipc".to_owned());
@@ -331,7 +349,7 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(GlobalReq::Count) =>
                 tx_chan_n(PqRep::Global(GlobalRep::Counted(pq.len())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Global(GlobalReq::Repay { lend_key: rlend_key, key: rkey, value: rvalue, status: rstatus, }) =>
-                if pq.repay(rlend_key, rkey.clone(), rstatus)? {
+                if pq.repay(rlend_key, rkey.clone(), rstatus) {
                     tx_chan_n(PqRep::Local(PqLocalRep::Repaid(rkey, rvalue)), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::NotFound), req.headers, &chan_tx, &mut sock_tx)?
@@ -339,13 +357,13 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
             PqReq::Global(..) =>
                 unreachable!(),
             PqReq::Local(PqLocalReq::Enqueue(key, mode)) =>
-                pq.add(key, mode)?,
+                pq.add(key, mode, true),
             PqReq::Local(PqLocalReq::Remove(key)) =>
-                pq.remove(key)?,
+                pq.remove(key),
             PqReq::Local(PqLocalReq::LendUntil(timeout, trigger_at, mode)) =>
-                if let Some((key, serial)) = pq.top()? {
+                if let Some((key, serial)) = pq.top() {
                     tx_chan_n(PqRep::Local(PqLocalRep::Lent(serial, key, timeout, trigger_at, mode)), req.headers, &chan_tx, &mut sock_tx)?;
-                    pq.lend(trigger_at)?;
+                    pq.lend(trigger_at);
                 } else {
                     match mode {
                         LendMode::Block =>
@@ -355,16 +373,16 @@ pub fn worker_pq(mut sock_tx: zmq::Socket,
                     }
                 },
             PqReq::Local(PqLocalReq::Heartbeat(lend_key, ref key, trigger_at)) => {
-                if pq.heartbeat(lend_key, key, trigger_at)? {
+                if pq.heartbeat(lend_key, key, trigger_at) {
                     tx_chan_n(PqRep::Global(GlobalRep::Heartbeaten), req.headers, &chan_tx, &mut sock_tx)?
                 } else {
                     tx_chan_n(PqRep::Global(GlobalRep::Skipped), req.headers, &chan_tx, &mut sock_tx)?
                 }
             },
             PqReq::Local(PqLocalReq::NextTrigger) =>
-                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout()?)), req.headers, &chan_tx, &mut sock_tx)?,
+                tx_chan_n(PqRep::Local(PqLocalRep::TriggerGot(pq.next_timeout())), req.headers, &chan_tx, &mut sock_tx)?,
             PqReq::Local(PqLocalReq::RepayTimedOut) =>
-                pq.repay_timed_out()?,
+                pq.repay_timed_out(),
             PqReq::Local(PqLocalReq::Stop) => {
                 tx_chan_n(PqRep::Local(PqLocalRep::Stopped), req.headers, &chan_tx, &mut sock_tx)?;
                 return Ok(())
@@ -431,7 +449,7 @@ fn master(mut sock_ext: zmq::Socket,
                 MAX_POLL_TIMEOUT,
             Some(Some(next_trigger)) => {
                 let interval = next_trigger - before_poll_ts;
-                match interval.num_milliseconds() {
+                match interval.whole_milliseconds() {
                     timeout if timeout <= 0 => {
                         tx_chan(PqReq::Local(PqLocalReq::RepayTimedOut), None, &chan_pq_tx);
                         tx_chan(PqReq::Local(PqLocalReq::NextTrigger), None, &chan_pq_tx);
@@ -451,7 +469,7 @@ fn master(mut sock_ext: zmq::Socket,
             let mut pollitems = [sock_ext.as_poll_item(zmq::POLLIN),
                                  sock_db_rx.as_poll_item(zmq::POLLIN),
                                  sock_pq_rx.as_poll_item(zmq::POLLIN)];
-            zmq::poll(&mut pollitems, timeout)
+            zmq::poll(&mut pollitems, timeout as i64)
                 .map_err(ZmqError::Poll)
                 .map_err(Error::Zmq)?;
             [pollitems[0].get_revents() == zmq::POLLIN,
@@ -746,7 +764,8 @@ mod test {
         let (chan_slave_master_tx, chan_master_slave_rx) = channel();
 
         let worker = spawn(move || worker_fn(sock_slave_master_tx, chan_slave_master_tx, chan_slave_master_rx));
-        assert_eq!(sock_master_slave_rx.recv_bytes(0).unwrap(), &[]); // sync
+        let should_be_bytes_from_slave: [u8; 0] = [];
+        assert_eq!(sock_master_slave_rx.recv_bytes(0).unwrap(), &should_be_bytes_from_slave); // sync
         master_fn(sock_master_slave_rx, chan_master_slave_tx, chan_master_slave_rx);
         worker.join().unwrap();
     }
@@ -755,7 +774,8 @@ mod test {
         where Rep: PartialEq + Debug
     {
         tx_chan(req, None, tx);
-        assert_eq!(sock.recv_bytes(0).unwrap(), &[]);
+        let should_be_bytes_from_sock: [u8; 0] = [];
+        assert_eq!(sock.recv_bytes(0).unwrap(), &should_be_bytes_from_sock);
         assert_eq!(rx.recv().unwrap().load, rep);
     }
 

@@ -1,6 +1,7 @@
-use std::{io, fs};
+use std::io;
 use std::iter::Iterator;
 use super::proto::{Key, Value};
+use crate::system::{SledTree, System};
 
 #[derive(Debug)]
 pub enum Error {
@@ -17,59 +18,100 @@ impl From<sled::Error> for Error {
 }
 
 pub struct Database {
-    db_cfg: sled::Config,
-    db: sled::Db
+    db: sled::Db,
+    system: System,
 }
 
 impl Database {
     pub fn new(database_dir: &str) -> Result<Database, Error> {
-        match fs::metadata(database_dir) {
-            Ok(ref metadata) if metadata.is_dir() => (),
-            Ok(_) => return Err(Error::DatabaseIsNotADir(database_dir.to_owned())),
-            Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
-                fs::create_dir(database_dir).map_err(Error::DatabaseMkdir)?,
-            Err(e) => return Err(Error::DatabaseStat(e)),
-        }
-
         let mut db_path = std::path::PathBuf::from(database_dir);
         db_path.push("store");
 
         let db_cfg = sled::Config::new()
             .path(db_path)
-            // .cache_capacity(1024 * 1024 * 10)
-            .flush_every_ms(Some(1000));
+            .mode(sled::Mode::HighThroughput)
+            .flush_every_ms(Some(10 * 60 * 1000));
 
+        let start = std::time::Instant::now();
         let db = db_cfg.open().map_err(|e| Error::DatabaseDriverError(e))?;
+        let end = std::time::Instant::now();
+        metrics::timing!("db.init_time", start, end);
+
+        let system = db.open_tree("system")?;
+        let system = System::new(system, SledTree::Db(db.clone()), false);
 
         Ok(Database {
-            db_cfg,
-            db
+            db,
+            system
         })
     }
 
-    pub fn approx_count(&self) -> usize {
+    pub fn approx_count(&mut self) -> usize {
+        self.system.count()
+    }
+
+    pub fn count(&self) -> usize {
         self.db.len()
     }
 
     pub fn lookup(&self, key: &Key) -> Option<Value> {
-        match self.db.get(key) {
+        let start = std::time::Instant::now();
+
+        let r = match self.db.get(key) {
             Ok(value) => value.map(|v| v.into()),
             Err(_) => None
-        }
+        };
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.lookup_time", start, end);
+        metrics::counter!("db.lookup", 1);
+
+        r
     }
 
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
-        self.db.insert(key, value)?;
+        let start = std::time::Instant::now();
+
+        match self.db.insert(key, value)? {
+            None => {
+                self.system.incr();
+            }
+            Some(_) => {}
+        }
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.insert_time", start, end);
+        metrics::counter!("db.insert", 1);
+
         Ok(())
     }
 
     pub fn remove(&mut self, key: Key) -> Result<(), Error> {
-        self.db.remove(key.as_ref())?;
+        let start = std::time::Instant::now();
+
+        match self.db.remove(key.as_ref())? {
+            None => {}
+            Some(_) => {
+                self.system.decr();
+            }
+        }
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.remove_time", start, end);
+        metrics::counter!("db.remove", 1);
+
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+
         self.db.flush()?;
+
+        let end = std::time::Instant::now();
+        metrics::timing!("db.flush_time", start, end);
+        metrics::counter!("db.flush", 1);
+
         Ok(())
     }
 
@@ -156,8 +198,8 @@ mod test {
         check_against(db, check_table);
     }
 
-    fn check_against(db: &Database, check_table: &HashMap<Key, Value>) {
-        if db.approx_count() < check_table.len() {
+    fn check_against(db: &mut Database, check_table: &HashMap<Key, Value>) {
+        if db.count() < check_table.len() {
             panic!("db.approx_count() == {} < check_table.len() == {}", db.approx_count(), check_table.len());
         }
 
@@ -168,14 +210,14 @@ mod test {
 
     #[test]
     fn make() {
-        let db = mkdb("/tmp/spiderq_a");
-        assert_eq!(db.approx_count(), 0);
+        let mut db = mkdb("/tmp/spiderq_a");
+        assert_eq!(db.count(), 0);
     }
 
     #[test]
     fn insert_lookup() {
         let mut db = mkdb("/tmp/spiderq_b");
-        assert_eq!(db.approx_count(), 0);
+        assert_eq!(db.count(), 0);
         let mut check_table = HashMap::new();
         rnd_fill_check(&mut db, &mut check_table, 10);
     }
@@ -185,13 +227,13 @@ mod test {
         let mut check_table = HashMap::new();
         {
             let mut db = mkdb("/tmp/spiderq_c");
-            assert_eq!(db.approx_count(), 0);
+            assert_eq!(db.count(), 0);
             rnd_fill_check(&mut db, &mut check_table, 10);
         }
         {
-            let db = Database::new("/tmp/spiderq_c").unwrap();
-            assert_eq!(db.approx_count(), 10);
-            check_against(&db, &check_table);
+            let mut db = Database::new("/tmp/spiderq_c").unwrap();
+            assert_eq!(db.count(), 10);
+            check_against(&mut db, &check_table);
         }
     }
 
@@ -203,9 +245,9 @@ mod test {
             rnd_fill_check(&mut db, &mut check_table, 2560);
         }
         {
-            let db = Database::new("/tmp/spiderq_d").unwrap();
+            let mut db = Database::new("/tmp/spiderq_d").unwrap();
             assert!(db.approx_count() <= 2560);
-            check_against(&db, &check_table);
+            check_against(&mut db, &check_table);
         }
     }
 

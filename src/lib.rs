@@ -7,3 +7,4 @@ extern crate spiderq_proto as proto;
 
 pub mod db;
 pub mod pq;
+pub mod system;
