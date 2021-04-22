@@ -31,7 +31,7 @@ impl System {
             }
             Ok(None) | Err(_) => {
                 let v = bincode::serialize::<usize>(&0).unwrap();
-                tree.insert("count", v);
+                tree.insert("count", v).unwrap();
 
                 0
             }
@@ -89,7 +89,7 @@ impl System {
                                 Some(v)
                             }
                         }
-                    });
+                    }).unwrap();
                     count = 0;
                     ops_count = 0;
                 }
@@ -101,7 +101,7 @@ impl System {
                 SledTree::Db(ref db) => db.len(),
                 SledTree::Tree(ref db) => db.len()
             };
-            send.send(Op::Set(new_count));
+            send.send(Op::Set(new_count)).unwrap();
         }
 
         Self {
@@ -112,11 +112,11 @@ impl System {
     }
 
     pub fn incr(&self) {
-        self.update_tx.send(Op::Incr);
+        self.update_tx.send(Op::Incr).unwrap();
     }
 
     pub fn decr(&self) {
-        self.update_tx.send(Op::Decr);
+        self.update_tx.send(Op::Decr).unwrap();
     }
 
     pub fn count(&self) -> usize {
@@ -136,7 +136,7 @@ impl System {
     }
 
     pub fn stop(&mut self) {
-        self.update_tx.send(Op::Stop);
+        self.update_tx.send(Op::Stop).unwrap();
         self.thread_handle.take().map(|h| h.join().unwrap());
     }
 }

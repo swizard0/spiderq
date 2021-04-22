@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 use std::iter::Iterator;
 use super::proto::{Key, Value};
 use crate::system::{SledTree, System};
@@ -57,8 +58,8 @@ impl Database {
     pub fn lookup(&self, key: &Key) -> Option<Value> {
         let start = std::time::Instant::now();
 
-        let r = match self.db.get(key) {
-            Ok(value) => value.map(|v| v.into()),
+        let r = match self.db.get(key.to_vec()) {
+            Ok(value) => value.map(|v| Arc::new(v.to_vec())),
             Err(_) => None
         };
 
@@ -72,7 +73,7 @@ impl Database {
     pub fn insert(&mut self, key: Key, value: Value) -> Result<(), Error> {
         let start = std::time::Instant::now();
 
-        match self.db.insert(key, value)? {
+        match self.db.insert(key.to_vec(), value.to_vec())? {
             None => {
                 self.system.incr();
             }
@@ -141,7 +142,7 @@ impl Iterator for Iter {
         match self.iter.next() {
             None => None,
             Some(r) => match r {
-                Ok((k, v)) => Some((k.into(), v.into())),
+                Ok((k, v)) => Some((Arc::new(k.to_vec()), Arc::new(v.to_vec()))),
                 Err(_) => self.next()
             }
         }

@@ -1,4 +1,4 @@
-use std::{io, env, process, fs::File};
+use std::{io, env, process, fs::File, sync::Arc};
 use std::io::{Write, BufRead};
 use getopts::Options;
 
@@ -73,13 +73,13 @@ pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
                 let mut split_iter = line.splitn(2, '\t');
 
                 let key = split_iter.next().unwrap().to_owned();
-                let key = key.into_boxed_str();
+                let key = key.to_string();
                 println!("{}", key);
-                let key: Key = key.into_boxed_bytes().into();
+                let key = Arc::new(key.into_bytes());
 
                 let value = split_iter.next().unwrap().to_owned();
-                let value = value.into_boxed_str();
-                let value: Value = value.into_boxed_bytes().into();
+                let value = value.to_string();
+                let value: Value = Arc::new(value.into_bytes());
 
                 db_tx.send(Ok((key, value))).unwrap();
             }
@@ -116,9 +116,9 @@ eprintln!("done queue load");
             let mut split_iter = line.splitn(2, '\t');
 
             let key = split_iter.next().unwrap().to_owned();
-            let key = key.into_boxed_str();
+            let key = key.to_string();
             println!("{}", key);
-            let key: Key = key.into_boxed_bytes().into();
+            let key: Key = Arc::new(key.into_bytes());
 
             pq_tx.send(Ok(key)).unwrap();
         }
