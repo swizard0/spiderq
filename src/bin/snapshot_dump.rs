@@ -15,14 +15,14 @@ pub enum Error {
 
 pub fn entrypoint(maybe_matches: getopts::Result) -> Result<(), Error> {
     let matches = maybe_matches.map_err(Error::Getopts)?;
-    let database_dir = matches.opt_str("database").unwrap_or("./spiderq".to_owned());
+    let database_dir = matches.opt_str("database").unwrap_or_else(|| "./spiderq".to_owned());
     let db = db::Database::new(&database_dir, 131072).map_err(Error::Db)?;
 
     for (key, value) in db.iter() {
-        print_vec_u8(&key);
+        print_vec_u8(key);
         print!("\t");
-        print_vec_u8(&value);
-        println!("");
+        print_vec_u8(value);
+        println!();
     }
 
     Ok(())
