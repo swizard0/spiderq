@@ -14,4 +14,4 @@ simple-signal = "^1.1"
 spiderq_proto = { path = "spiderq-proto" }
 
 [dev-dependencies]
-rand = "^0.3"
+rand = "^0.8"

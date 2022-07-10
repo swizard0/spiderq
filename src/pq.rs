@@ -55,8 +55,8 @@ pub struct PQueue {
     lentq: BinaryHeap<LentEntry>,
 }
 
-impl PQueue {
-    pub fn new() -> PQueue {
+impl Default for PQueue {
+    fn default() -> Self {
         PQueue {
             serial: 1,
             queue: BinaryHeap::new(),
@@ -64,15 +64,25 @@ impl PQueue {
             lentq: BinaryHeap::new(),
         }
     }
+}
+
+impl PQueue {
+    pub fn new() -> PQueue {
+        PQueue::default()
+    }
 
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     pub fn add(&mut self, key: Key, mode: AddMode) {
         self.serial += 1;
         self.queue.push(PQueueEntry {
-            key: key,
+            key,
             priority: match mode { AddMode::Head => 0, AddMode::Tail => self.serial, },
             boost: 0,
         });
@@ -84,8 +94,8 @@ impl PQueue {
 
     pub fn lend(&mut self, trigger_at: SteadyTime) -> Option<u64> {
         if let Some(entry) = self.queue.pop() {
-            self.lentq.push(LentEntry { trigger_at: trigger_at, key: entry.key.clone(), snapshot: self.serial, });
-            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry: entry, });
+            self.lentq.push(LentEntry { trigger_at, key: entry.key.clone(), snapshot: self.serial, });
+            self.lentm.insert(entry.key.clone(), LendSnapshot { serial: self.serial, recycle: None, entry, });
             Some(self.serial)
         } else {
             None
@@ -93,24 +103,22 @@ impl PQueue {
     }
 
     pub fn next_timeout(&mut self) -> Option<SteadyTime> {
-        loop {
-            let do_recycle = if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
-                match self.lentm.get_mut(k) {
-                    Some(ref mut snapshot) if snapshot.recycle.is_some() =>
-                        snapshot.recycle.take(),
-                    Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
-                        return Some(trigger),
-                    _ =>
-                        None,
-                }
-            } else {
-                break
+        while let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() { 
+            let do_recycle = match self.lentm.get_mut(k) {
+                Some(ref mut snapshot) if snapshot.recycle.is_some() =>
+                    snapshot.recycle.take(),
+                Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
+                    return Some(trigger),
+                _ =>
+                    None,
             };
 
-            self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
-                entry.trigger_at = reschedule;
-                self.lentq.push(entry);
-            });
+            if let Some(mut entry) = self.lentq.pop() {
+                if let Some(reschedule) = do_recycle {
+                    entry.trigger_at = reschedule;
+                    self.lentq.push(entry);
+                }
+            }
         }
         None
     }

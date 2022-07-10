@@ -1,6 +1,6 @@
 use std::{io, fs, mem};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::sync::Arc;
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::thread::{spawn, JoinHandle};
@@ -47,21 +47,21 @@ enum Snapshot {
 impl Snapshot {
     fn count(&self) -> usize {
         match self {
-            &Snapshot::Memory(ref idx) => idx.len(),
-            &Snapshot::Frozen(ref idx) => idx.len(),
-            &Snapshot::Persisting { index: ref idx, .. } => idx.len(),
-            &Snapshot::Persisted(ref idx) => idx.len(),
-            &Snapshot::Merging { indices: ref idxs, .. } => idxs.iter().fold(0, |total, idx| total + idx.len()),
+            Snapshot::Memory(ref idx) => idx.len(),
+            Snapshot::Frozen(ref idx) => idx.len(),
+            Snapshot::Persisting { index: ref idx, .. } => idx.len(),
+            Snapshot::Persisted(ref idx) => idx.len(),
+            Snapshot::Merging { indices: ref idxs, .. } => idxs.iter().fold(0, |total, idx| total + idx.len()),
         }
     }
 
     fn lookup(&self, key: &Key) -> Option<&ValueSlot> {
         match self {
-            &Snapshot::Memory(ref idx) => idx.get(key),
-            &Snapshot::Frozen(ref idx) => idx.get(key),
-            &Snapshot::Persisting { index: ref idx, .. } => idx.get(key),
-            &Snapshot::Persisted(ref idx) => idx.get(key),
-            &Snapshot::Merging { indices: ref idxs, .. } => {
+            Snapshot::Memory(ref idx) => idx.get(key),
+            Snapshot::Frozen(ref idx) => idx.get(key),
+            Snapshot::Persisting { index: ref idx, .. } => idx.get(key),
+            Snapshot::Persisted(ref idx) => idx.get(key),
+            Snapshot::Merging { indices: ref idxs, .. } => {
                 for idx in idxs.iter() {
                     if let Some(value) = idx.get(key) {
                         return Some(value)
@@ -75,11 +75,11 @@ impl Snapshot {
 
     fn indices_refs<'a, 'b>(&'a self, refs: &'b mut Vec<&'a Index>) {
         match self {
-            &Snapshot::Memory(ref idx) => refs.push(&*idx),
-            &Snapshot::Frozen(ref idx) => refs.push(&*idx),
-            &Snapshot::Persisting { index: ref idx, .. } => refs.push(&*idx),
-            &Snapshot::Persisted(ref idx) => refs.push(&*idx),
-            &Snapshot::Merging { indices: ref idxs, .. } => {
+            Snapshot::Memory(ref idx) => refs.push(&*idx),
+            Snapshot::Frozen(ref idx) => refs.push(&*idx),
+            Snapshot::Persisting { index: ref idx, .. } => refs.push(&*idx),
+            Snapshot::Persisted(ref idx) => refs.push(&*idx),
+            Snapshot::Merging { indices: ref idxs, .. } => {
                 for idx in idxs.iter() {
                     refs.push(&*idx)
                 }
@@ -111,8 +111,8 @@ impl Database {
 
         Ok(Database {
             database_dir: Arc::new(PathBuf::from(database_dir)),
-            flush_limit: flush_limit,
-            snapshots: snapshots,
+            flush_limit,
+            snapshots,
         })
     }
 
@@ -161,8 +161,8 @@ impl Database {
         loop {
             // Check if memory part overflowed
             if let Some(index_to_freeze) = match self.snapshots.first_mut() {
-                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (idx.len() != 0 && flush_mode) =>
-                    Some(mem::replace(idx, Index::new())),
+                Some(&mut Snapshot::Memory(ref mut idx)) if (idx.len() >= self.flush_limit) || (!idx.is_empty() && flush_mode) =>
+                    Some(mem::take(idx)),
                 _ =>
                     None,
             } {
@@ -180,11 +180,11 @@ impl Database {
                     let slave_dir = self.database_dir.clone();
                     let slave_index = index_to_persist.clone();
                     let slave = spawn(move || tx.send(persist(slave_dir, slave_index)).unwrap());
-                    mem::replace(last_snapshot, Snapshot::Persisting {
+                    *last_snapshot = Snapshot::Persisting {
                         index: index_to_persist,
                         chan: rx,
-                        slave: slave,
-                    });
+                        slave,
+                    };
                     continue;
                 }
             }
@@ -214,17 +214,14 @@ impl Database {
                 self.snapshots.push(Snapshot::Merging {
                     indices: master_indices,
                     chan: rx,
-                    slave: slave,
+                    slave,
                 });
 
                 continue;
             }
 
             // Check if persisting is finished
-            if let Some(persisting_snapshot) = self.snapshots.iter_mut().find(|snapshot| match snapshot {
-                &&mut Snapshot::Persisting { .. } => true,
-                _ => false,
-            }) {
+            if let Some(persisting_snapshot) = self.snapshots.iter_mut().find(|snapshot| matches!(snapshot, Snapshot::Persisting{..}) ) {
                 let done_index =
                     if let &mut Snapshot::Persisting { index: ref idx, chan: ref rx, .. } = persisting_snapshot {
                         if !flush_mode {
@@ -257,10 +254,7 @@ impl Database {
             }
 
             // Check if merging is finished
-            if let Some(merging_snapshot) = self.snapshots.iter_mut().find(|snapshot| match snapshot {
-                &&mut Snapshot::Merging { .. } => true,
-                _ => false,
-            }) {
+            if let Some(merging_snapshot) = self.snapshots.iter_mut().find(|snapshot| matches!(snapshot, Snapshot::Merging{..})) {
                 let done_index =
                     if let &mut Snapshot::Merging { chan: ref rx, .. } = merging_snapshot {
                         if !flush_mode {
@@ -292,14 +286,14 @@ impl Database {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> Iter<'a> {
+    pub fn iter(&self) -> Iter {
         let mut indices = Vec::new();
         for snapshot in self.snapshots.iter() {
             snapshot.indices_refs(&mut indices);
         }
 
         Iter {
-            indices: indices,
+            indices,
             index: 0,
             iter: None,
         }
@@ -324,7 +318,7 @@ impl<'a> Iterator for Iter<'a> {
     fn next(&mut self) -> Option<(&'a Key, &'a Value)> {
         while self.index < self.indices.len() {
             if let Some(ref mut map_iter) = self.iter {
-                while let Some((key, slot)) = map_iter.next() {
+                for (key, slot) in map_iter.by_ref() {
                     if self.indices[0 .. self.index]
                         .iter()
                         .rev()
@@ -333,9 +327,9 @@ impl<'a> Iterator for Iter<'a> {
                         }
 
                     match slot {
-                        &ValueSlot::Value(ref value) =>
+                        ValueSlot::Value(ref value) =>
                             return Some((key, value)),
-                        &ValueSlot::Tombstone =>
+                        ValueSlot::Tombstone =>
                             continue,
                     }
                 }
@@ -353,7 +347,7 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 
-fn filename_as_string(filename: &PathBuf) -> String {
+fn filename_as_string(filename: &Path) -> String {
     filename.to_string_lossy().into_owned()
 }
 
@@ -387,7 +381,7 @@ fn load_index(database_dir: &str) -> Result<Option<Index>, Error> {
         Err(ref e) if e.kind() == io::ErrorKind::NotFound =>
             Ok(None),
         Err(e) =>
-            return Err(Error::DatabaseFileOpen(filename_as_string(&db_file), e)),
+            Err(Error::DatabaseFileOpen(filename_as_string(&db_file), e))
     }
 }
 
@@ -456,7 +450,7 @@ mod test {
     use std::fs;
     use std::sync::Arc;
     use std::collections::HashMap;
-    use rand::{thread_rng, sample, Rng};
+    use rand::{thread_rng, distributions::Uniform, Rng};
     use super::{Database};
     use super::super::proto::{Key, Value};
 
@@ -466,12 +460,18 @@ mod test {
     }
 
     fn rnd_kv() -> (Key, Value) {
-        let mut rng = thread_rng();
-        let key_len = rng.gen_range(1, 64);
-        let value_len = rng.gen_range(1, 64);
-        (Arc::new(sample(&mut rng, 0 .. 255, key_len)),
-         Arc::new(sample(&mut rng, 0 .. 255, value_len)))
+        let (key_len, value_len) = {
+            let mut rng = thread_rng();
+            (rng.gen_range(1..64), rng.gen_range(1..64))
+        };
+
+        let distr = Uniform::new(0_u8, 255_u8);
+        let key = thread_rng().sample_iter(distr).take(key_len).collect();
+        let value = thread_rng().sample_iter(distr).take(value_len).collect();
+
+        (Arc::new(key), Arc::new(value))
     }
+
 
     fn rnd_fill_check(db: &mut Database, check_table: &mut HashMap<Key, Value>, count: usize) {
         let mut to_remove = Vec::new();
