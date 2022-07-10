@@ -103,24 +103,22 @@ impl PQueue {
     }
 
     pub fn next_timeout(&mut self) -> Option<SteadyTime> {
-        loop {
-            let do_recycle = if let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() {
-                match self.lentm.get_mut(k) {
-                    Some(ref mut snapshot) if snapshot.recycle.is_some() =>
-                        snapshot.recycle.take(),
-                    Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
-                        return Some(trigger),
-                    _ =>
-                        None,
-                }
-            } else {
-                break
+        while let Some(&LentEntry { trigger_at: trigger, key: ref k, snapshot: qshot, .. }) = self.lentq.peek() { 
+            let do_recycle = match self.lentm.get_mut(k) {
+                Some(ref mut snapshot) if snapshot.recycle.is_some() =>
+                    snapshot.recycle.take(),
+                Some(&mut LendSnapshot { serial: mshot, .. }) if mshot == qshot =>
+                    return Some(trigger),
+                _ =>
+                    None,
             };
 
-            self.lentq.pop().map(|mut entry| if let Some(reschedule) = do_recycle {
-                entry.trigger_at = reschedule;
-                self.lentq.push(entry);
-            });
+            if let Some(mut entry) = self.lentq.pop() {
+                if let Some(reschedule) = do_recycle {
+                    entry.trigger_at = reschedule;
+                    self.lentq.push(entry);
+                }
+            }
         }
         None
     }
